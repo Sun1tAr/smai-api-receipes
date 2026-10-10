@@ -6,6 +6,7 @@ from asyncpg import PostgresError
 from sqlalchemy import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
+from receipes import models  # noqa: F401  # Регистрирует таблицы в Base.metadata.
 from receipes.config import Settings
 from receipes.database import Base, create_migration_engine
 from receipes.migration_diagnostics import describe_migration_error
@@ -13,7 +14,6 @@ from receipes.observability import configure_logging
 
 settings = Settings()
 configure_logging(settings.log_level)
-# Доменные модели появятся позже; их модуль нужно импортировать здесь.
 target_metadata = Base.metadata
 # Ревизии для диагностики падения: с какой начали и какая применена последней.
 progress: dict[str, str | None] = {"from_revision": None, "last_applied": None}
