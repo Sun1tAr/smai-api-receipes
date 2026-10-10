@@ -114,7 +114,7 @@ async def test_error_format_for_404_405_and_unhandled_errors() -> None:
         assert invalid.status_code == 400
         error = invalid.json()["error"]
         assert error["code"] == "VALIDATION_ERROR"
-        assert error["details"]["fields"][0]["field"] == "path.item_id"
+        assert error["details"]["fields"][0]["loc"] == ["path", "item_id"]
         assert "abc" not in invalid.text
         assert crashed.status_code == 500
         assert crashed.json() == {

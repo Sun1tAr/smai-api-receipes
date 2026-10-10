@@ -16,7 +16,13 @@ class ErrorBody(BaseModel):
         description="Описание ошибки на английском, безопасное для показа."
     )
     details: dict[str, Any] = Field(
-        default_factory=dict, description="Дополнительные сведения; может быть пустым."
+        default_factory=dict,
+        description=(
+            "Дополнительные сведения; может быть пустым. Для `VALIDATION_ERROR` — "
+            '`{"fields": [{"loc": ["body", "name"], "type": "missing"}]}`: '
+            "`loc` — список строк с местом ошибки, `type` — тип ошибки Pydantic; "
+            "значения и тексты исключений не возвращаются."
+        ),
     )
 
 
@@ -54,16 +60,21 @@ def error_response(
     return JSONResponse(body, status_code=status_code, headers=headers)
 
 
+# Контракт gateway: loc — список строк. Для битого JSON loc несёт позицию символа,
+# а не поле, поэтому остаётся только ["body"].
+def error_location(item: Any) -> list[str]:
+    location = item["loc"]
+    if item["type"] == "json_invalid":
+        location = [part for part in location if not isinstance(part, int)]
+    return [str(part) for part in location]
+
+
 # Только место и тип ошибки: текст исключений и введённые значения могут содержать
 # пользовательские данные, поэтому не возвращаются и не логируются.
 async def validation_error_handler(request: Request, error: Exception) -> JSONResponse:
     assert isinstance(error, RequestValidationError)
     fields = [
-        {
-            "field": ".".join(str(part) for part in item["loc"] if part != "body"),
-            "type": item["type"],
-        }
-        for item in error.errors()
+        {"loc": error_location(item), "type": item["type"]} for item in error.errors()
     ]
     return error_response(
         400, "VALIDATION_ERROR", "Request validation failed", {"fields": fields}

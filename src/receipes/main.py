@@ -40,7 +40,8 @@ REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
 # Служебные пробы вызываются каждые несколько секунд: без шума в логах и трейсах.
 QUIET_PATHS = frozenset({"/health", "/metrics"})
-TRACING_EXCLUDED_URLS = ",".join(f"{path}$" for path in sorted(QUIET_PATHS))
+# Шаблоны сопоставляются с полным URL, включая query (/health?x=1).
+TRACING_EXCLUDED_URLS = ",".join(f"{path}(\\?.*)?$" for path in sorted(QUIET_PATHS))
 
 
 # Шаблон пути без значений параметров. Маршруты Starlette (/docs, /openapi.json)
@@ -73,6 +74,14 @@ def build_openapi(app: FastAPI) -> dict[str, Any]:
             schema.get("components", {}).get("schemas", {}).pop(name, None)
         app.openapi_schema = schema
     return app.openapi_schema
+
+
+# Starlette поднимает этот RuntimeError, когда клиент оборвал соединение до ответа.
+CLIENT_CLOSED_REQUEST = 499
+
+
+def is_client_disconnect(error: Exception) -> bool:
+    return isinstance(error, RuntimeError) and str(error) == "No response returned."
 
 
 def resolve_request_id(incoming: str | None) -> str:
@@ -138,13 +147,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             try:
                 response = await call_next(request)
-            except Exception:
-                # 500 собирается здесь, а не в ServerErrorMiddleware: так в ответе
-                # есть X-Request-ID, а лог ошибки несёт тот же request_id.
-                logger.error("unhandled_error", exc_info=True)
-                response = error_response(
-                    500, "INTERNAL_ERROR", "Internal server error"
-                )
+            except Exception as error:
+                if is_client_disconnect(error):
+                    # Клиент ушёл, отвечать некому: не ошибка сервиса.
+                    response = Response(status_code=CLIENT_CLOSED_REQUEST)
+                else:
+                    # 500 собирается здесь, а не в ServerErrorMiddleware: так в
+                    # ответе есть X-Request-ID, а лог несёт тот же request_id.
+                    logger.error("unhandled_error", exc_info=True)
+                    response = error_response(
+                        500, "INTERNAL_ERROR", "Internal server error"
+                    )
             response.headers["X-Request-ID"] = request_id
             path = route_path(request)
             quiet = path in QUIET_PATHS and response.status_code < 400

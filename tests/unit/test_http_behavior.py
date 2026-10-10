@@ -14,6 +14,14 @@ class Payload(BaseModel):
     count: int
 
 
+class Inner(BaseModel):
+    values: list[int]
+
+
+class Outer(BaseModel):
+    inner: Inner
+
+
 @pytest.fixture
 async def app(capsys):
     from receipes.main import create_app
@@ -27,6 +35,10 @@ async def app(capsys):
     @app.get("/items/{item_id}")
     async def item(item_id: int, limit: int = Query(default=1)) -> dict:
         return {"id": item_id}
+
+    @app.post("/nested")
+    async def nested(body: Outer) -> dict:
+        return {}
 
     @app.post("/payload")
     async def payload(body: Payload) -> dict:
@@ -183,13 +195,78 @@ async def test_validation_error_reports_only_type_and_location(client) -> None:
     assert body["error"]["code"] == "VALIDATION_ERROR"
     assert body["error"]["message"] == "Request validation failed"
     assert body["error"]["details"]["fields"] == [
-        {"field": "count", "type": "int_parsing"}
+        {"loc": ["body", "count"], "type": "int_parsing"}
     ]
     assert "private-user-text" not in response.text
 
     response = await client.get("/items/not-a-number?limit=also-private")
     assert response.status_code == 400
     assert "also-private" not in response.text and "not-a-number" not in response.text
-    assert {"field": "path.item_id", "type": "int_parsing"} in (
+    assert {"loc": ["path", "item_id"], "type": "int_parsing"} in (
         response.json()["error"]["details"]["fields"]
+    )
+
+
+async def test_validation_error_for_missing_and_nested_fields(client) -> None:
+    missing = await client.post("/payload", json={})
+    assert missing.json()["error"]["details"]["fields"] == [
+        {"loc": ["body", "count"], "type": "missing"}
+    ]
+    nested = await client.post("/nested", json={"inner": {"values": [1, "x"]}})
+    assert nested.json()["error"]["details"]["fields"] == [
+        {"loc": ["body", "inner", "values", "1"], "type": "int_parsing"}
+    ]
+    assert "x" not in str(nested.json()["error"]["details"]["fields"][0]["loc"][:3])
+
+
+async def test_malformed_json_reports_only_the_body(client) -> None:
+    response = await client.post(
+        "/payload", content="{bad", headers={"Content-Type": "application/json"}
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["details"]["fields"] == [
+        {"loc": ["body"], "type": "json_invalid"}
+    ]
+
+
+async def test_error_body_schema_documents_validation_details(client) -> None:
+    schema = (await client.get("/openapi.json")).json()["components"]["schemas"]
+    details = schema["ErrorBody"]["properties"]["details"]["description"]
+    assert '"loc"' in details and '"type"' in details
+
+
+@pytest.mark.parametrize("query", ["", "?x=1", "?token=private"])
+async def test_probes_with_query_create_no_spans(app, client, query) -> None:
+    exporter = InMemorySpanExporter()
+    app.state.tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+    await client.get(f"/health{query}")
+    await client.get(f"/metrics{query}")
+    assert exporter.get_finished_spans() == ()
+
+
+async def test_client_disconnect_is_not_logged_as_unhandled_error(
+    app, client, capsys: pytest.CaptureFixture[str]
+) -> None:
+    capture_logs()
+
+    @app.get("/gone")
+    async def gone() -> None:
+        raise RuntimeError("No response returned.")
+
+    response = await client.get("/gone")
+    assert response.status_code == 499
+    events = events_from(capsys.readouterr().out)
+    assert not [e for e in events if e["message"] == "unhandled_error"]
+    access = next(e for e in events if e["message"] == "http_request")
+    assert (access["path"], access["status_code"]) == ("/gone", 499)
+
+
+async def test_other_runtime_errors_are_still_unhandled(
+    client, capsys: pytest.CaptureFixture[str]
+) -> None:
+    capture_logs()
+    response = await client.get("/boom")
+    assert response.status_code == 500
+    assert any(
+        e["message"] == "unhandled_error" for e in events_from(capsys.readouterr().out)
     )
