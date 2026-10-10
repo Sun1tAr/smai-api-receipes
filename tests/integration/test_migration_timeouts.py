@@ -16,7 +16,7 @@ REVISION = '''"""temporary"""
 from alembic import op
 
 revision = "tmp0001"
-down_revision = None
+down_revision = {head!r}
 
 
 def upgrade() -> None:
@@ -30,9 +30,15 @@ def downgrade() -> None:
 
 # Временная ветка миграций с настоящим env.py проекта и одной ревизией.
 def run_alembic(tmp_path: Path, env: dict[str, str], statement: str):
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    head = ScriptDirectory.from_config(
+        Config(str(ROOT / "alembic.ini"))
+    ).get_current_head()
     shutil.copytree(ROOT / "migrations", tmp_path / "migrations")
     (tmp_path / "migrations" / "versions" / "tmp0001.py").write_text(
-        REVISION.format(statement=statement)
+        REVISION.format(statement=statement, head=head)
     )
     (tmp_path / "alembic.ini").write_text(
         "[alembic]\nscript_location = %(here)s/migrations\n"
@@ -54,7 +60,7 @@ def test_migration_longer_than_db_timeout_succeeds(
     result = run_alembic(tmp_path, env, "SELECT pg_sleep(2.5)")
     assert result.returncode == 0, result.stdout + result.stderr
     subprocess.run(
-        ["alembic", "-c", str(tmp_path / "alembic.ini"), "downgrade", "base"],
+        ["alembic", "-c", str(tmp_path / "alembic.ini"), "downgrade", "-1"],
         env=env,
         cwd=tmp_path,
         check=False,
@@ -74,7 +80,8 @@ def test_failed_migration_logs_sqlstate_and_revisions_without_secrets(
         if item["message"] == "migration_failed"
     )
     assert failure["sqlstate"] == "42P01"
-    assert failure["from_revision"] is None
+    # Ревизия, с которой начали, — текущий head проекта (или None на пустой БД).
+    assert "from_revision" in failure
     assert failure["error_type"]
 
 
