@@ -29,8 +29,9 @@ Ollama. Сейчас готова только инфраструктура (**S
 500 на необработанное исключение, содержит заголовок `X-Request-ID`: входящее
 значение принимается, если это до 128 символов `A-Za-z0-9._-`, иначе
 генерируется UUID4; тот же `request_id` пишется в логи. В `details.fields`
-ошибки валидации приходят только `field` (место) и `type` (тип ошибки), без
-введённых значений и текста исключений. Схема OpenAPI не содержит `422` и
+ошибки валидации приходят только `loc` (список строк с местом ошибки, например `["body", "name"]`) и
+`type` (тип ошибки Pydantic), без введённых значений и текста исключений; для
+неразобранного JSON `loc` равен `["body"]`. Формат совпадает с контрактом gateway. Схема OpenAPI не содержит `422` и
 `HTTPValidationError` фреймворка: валидация отвечает `400`.
 
 ## Локальный запуск
@@ -64,6 +65,7 @@ Compose-сети. При старте контейнер выполняет `ale
 | `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | Подключение к PostgreSQL | Обязательны |
 | `DB_PORT` | Порт PostgreSQL | `5432` |
 | `DB_TIMEOUT_SECONDS` | Предельное ожидание БД (0, 60]: подключение и запросы приложения. Запросы миграций не ограничиваются | `5` |
+| `MIGRATION_LOCK_TIMEOUT_SECONDS` | Ожидание чужой блокировки при миграциях, (0, 3600] | `30` |
 | `LOG_LEVEL` | DEBUG / INFO / WARNING / ERROR | `INFO` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Базовый адрес OTLP HTTP, например `http://collector:4318` | Экспорт отключён |
 | `OLLAMA_BASE_URL` | Адрес Ollama (http/https) | Обязательна |
@@ -133,16 +135,20 @@ tests/integration/  интеграционные тесты (нужна PostgreS
 `uv run alembic upgrade head`, `uv run alembic check` (БД должна быть доступна).
 
 Alembic ждёт подключения не дольше `DB_TIMEOUT_SECONDS`, но длительность самих
-запросов миграции не ограничивает. При падении миграции в лог попадает событие
-`migration_failed`: `error_type`, `sqlstate`, `driver_error_type`, `db_message`
-(только основное сообщение PostgreSQL, без SQL, параметров и DETAIL),
+запросов миграции не ограничивает; ожидание чужой блокировки ограничено
+`lock_timeout` (`MIGRATION_LOCK_TIMEOUT_SECONDS`, по умолчанию 30 с, только для
+миграций). При падении миграции в лог попадает событие
+`migration_failed`: `error_type`, `sqlstate`, `driver_error_type` и
+`db_message` — основное сообщение PostgreSQL, только для SQLSTATE класса 42
+(синтаксис и объекты схемы); для остальных классов сообщение не пишется, так как
+оно может содержать данные строк. SQL, параметры запросов и DETAIL не логируются;
 `from_revision` (ревизия до запуска) и `last_applied` (последняя выполненная
 в этой попытке; транзакция откатывается). Пароли и параметры запросов не логируются.
 
 ## CI
 
 Джобы: `lint`, `unit`, `integration`, `compose-smoke` (`docker compose up --build
---wait`, затем `/health` и `/docs`), `docker-build`. Права workflow —
+--wait`, затем `/health` и `/docs`), `docker-build`; у каждой джобы задан `timeout-minutes`. Права workflow —
 `contents: read`; устаревшие запуски PR отменяются. Публикация образа и деплой
 (stage/prod) в CI не описаны: это решение Ivan и DevOps.
 
@@ -155,3 +161,5 @@ Alembic ждёт подключения не дольше `DB_TIMEOUT_SECONDS`, 
 - Alembic использует те же настройки, что и приложение (`Settings`), включая
   обязательные `OLLAMA_*`; отдельного набора настроек для миграций нет.
 - Действия GitHub Actions закреплены тегами версий, а не SHA коммитов.
+- При неверной конфигурации контейнер уходит в перезапуск (`restart: unless-stopped`),
+  а `docker compose up --wait` завершается ошибкой.

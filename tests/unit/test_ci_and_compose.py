@@ -44,3 +44,11 @@ def test_workflow_has_no_deploy_jobs() -> None:
 def test_services_restart_unless_stopped() -> None:
     compose = (ROOT / "docker-compose.yml").read_text()
     assert compose.count("restart: unless-stopped") == 2
+
+
+def test_every_job_has_a_timeout() -> None:
+    jobs = re.split(r"^  (?=[a-z-]+:$)", ci().split("\njobs:\n")[1], flags=re.M)
+    jobs = [job for job in jobs if job.strip()]
+    assert len(jobs) == 5
+    for job in jobs:
+        assert re.search(r"^    timeout-minutes: \d+$", job, re.MULTILINE), job
