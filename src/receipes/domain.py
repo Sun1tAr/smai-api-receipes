@@ -10,6 +10,11 @@ PEOPLE_COUNT_MAX = 20
 WEEKLY_BUDGET_MAX = Decimal("1000000")
 BUDGET_DECIMAL_PLACES = 2
 
+# Размеры колонок: «ворота» ответа модели не пропускают строки длиннее.
+NAME_MAX_LENGTH = 255
+UNIT_MAX_LENGTH = 32
+INSTRUCTION_MAX_LENGTH = 2000
+
 
 class DomainError(Exception):
     """Базовая ошибка домена; текст безопасен для логов, без пользовательских данных."""
