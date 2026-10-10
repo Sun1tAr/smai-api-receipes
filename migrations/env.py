@@ -34,7 +34,7 @@ def run_migrations_offline() -> None:
 
 # Alembic выполняет синхронные операции через async-соединение SQLAlchemy.
 def migrate(connection: Connection) -> None:
-    def record_applied(revision, step, heads, run_args) -> None:
+    def record_applied(*, ctx, step, heads, run_args) -> None:
         progress["last_applied"] = step.up_revision_id
 
     context.configure(

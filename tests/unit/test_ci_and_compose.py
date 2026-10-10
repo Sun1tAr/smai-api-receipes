@@ -1,10 +1,15 @@
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
+# В test-образе нет .github (Dockerfile копирует только нужное): проверки идут в CI.
 def ci() -> str:
+    if not (ROOT / ".github/workflows/ci.yml").exists():
+        pytest.skip("workflow is not part of the test image")
     return (ROOT / ".github/workflows/ci.yml").read_text()
 
 

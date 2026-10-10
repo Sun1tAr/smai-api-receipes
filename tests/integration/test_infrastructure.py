@@ -78,13 +78,21 @@ async def test_http_and_database_traces_correlate_with_json_logs(
     from receipes.main import create_app
 
     app = create_app(settings)
+
+    # /health намеренно не трассируется, поэтому проверяем обычным маршрутом.
+    @app.get("/trace-probe")
+    async def trace_probe() -> dict:
+        async with app.state.session_factory() as session:
+            await session.execute(text("SELECT 1"))
+        return {}
+
     exporter = InMemorySpanExporter()
     app.state.tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
-            response = await client.get("/health")
+            response = await client.get("/trace-probe")
         spans = exporter.get_finished_spans()
         server = next(span for span in spans if span.kind == SpanKind.SERVER)
         assert any(
@@ -97,6 +105,7 @@ async def test_http_and_database_traces_correlate_with_json_logs(
         request_log = next(
             item for item in entries if item["message"] == "http_request"
         )
+        assert request_log["path"] == "/trace-probe"
         assert request_log["trace_id"] == f"{server.context.trace_id:032x}"
         assert request_log["request_id"] == response.headers["X-Request-ID"]
         assert request_log["service"] == "smai-api-receipes"
