@@ -1,0 +1,29 @@
+services:
+  tests:
+    build:
+      context: .
+      target: test
+    environment:
+      TEST_DB_HOST: postgres-test
+      TEST_DB_PORT: "5432"
+      TEST_DB_NAME: receipes_test
+      TEST_DB_USER: receipes_test
+      TEST_DB_PASSWORD: receipes-test-only
+      OLLAMA_BASE_URL: http://ollama.test:11434
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+
+  postgres-test:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: receipes_test
+      POSTGRES_USER: receipes_test
+      POSTGRES_PASSWORD: receipes-test-only
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 2s
+      timeout: 3s
+      retries: 20
