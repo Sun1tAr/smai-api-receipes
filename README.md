@@ -119,12 +119,93 @@ docker compose -p receipes-tests -f docker-compose.test.yml down
 Для своей тестовой БД задайте `TEST_DB_HOST`, `TEST_DB_PORT`, `TEST_DB_NAME`,
 `TEST_DB_USER`, `TEST_DB_PASSWORD` и выполните `uv run pytest`.
 
+## Модель данных
+
+Схема по ERD статьи MS-4 (SMAI-A-110). Все первичные ключи — UUID, их создаёт
+приложение. Модели — `src/receipes/models.py`, домен — `domain.py`,
+«ворота» ответа Ollama — `generated_menu.py`, доступ к данным —
+`repositories.py` (репозитории принимают `AsyncSession` и не коммитят).
+
+| Таблица | Назначение и ключевые поля |
+| --- | --- |
+| `prompt_template` | `template` (Text), `created_at`; актуален последний |
+| `generation_parameters` | `people_count` (≥1), `weekly_budget` Numeric(12,2) (>0) |
+| `generation_task` | `task_id`, `status`, `prompt`, `parameters_id` (NOT NULL, UNIQUE, 1:1), `menu_id` (NULL до `done`), `created_at`, `started_at`, `finished_at`, `error` |
+| `menu` | только `id` |
+| `menu_recipes` | `menu_id`, `recipe_id`, `position` |
+| `recipe` | `name` (255), `calories`, `cooking_time` (минуты), `photo` (Text, NULL), `nutrition_id` |
+| `ingredient` | `name` (255), хранится в нормализованном виде |
+| `recipe_ingredients` | `recipe_id`, `ingredient_id`, `quantity`, `unit` (32), `position` |
+| `instruction` | `recipe_id`, `text`, `position` |
+| `nutrition` | `calories`, `proteins`, `fats`, `carbohydrates` |
+
+Числа (калории, КБЖУ, количества, время готовки) — `Numeric(10,2)`; время
+`created_at`/`started_at`/`finished_at` — `timestamptz` (`created_at` по умолчанию
+`now()`).
+
+**Ограничения `generation_task`:** `status IN ('pending','in_progress','done','failed')`;
+`(status='done') = (menu_id IS NOT NULL)`; `(status='failed') = (error IS NOT NULL)`;
+`prompt` обязателен при `in_progress`/`done`; `started_at` обязателен при
+`in_progress`/`done`; `finished_at` — при `done`/`failed`.
+Остальное: `UNIQUE(menu_recipes.menu_id, recipe_id)` и `(menu_id, position)`,
+`UNIQUE(recipe_ingredients.recipe_id, ingredient_id)` и `(recipe_id, position)`,
+`UNIQUE(instruction.recipe_id, position)`, позиции ≥1, неотрицательные числа.
+Уникальность ингредиента — индекс `uq_ingredient_name_normalized` по
+`lower(btrim(name))`. Частичные индексы: `generation_task(created_at) WHERE
+status='pending'` (очередь) и `generation_task(started_at) WHERE
+status='in_progress'` (восстановление зависших).
+
+**Каскады.** `menu` → `menu_recipes` и `recipe` → `recipe_ingredients`,
+`instruction`: `ON DELETE CASCADE`. Все остальные ссылки — `RESTRICT`: нельзя
+удалить рецепт, входящий в меню, ингредиент, нутриенты или параметры, на которые
+есть ссылки, и меню, на которое ссылается задача (иначе задача `done` потеряла бы
+результат, нарушив `menu_iff_done`).
+
+**Ревизии Alembic.**
+- `0001_base_schema` — схема строго по ERD.
+- `0002_ordering_task_times` — отличия от ERD: `position` в `menu_recipes` и
+  `recipe_ingredients` (без него порядок рецептов в меню и ингредиентов не
+  определён), `started_at`/`finished_at` в `generation_task` (нужны для
+  восстановления зависших задач и метрик длительности), связанные CHECK и
+  индекс. Вынесены отдельно: при отказе ревизию можно удалить, не трогая базовую.
+  Существующие строки получают позиции `1..n` по `id`, а `started_at`/`finished_at`
+  — `created_at`.
+
+Обе ревизии обратимы (`upgrade` / `downgrade` / `upgrade` проверяются в
+интеграционных тестах, схема после `downgrade base` пуста, `alembic check` чист).
+
+**Названия ингредиентов** нормализуются в одном месте
+(`domain.normalize_ingredient_name`: схлопывание пробелов, `casefold`, `ё`→`е`) и
+хранятся в нормализованном виде, поэтому в ответе они строчные (`овсяные хлопья`).
+
+**Репозитории.**
+- `TaskRepository`: `create`, `get`, `claim_next(build_prompt)` (`SELECT … FOR
+  UPDATE SKIP LOCKED` старейшей `pending`; промпт задаётся при захвате, потому что
+  CHECK требует его у любой задачи `in_progress`), `transition(task_id, expected,
+  to, …)` — условный `UPDATE … WHERE status=:expected RETURNING`, `False` при
+  чужом статусе; допустимость перехода проверяет `TaskStatus`; `expire_stale(
+  pending_ttl, stale_after)` (`Queue timeout`, `Generation interrupted`),
+  `count_pending`, `oldest_pending_age`.
+- `MenuRepository`: `save(GeneratedMenu)` (ингредиенты через `INSERT … ON CONFLICT
+  (lower(btrim(name))) DO NOTHING`, позиции с 1) и `load(menu_id)` — рецепты,
+  ингредиенты и шаги отсортированы по `position`; связанные данные грузятся
+  `selectinload`/`joinedload` (несколько запросов, без N+1).
+- `PromptTemplateRepository.latest()` — `ORDER BY created_at DESC, id DESC`.
+
+**Ворота ответа модели** (`GeneratedMenu`): 3–21 рецепт, 1–50 ингредиентов и
+шагов, непустые строки не длиннее колонок, конечные числа ≥0 с верхними
+границами (калории ≤10000, время ≤1440 мин). Числа округляются до сотых,
+дубли ингредиентов схлопываются (одна единица — количества складываются, разная —
+остаётся первое и пишется предупреждение), `photo` игнорируется. Поля — camelCase
+как в контракте API.
+
 ## Структура репозитория
 
 ```text
 src/receipes/       приложение: config, database, main (create_app), health,
-                    errors, observability, migration_diagnostics, __main__ (запуск uvicorn)
-migrations/         Alembic (async env.py), ревизий пока нет
+                    errors, observability, migration_diagnostics, __main__ (запуск uvicorn);
+                    домен MS-4: models, domain, generated_menu, repositories
+migrations/         Alembic (async env.py), ревизии в versions/ (0001, 0002)
 docker/             entrypoint.sh: alembic upgrade head, затем запуск сервера
 tests/unit/         unit-тесты (без БД)
 tests/integration/  интеграционные тесты (нужна PostgreSQL, TEST_DB_HOST)
