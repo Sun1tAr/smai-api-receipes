@@ -48,6 +48,30 @@ class Settings(BaseSettings):
     def normalize_log_level(cls, value: object) -> object:
         return value.upper() if isinstance(value, str) else value
 
+    # Пробельное значение так же бессмысленно, как пустое. Само значение не меняем:
+    # пробелы могут быть частью пароля.
+    @field_validator("db_host", "db_name", "db_user", mode="after")
+    @classmethod
+    def reject_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+    @field_validator("db_password", mode="after")
+    @classmethod
+    def reject_blank_password(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value().strip():
+            raise ValueError("must not be blank")
+        return value
+
+    # Учётные данные в URL попали бы в логи, трейсы и сообщения об ошибках.
+    @field_validator("ollama_base_url", "otel_exporter_otlp_endpoint", mode="after")
+    @classmethod
+    def reject_url_credentials(cls, value: AnyHttpUrl | None) -> AnyHttpUrl | None:
+        if value is not None and (value.username or value.password):
+            raise ValueError("must not contain credentials (user:password@host)")
+        return value
+
     # URL.create сохраняет спецсимволы пароля без ручного экранирования.
     @property
     def database_url(self) -> URL:

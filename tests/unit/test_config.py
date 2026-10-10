@@ -196,3 +196,33 @@ def test_validation_error_does_not_echo_secret() -> None:
     with pytest.raises(ValidationError) as error:
         make(db_password=secret, db_port="invalid")
     assert secret not in str(error.value)
+
+
+@pytest.mark.parametrize("field", ["db_host", "db_name", "db_user", "db_password"])
+@pytest.mark.parametrize("blank", [" ", "   ", "\t\n"])
+def test_blank_string_settings_are_rejected(field: str, blank: str) -> None:
+    with pytest.raises(ValidationError) as error:
+        make(**{field: blank})
+    assert field in str(error.value)
+
+
+def test_password_with_surrounding_spaces_is_kept_unchanged() -> None:
+    assert make(db_password=" pass word ").db_password.get_secret_value() == (
+        " pass word "
+    )
+
+
+@pytest.mark.parametrize("field", ["ollama_base_url", "otel_exporter_otlp_endpoint"])
+@pytest.mark.parametrize(
+    "url", ["http://user:private-pass@host:11434", "http://user@host:11434"]
+)
+def test_urls_with_credentials_are_rejected_without_echoing_them(
+    field: str, url: str
+) -> None:
+    with pytest.raises(ValidationError) as error:
+        make(**{field: url})
+    text = str(error.value)
+    assert "credentials" in text
+    assert "private-pass" not in text and "user" not in text.replace(
+        "user:password", ""
+    )

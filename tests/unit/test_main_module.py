@@ -20,3 +20,35 @@ def test_server_listens_on_all_interfaces_port_8000(
     assert options["host"] == "0.0.0.0"
     assert options["port"] == 8000
     assert options["access_log"] is False
+
+
+def test_invalid_configuration_exits_with_names_but_without_values(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    import receipes.__main__ as entrypoint
+
+    started: list[object] = []
+    monkeypatch.setattr(entrypoint.uvicorn, "run", lambda *a, **k: started.append(a))
+    monkeypatch.setenv("DB_HOST", "postgres")
+    monkeypatch.setenv("DB_NAME", "receipes")
+    monkeypatch.setenv("DB_USER", "receipes")
+    monkeypatch.setenv("DB_PASSWORD", "private-env-password")
+    monkeypatch.setenv("DB_PORT", "private-not-a-port")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://user:private-url-pass@ollama:11434")
+    with pytest.raises(SystemExit) as exit_info:
+        entrypoint.main()
+    assert exit_info.value.code == 1
+    assert started == []
+    output = capsys.readouterr()
+    text = output.out + output.err
+    for secret in ("private-env-password", "private-not-a-port", "private-url-pass"):
+        assert secret not in text
+    assert "Traceback" not in text
+    event = json.loads(output.out.splitlines()[-1])
+    assert event["message"] == "invalid_configuration"
+    assert {item["field"] for item in event["fields"]} == {
+        "db_port",
+        "ollama_base_url",
+    }

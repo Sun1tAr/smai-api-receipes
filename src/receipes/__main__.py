@@ -1,11 +1,33 @@
+import structlog
 import uvicorn
+from pydantic import ValidationError
 
 from receipes.config import Settings
 from receipes.main import create_app
+from receipes.observability import configure_logging
+
+
+# Ошибки настроек описываются именами полей и типами: значения могут быть секретами.
+def load_settings() -> Settings:
+    try:
+        return Settings()
+    except ValidationError as error:
+        configure_logging("INFO")
+        structlog.get_logger().error(
+            "invalid_configuration",
+            fields=[
+                {
+                    "field": ".".join(str(part) for part in item["loc"]),
+                    "type": item["type"],
+                }
+                for item in error.errors()
+            ],
+        )
+        raise SystemExit(1) from None
 
 
 def main() -> None:
-    settings = Settings()
+    settings = load_settings()
     uvicorn.run(
         create_app(settings),
         # Внутри контейнера нужен 0.0.0.0; наружу порт публикует только Compose.
