@@ -7,13 +7,16 @@ from sqlalchemy import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
 from receipes.config import Settings
-from receipes.database import Base, create_engine
+from receipes.database import Base, create_migration_engine
+from receipes.migration_diagnostics import describe_migration_error
 from receipes.observability import configure_logging
 
 settings = Settings()
 configure_logging(settings.log_level)
 # Доменные модели появятся позже; их модуль нужно импортировать здесь.
 target_metadata = Base.metadata
+# Ревизии для диагностики падения: с какой начали и какая применена последней.
+progress: dict[str, str | None] = {"from_revision": None, "last_applied": None}
 
 
 # Offline-режим генерирует SQL без подключения к PostgreSQL.
@@ -31,24 +34,29 @@ def run_migrations_offline() -> None:
 
 # Alembic выполняет синхронные операции через async-соединение SQLAlchemy.
 def migrate(connection: Connection) -> None:
+    def record_applied(revision, step, heads, run_args) -> None:
+        progress["last_applied"] = step.up_revision_id
+
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
         compare_type=True,
+        on_version_apply=record_applied,
     )
+    progress["from_revision"] = context.get_context().get_current_revision()
     with context.begin_transaction():
         context.run_migrations()
 
 
-# Подключение миграций использует ту же конфигурацию, что и приложение.
+# Подключение миграций берёт настройки приложения, но без таймаута запросов.
 async def run_migrations_online() -> None:
-    engine = create_engine(settings)
+    engine = create_migration_engine(settings)
     try:
         async with engine.connect() as connection:
             await connection.run_sync(migrate)
     except (OSError, PostgresError, SQLAlchemyError) as error:
         structlog.get_logger().error(
-            "migration_failed", error_type=type(error).__name__
+            "migration_failed", **describe_migration_error(error), **progress
         )
         raise SystemExit(1) from None
     finally:

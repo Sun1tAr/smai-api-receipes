@@ -30,3 +30,7 @@ def test_migration_connection_failure_has_safe_logs_and_nonzero_exit() -> None:
     failure = next(item for item in events if item["message"] == "migration_failed")
     assert failure["level"] == "error"
     assert failure["error_type"]
+    # Без версии в БД, SQLSTATE и текста сообщения: вывод только безопасных полей.
+    assert failure["sqlstate"] is None
+    assert "db_message" not in failure
+    assert "from_revision" in failure and "last_applied" in failure
