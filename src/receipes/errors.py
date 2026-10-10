@@ -54,13 +54,14 @@ def error_response(
     return JSONResponse(body, status_code=status_code, headers=headers)
 
 
-# Тип и место ошибки без значений: тела запросов не возвращаются и не логируются.
+# Только место и тип ошибки: текст исключений и введённые значения могут содержать
+# пользовательские данные, поэтому не возвращаются и не логируются.
 async def validation_error_handler(request: Request, error: Exception) -> JSONResponse:
     assert isinstance(error, RequestValidationError)
     fields = [
         {
             "field": ".".join(str(part) for part in item["loc"] if part != "body"),
-            "message": item["msg"],
+            "type": item["type"],
         }
         for item in error.errors()
     ]
@@ -82,8 +83,9 @@ async def http_error_handler(request: Request, error: Exception) -> JSONResponse
     )
 
 
+# Запасной путь для ошибок вне middleware логирования; стек пишется без текста.
 async def unexpected_error_handler(request: Request, error: Exception) -> JSONResponse:
-    logger.error("unhandled_error", error_type=type(error).__name__)
+    logger.error("unhandled_error", exc_info=error)
     return error_response(500, "INTERNAL_ERROR", "Internal server error")
 
 

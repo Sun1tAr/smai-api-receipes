@@ -1,5 +1,7 @@
 import logging
+import os
 import sys
+import traceback
 from typing import Any
 
 import structlog
@@ -12,6 +14,11 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from receipes.config import Settings
 
 SERVICE_NAME = "smai-api-receipes"
+PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
+# Кадры сервиса показывают место в нашем коде, нижние кадры — саму причину.
+MAX_SERVICE_FRAMES = 10
+MAX_INNER_FRAMES = 20
+MAX_CAUSES = 5
 
 
 # Связываем JSON-логи с активным трейсом без логирования содержимого запросов.
@@ -27,6 +34,50 @@ def add_context(
     return event
 
 
+# Тип, причины и кадры стека без текста исключения: сообщения драйверов могут
+# содержать адреса подключения, SQL и данные запроса.
+def exception_summary(
+    logger: Any,
+    method_name: str,
+    event: dict[str, Any],
+) -> dict[str, Any]:
+    exc_info = event.pop("exc_info", None)
+    if exc_info is True:
+        exc_info = sys.exc_info()
+    elif isinstance(exc_info, BaseException):
+        exc_info = (type(exc_info), exc_info, exc_info.__traceback__)
+    if not exc_info or exc_info[0] is None:
+        return event
+    error_type, error, trace = exc_info
+    causes: list[str] = []
+    current = error
+    while len(causes) < MAX_CAUSES:
+        current = current.__cause__ or (
+            None if current.__suppress_context__ else current.__context__
+        )
+        if current is None:
+            break
+        causes.append(type(current).__name__)
+    frames = traceback.StackSummary.extract(
+        traceback.walk_tb(trace), lookup_lines=False
+    )
+    service = [
+        index
+        for index, frame in enumerate(frames)
+        if frame.filename.startswith(PACKAGE_DIR)
+    ]
+    inner = range(max(len(frames) - MAX_INNER_FRAMES, 0), len(frames))
+    event["exception"] = {
+        "type": error_type.__name__,
+        "causes": causes,
+        "frames": [
+            f"{frames[index].filename}:{frames[index].lineno} {frames[index].name}"
+            for index in sorted({*service[-MAX_SERVICE_FRAMES:], *inner})
+        ],
+    }
+    return event
+
+
 # Одинаковый формат применяется к structlog и стандартным логгерам библиотек.
 def configure_logging(level: str) -> None:
     shared = [
@@ -34,6 +85,7 @@ def configure_logging(level: str) -> None:
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         add_context,
+        exception_summary,
     ]
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(

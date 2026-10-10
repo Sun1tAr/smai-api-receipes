@@ -2,19 +2,26 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from time import perf_counter
+from typing import Any
 from uuid import uuid4
 
 import structlog
 from fastapi import FastAPI, Request, Response
+from fastapi.openapi.utils import get_openapi
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
-from prometheus_client import CollectorRegistry
+from prometheus_client import (
+    CollectorRegistry,
+    GCCollector,
+    PlatformCollector,
+    ProcessCollector,
+)
 from prometheus_fastapi_instrumentator import Instrumentator
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from receipes.config import Settings
 from receipes.database import create_engine
-from receipes.errors import register_error_handlers
+from receipes.errors import error_response, register_error_handlers
 from receipes.health import dependencies_ready, router
 from receipes.observability import configure_logging, create_tracer_provider
 
@@ -31,6 +38,43 @@ API_DESCRIPTION = (
 REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
 
+# Служебные пробы вызываются каждые несколько секунд: без шума в логах и трейсах.
+QUIET_PATHS = frozenset({"/health", "/metrics"})
+TRACING_EXCLUDED_URLS = ",".join(f"{path}$" for path in sorted(QUIET_PATHS))
+
+
+# Шаблон пути без значений параметров. Маршруты Starlette (/docs, /openapi.json)
+# не кладут route в scope, поэтому ищем их по endpoint.
+def route_path(request: Request) -> str:
+    route = request.scope.get("route")
+    if route is not None:
+        return route.path
+    endpoint = request.scope.get("endpoint")
+    if endpoint is not None:
+        for candidate in request.app.routes:
+            if getattr(candidate, "endpoint", None) is endpoint:
+                return candidate.path
+    return "unmatched"
+
+
+# Ошибки валидации отдаются в формате сервиса (400), поэтому 422 FastAPI не нужен.
+def build_openapi(app: FastAPI) -> dict[str, Any]:
+    if app.openapi_schema is None:
+        schema = get_openapi(
+            title=app.title,
+            version=app.version,
+            description=app.description,
+            routes=app.routes,
+        )
+        for path in schema["paths"].values():
+            for operation in path.values():
+                operation["responses"].pop("422", None)
+        for name in ("HTTPValidationError", "ValidationError"):
+            schema.get("components", {}).get("schemas", {}).pop(name, None)
+        app.openapi_schema = schema
+    return app.openapi_schema
+
+
 def resolve_request_id(incoming: str | None) -> str:
     if incoming is not None and REQUEST_ID_PATTERN.fullmatch(incoming):
         return incoming
@@ -43,8 +87,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     configure_logging(settings.log_level)
     engine = create_engine(settings)
     provider = create_tracer_provider(settings)
-    # Единый реестр: сюда же позже добавятся доменные метрики.
+    # Единый реестр: сюда же позже добавятся доменные метрики. Приватный реестр не
+    # содержит метрик процесса по умолчанию, поэтому добавляем их явно.
     metrics_registry = CollectorRegistry()
+    ProcessCollector(registry=metrics_registry)
+    PlatformCollector(registry=metrics_registry)
+    GCCollector(registry=metrics_registry)
 
     # Владение соединениями и экспортёром ограничено жизненным циклом приложения.
     @asynccontextmanager
@@ -75,6 +123,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.tracer_provider = provider
     app.state.metrics_registry = metrics_registry
     app.include_router(router)
+    app.openapi = lambda: build_openapi(app)
 
     # Request ID относится к текущему HTTP-вызову; query и тела не логируются.
     @app.middleware("http")
@@ -87,20 +136,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         structlog.contextvars.bind_contextvars(request_id=request_id)
         started = perf_counter()
         try:
-            response = await call_next(request)
+            try:
+                response = await call_next(request)
+            except Exception:
+                # 500 собирается здесь, а не в ServerErrorMiddleware: так в ответе
+                # есть X-Request-ID, а лог ошибки несёт тот же request_id.
+                logger.error("unhandled_error", exc_info=True)
+                response = error_response(
+                    500, "INTERNAL_ERROR", "Internal server error"
+                )
             response.headers["X-Request-ID"] = request_id
-            route = request.scope.get("route")
-            logger.info(
+            path = route_path(request)
+            quiet = path in QUIET_PATHS and response.status_code < 400
+            log = logger.debug if quiet else logger.info
+            log(
                 "http_request",
                 method=request.method,
-                path=route.path if route else "unmatched",
+                path=path,
                 status_code=response.status_code,
                 duration_seconds=round(perf_counter() - started, 6),
             )
             return response
-        except Exception as error:
-            logger.error("http_request_failed", error_type=type(error).__name__)
-            raise
         finally:
             structlog.contextvars.clear_contextvars()
 
@@ -109,5 +165,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         should_group_status_codes=False,
         should_ignore_untemplated=True,
     ).instrument(app).expose(app, include_in_schema=False)
-    FastAPIInstrumentor.instrument_app(app, tracer_provider=provider)
+    FastAPIInstrumentor.instrument_app(
+        app, tracer_provider=provider, excluded_urls=TRACING_EXCLUDED_URLS
+    )
     return app
