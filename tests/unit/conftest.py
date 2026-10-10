@@ -14,6 +14,7 @@ def clean_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "DB_USER",
         "DB_PASSWORD",
         "DB_TIMEOUT_SECONDS",
+        "MIGRATION_LOCK_TIMEOUT_SECONDS",
         "LOG_LEVEL",
         "OTEL_EXPORTER_OTLP_ENDPOINT",
         "OLLAMA_BASE_URL",

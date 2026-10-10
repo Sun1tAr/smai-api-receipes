@@ -53,3 +53,24 @@ def test_non_postgres_error_has_no_sqlstate_or_message() -> None:
 
     fields = describe_migration_error(ConnectionRefusedError("10.1.2.3 password=x"))
     assert fields == {"error_type": "ConnectionRefusedError", "sqlstate": None}
+
+
+def test_message_is_kept_only_for_schema_and_syntax_class() -> None:
+    from receipes.migration_diagnostics import describe_migration_error
+
+    syntax = server_error("42601", 'syntax error at or near "SELEC"')
+    assert describe_migration_error(syntax)["db_message"].startswith("syntax error")
+
+
+def test_message_with_row_data_is_not_logged() -> None:
+    from receipes.migration_diagnostics import describe_migration_error
+
+    for code, message in (
+        ("22P02", 'invalid input syntax for type integer: "private-abc"'),
+        ("23505", "duplicate key value violates unique constraint"),
+        ("23502", "null value in column"),
+    ):
+        fields = describe_migration_error(server_error(code, message))
+        assert "db_message" not in fields
+        assert fields["sqlstate"] == code and fields["driver_error_type"]
+        assert "private-abc" not in str(fields)

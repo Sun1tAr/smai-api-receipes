@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     db_user: str = Field(min_length=1)
     db_password: SecretStr = Field(min_length=1)
     db_timeout_seconds: float = Field(default=5, gt=0, le=60)
+    # Ожидание блокировки при миграциях (только Alembic): чужая блокировка не должна
+    # подвешивать старт контейнера бесконечно.
+    migration_lock_timeout_seconds: float = Field(default=30, gt=0, le=3600)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     otel_exporter_otlp_endpoint: AnyHttpUrl | None = None
 
