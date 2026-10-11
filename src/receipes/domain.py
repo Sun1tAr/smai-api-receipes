@@ -34,6 +34,17 @@ class InvalidGenerationParameters(DomainError):
         self.reason = reason
 
 
+class InvalidPromptTemplate(DomainError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"Invalid prompt template: {reason}")
+        self.reason = reason
+
+
+class PromptTemplateNotFound(DomainError):
+    def __init__(self) -> None:
+        super().__init__("No prompt template is stored")
+
+
 class MenuNotFound(DomainError):
     def __init__(self, menu_id: UUID) -> None:
         super().__init__(f"Menu {menu_id} not found")

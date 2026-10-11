@@ -14,6 +14,7 @@ from receipes.domain import (
     GenerationTaskNotFound,
     InvalidTaskTransition,
     MenuNotFound,
+    PromptTemplateNotFound,
     TaskStatus,
 )
 from receipes.generated_menu import GeneratedMenu
@@ -29,6 +30,7 @@ from receipes.models import (
     Recipe,
     RecipeIngredient,
 )
+from receipes.prompt import prompt_builder
 
 logger = structlog.get_logger()
 
@@ -365,3 +367,11 @@ class PromptTemplateRepository:
                 .limit(1)
             )
         ).scalar_one_or_none()
+
+    # build_prompt для claim_next на основе актуального шаблона; без шаблона —
+    # PromptTemplateNotFound (воркер не должен брать задачи).
+    async def builder(self) -> Callable[[GenerationParameters], str]:
+        template = await self.latest()
+        if template is None:
+            raise PromptTemplateNotFound()
+        return prompt_builder(template.template)
