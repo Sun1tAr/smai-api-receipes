@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import time
 import uuid
 from collections.abc import Callable
 from datetime import timedelta
@@ -7,8 +8,15 @@ from time import perf_counter
 
 import structlog
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+)
 
+from receipes.breaker import CircuitBreaker
 from receipes.config import Settings
 from receipes.domain import (
     GenerationParameters,
@@ -30,6 +38,16 @@ logger = structlog.get_logger()
 
 # Запас к времени всех попыток: in_progress старше него считается зависшим.
 STALE_MARGIN_SECONDS = 60
+# Один активный воркер на кластер: pg_try_advisory_lock на отдельном соединении.
+ADVISORY_LOCK_ID = 7_243_219_907_100_001
+# Потолок экспоненциальной паузы при ошибках тика (например, БД недоступна).
+TICK_BACKOFF_CAP_SECONDS = 30
+# Сколько отмена воркера ждёт записи «Generation interrupted».
+INTERRUPT_WRITE_TIMEOUT_SECONDS = 5
+# Сбои Ollama, после которых breaker не пускает новые задачи.
+BREAKER_REASONS = frozenset(
+    {FailureReason.UNAVAILABLE, FailureReason.TIMEOUT, FailureReason.HTTP_ERROR}
+)
 
 
 # Метки метрик — только фиксированные значения, без task_id и свободного текста.
@@ -37,7 +55,9 @@ class WorkerMetrics:
     def __init__(self, registry: CollectorRegistry) -> None:
         self.outcomes = Counter(
             "generation_outcomes",
-            "Finished menu generations by outcome and reason.",
+            "Finished menu generations by outcome and reason. Outcome 'discarded' "
+            "means the result could not be recorded because the task had expired; "
+            "its reason is the outcome that was intended.",
             ["outcome", "reason"],
             registry=registry,
         )
@@ -68,6 +88,21 @@ class WorkerMetrics:
             "Ticks skipped because the prompt template is missing or invalid.",
             registry=registry,
         )
+        self.breaker_open = Gauge(
+            "generation_breaker_open",
+            "1 while the Ollama circuit breaker is open (no new tasks are taken).",
+            registry=registry,
+        )
+        self.breaker_opened = Counter(
+            "generation_breaker_opened",
+            "Times the Ollama circuit breaker opened.",
+            registry=registry,
+        )
+        self.leader = Gauge(
+            "generation_worker_active",
+            "1 while this replica holds the generation advisory lock.",
+            registry=registry,
+        )
 
 
 class GenerationWorker:
@@ -75,11 +110,14 @@ class GenerationWorker:
         self,
         *,
         settings: Settings,
+        engine: AsyncEngine,
         session_factory: async_sessionmaker[AsyncSession],
         client: OllamaClient,
         metrics: WorkerMetrics,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.settings = settings
+        self.engine = engine
         self.session_factory = session_factory
         self.client = client
         self.metrics = metrics
@@ -88,7 +126,13 @@ class GenerationWorker:
             seconds=settings.ollama_timeout_seconds * self.attempts
             + STALE_MARGIN_SECONDS
         )
+        self.breaker = CircuitBreaker(
+            settings.generation_breaker_min_pause_seconds,
+            settings.generation_breaker_max_pause_seconds,
+            clock,
+        )
         self._task: asyncio.Task[None] | None = None
+        self._lock_connection: AsyncConnection | None = None
 
     # --- жизненный цикл -----------------------------------------------------
 
@@ -96,42 +140,112 @@ class GenerationWorker:
         if self._task is None:
             self._task = asyncio.create_task(self.run(), name="generation-worker")
 
-    # Отмена и ожидание: после остановки не остаётся висящих задач. Задача, которую
-    # прервали на вызове Ollama, остаётся in_progress; её завершит expire_stale.
+    # Отмена и ожидание: после остановки не остаётся висящих задач. Прерванная на
+    # вызове Ollama задача помечается failed (см. process). Блокировка и клиент
+    # освобождаются независимо друг от друга.
     async def stop(self) -> None:
         task, self._task = self._task, None
-        if task is not None:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        await self.client.close()
+        try:
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        finally:
+            try:
+                await self.release_leadership()
+            finally:
+                await self.client.close()
 
     async def run(self) -> None:
         logger.info("generation_worker_started")
+        errors = 0
         try:
             while True:
                 processed = False
                 try:
                     processed = await self.tick()
                 except Exception:
-                    # Одна ошибка тика не должна останавливать воркер.
+                    # Одна ошибка тика не останавливает воркер. Лог — на смену
+                    # состояния и затем по нарастающей (1, 2, 4, 8 …), пауза растёт.
+                    errors += 1
                     self.metrics.tick_errors.inc()
-                    logger.error("generation_tick_failed", exc_info=True)
-                if not processed:
-                    await asyncio.sleep(
-                        self.settings.generation_worker_interval_seconds
-                    )
+                    if errors & (errors - 1) == 0:
+                        logger.error(
+                            "generation_tick_failed", consecutive=errors, exc_info=True
+                        )
+                else:
+                    if errors:
+                        logger.info("generation_worker_recovered", after_errors=errors)
+                        errors = 0
+                if processed:
+                    continue
+                interval = self.settings.generation_worker_interval_seconds
+                await asyncio.sleep(
+                    min(interval * 2**errors, TICK_BACKOFF_CAP_SECONDS)
+                    if errors
+                    else interval
+                )
         finally:
             logger.info("generation_worker_stopped")
+
+    # --- один активный воркер -----------------------------------------------
+
+    # Блокировка держится на отдельном соединении в AUTOCOMMIT; она снимается при
+    # закрытии или обрыве соединения. Потеря соединения замечается на следующем тике:
+    # воркер перестаёт считать себя активным и пробует взять блокировку заново.
+    async def ensure_leader(self) -> bool:
+        if self._lock_connection is not None:
+            try:
+                await self._lock_connection.execute(text("SELECT 1"))
+                return True
+            except Exception:
+                logger.warning("generation_lock_connection_lost")
+                await self.release_leadership()
+        connection = await self.engine.connect()
+        try:
+            connection = await connection.execution_options(
+                isolation_level="AUTOCOMMIT"
+            )
+            acquired = await connection.scalar(
+                text("SELECT pg_try_advisory_lock(:id)"), {"id": ADVISORY_LOCK_ID}
+            )
+        except BaseException:
+            await self.discard(connection)
+            raise
+        if not acquired:
+            await connection.close()
+            return False
+        self._lock_connection = connection
+        self.metrics.leader.set(1)
+        logger.info("generation_worker_active")
+        return True
+
+    async def release_leadership(self) -> None:
+        connection, self._lock_connection = self._lock_connection, None
+        self.metrics.leader.set(0)
+        if connection is not None:
+            await self.discard(connection)
+
+    # Соединение с блокировкой не возвращается в пул, а закрывается по-настоящему.
+    @staticmethod
+    async def discard(connection: AsyncConnection) -> None:
+        with contextlib.suppress(Exception):
+            await connection.invalidate()
+        with contextlib.suppress(Exception):
+            await connection.close()
 
     # --- тик ---------------------------------------------------------------
 
     # Один тик: обслуживание очереди и обработка одной задачи. True — задача была,
     # и следующий тик нужен сразу, без паузы.
     async def tick(self) -> bool:
+        if not await self.ensure_leader():
+            return False
         await self.maintain_queue()
         build_prompt = await self.load_prompt_builder()
         if build_prompt is None:
+            return False
+        if not await self.breaker_allows():
             return False
         async with self.session_factory() as session:
             task = await TaskRepository(session).claim_next(build_prompt)
@@ -141,6 +255,32 @@ class GenerationWorker:
             return False
         await self.process(task)
         return True
+
+    # Открытый breaker не пускает новые задачи: после паузы проверяется доступность
+    # Ollama (GET /api/tags), и только удачная проба закрывает его.
+    async def breaker_allows(self) -> bool:
+        if not self.breaker.is_open:
+            return True
+        if not self.breaker.probe_due():
+            return False
+        if await self.client.probe():
+            self.breaker.record_probe_success()
+            self.metrics.breaker_open.set(0)
+            logger.info("ollama_breaker_closed")
+            return True
+        self.breaker.record_failure()
+        logger.warning("ollama_probe_failed", next_pause_seconds=self.breaker.pause)
+        return False
+
+    def note_ollama_failure(self, reason: FailureReason) -> None:
+        if reason in BREAKER_REASONS and self.breaker.record_failure():
+            self.metrics.breaker_opened.inc()
+            self.metrics.breaker_open.set(1)
+            logger.warning(
+                "ollama_breaker_opened",
+                reason=reason.value,
+                pause_seconds=self.breaker.pause,
+            )
 
     async def maintain_queue(self) -> None:
         async with self.session_factory() as session:
@@ -179,19 +319,41 @@ class GenerationWorker:
         log = logger.bind(task_id=str(task_id))
         try:
             menu = await self.generate(prompt, log)
-            if not await self.finish(task_id, menu):
-                # Задачу успели завершить (просрочена): меню не сохранено.
-                log.warning("generation_result_discarded")
-                return
+            done = await self.finish(task_id, menu)
         except GenerationFailure as failure:
+            self.note_ollama_failure(failure.reason)
             await self.fail(task_id, failure.reason, log)
             return
+        except asyncio.CancelledError:
+            # Остановка посреди вызова (деплой): без этого задача висела бы
+            # in_progress до expire_stale. Запись защищена от повторной отмены.
+            await self.record_interruption(task_id, log)
+            raise
         except Exception:
             log.error("generation_failed_unexpectedly", exc_info=True)
             await self.fail(task_id, FailureReason.INTERNAL, log)
             return
-        self.metrics.outcomes.labels("done", "none").inc()
-        log.info("generation_done")
+        if done:
+            self.breaker.record_success()
+            self.metrics.breaker_open.set(0)
+            self.metrics.outcomes.labels("done", "none").inc()
+            log.info("generation_done")
+        else:
+            # Задачу успели завершить (просрочена): меню не сохранено.
+            self.metrics.outcomes.labels("discarded", "done").inc()
+            log.warning("generation_result_discarded")
+
+    async def record_interruption(
+        self, task_id: uuid.UUID, log: structlog.stdlib.BoundLogger
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(self.fail(task_id, FailureReason.INTERRUPTED, log)),
+                INTERRUPT_WRITE_TIMEOUT_SECONDS,
+            )
+        except (TimeoutError, asyncio.CancelledError, Exception):
+            # Не удалось вовремя: задачу завершит expire_stale.
+            log.warning("generation_interruption_not_recorded")
 
     # Вызов Ollama без открытых сессий и транзакций. Повторяется только невалидный
     # ответ модели (GENERATION_BAD_RESPONSE_RETRIES); недоступность и таймаут — нет.
@@ -231,13 +393,14 @@ class GenerationWorker:
                 await session.rollback()
             return done
 
+    # Исход считается после записи в БД: проигранный переход — «discarded», а не
+    # failed; если записать не удалось, исход не считается вовсе.
     async def fail(
         self,
         task_id: uuid.UUID,
         reason: FailureReason,
         log: structlog.stdlib.BoundLogger,
     ) -> None:
-        self.metrics.outcomes.labels("failed", reason.value).inc()
         try:
             async with self.session_factory() as session:
                 changed = await TaskRepository(session).transition(
@@ -252,6 +415,8 @@ class GenerationWorker:
             log.error("generation_fail_not_recorded", exc_info=True)
             return
         if changed:
+            self.metrics.outcomes.labels("failed", reason.value).inc()
             log.warning("generation_failed", reason=reason.value)
         else:
+            self.metrics.outcomes.labels("discarded", reason.value).inc()
             log.warning("generation_failure_discarded", reason=reason.value)

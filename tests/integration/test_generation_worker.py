@@ -58,6 +58,7 @@ def worker_for(settings: Settings, session_factory, handler: Handler, **override
     effective = settings.model_copy(update=overrides)
     return GenerationWorker(
         settings=effective,
+        engine=session_factory.kw["bind"],
         session_factory=session_factory,
         client=OllamaClient(effective, transport=httpx.MockTransport(handler)),
         metrics=WorkerMetrics(CollectorRegistry()),

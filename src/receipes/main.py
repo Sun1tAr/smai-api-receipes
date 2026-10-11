@@ -136,6 +136,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if settings.generation_worker_enabled:
                 worker = GenerationWorker(
                     settings=settings,
+                    engine=engine,
                     session_factory=app.state.session_factory,
                     client=OllamaClient(settings),
                     metrics=app.state.worker_metrics,
@@ -144,13 +145,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             logger.info("service_started", worker_enabled=worker is not None)
             yield
         finally:
-            # Воркер останавливается раньше пула соединений, на котором он работает.
-            if worker is not None:
-                await worker.stop()
-            await engine.dispose()
-            instrumentor.uninstrument()
-            provider.shutdown()
-            logger.info("service_stopped")
+            # Каждый ресурс освобождается в своём try/finally: сбой остановки воркера
+            # не должен оставить открытым пул БД.
+            try:
+                if worker is not None:
+                    await worker.stop()
+            finally:
+                try:
+                    await engine.dispose()
+                finally:
+                    instrumentor.uninstrument()
+                    provider.shutdown()
+                    logger.info("service_stopped")
 
     app = ReceipesApp(
         title="SmartMeal recipes service",

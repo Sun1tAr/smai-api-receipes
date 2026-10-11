@@ -22,6 +22,7 @@ def make_worker(interval: float = 0.01, **settings: Any):
         settings=unavailable_db_settings(
             generation_worker_interval_seconds=interval, **settings
         ),
+        engine=None,  # type: ignore[arg-type]
         session_factory=None,  # type: ignore[arg-type]
         client=client,  # type: ignore[arg-type]
         metrics=WorkerMetrics(CollectorRegistry()),
@@ -138,3 +139,39 @@ def test_stale_threshold_covers_every_attempt_plus_a_margin() -> None:
 def test_attempts_follow_the_retry_setting(retries) -> None:
     worker, _ = make_worker(generation_bad_response_retries=retries)
     assert worker.attempts == 1 + retries
+
+
+async def test_tick_errors_back_off_exponentially_and_log_sparsely(monkeypatch) -> None:
+    from structlog.testing import capture_logs
+
+    import receipes.worker as module
+
+    worker, _ = make_worker(interval=2)
+    delays: list[float] = []
+    enough = asyncio.Event()
+    outcomes = iter([RuntimeError] * 8 + [False])
+
+    async def tick() -> bool:
+        item = next(outcomes, False)
+        if item is RuntimeError:
+            raise RuntimeError("db is down")
+        return bool(item)
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) >= 9:
+            enough.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(worker, "tick", tick)
+    monkeypatch.setattr(module.asyncio, "sleep", fake_sleep)
+    with capture_logs() as logs:
+        worker.start()
+        await enough.wait()
+        await worker.stop()
+    # 2·2ⁿ секунд до потолка 30; успешный тик возвращает обычный интервал.
+    assert delays == [4, 8, 16, 30, 30, 30, 30, 30, 2]
+    failures = [e for e in logs if e["event"] == "generation_tick_failed"]
+    assert [e["consecutive"] for e in failures] == [1, 2, 4, 8]
+    recovered = [e for e in logs if e["event"] == "generation_worker_recovered"]
+    assert [e["after_errors"] for e in recovered] == [8]
