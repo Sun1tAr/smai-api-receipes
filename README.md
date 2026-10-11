@@ -2,9 +2,8 @@
 
 MS-4 — сервис рецептов SmartMeal: ядро домена рецептов и генерация меню через
 Ollama. Готовы инфраструктура (**SMAI-58**), слой данных и домен (**SMAI-57**),
-шаблон промпта (**SMAI-56**) и API-1/API-2 (**SMAI-55**). Воркер генерации и клиент
-Ollama появятся в задачах SMAI-54 и SMAI-53: до тех пор созданные задачи остаются
-`pending`.
+шаблон промпта (**SMAI-56**), API-1/API-2 (**SMAI-55**) и фоновый воркер с клиентом
+Ollama (**SMAI-54**).
 
 ## Эндпоинты
 
@@ -127,7 +126,7 @@ Compose-сети. При старте контейнер выполняет `ale
 | `GENERATION_WORKER_ENABLED` | Включить фоновый воркер генерации | `true` |
 | `GENERATION_WORKER_INTERVAL_SECONDS` | Интервал опроса очереди, (0, 3600] | `2` |
 | `GENERATION_PENDING_TTL_SECONDS` | Время жизни ожидающей задачи, [1, 86400] | `900` |
-| `GENERATION_MAX_PENDING` | Лимит ожидающих задач | Не задан — без лимита |
+| `GENERATION_MAX_PENDING` | Лимит ожидающих задач (пока не применяется) | Не задан — без лимита |
 | `GENERATION_BAD_RESPONSE_RETRIES` | Повторы при некорректном ответе модели, [0, 10] | `1` |
 | `RECEIPES_HTTP_PORT` | Хостовой порт Compose (только Compose) | `8001` |
 
@@ -137,8 +136,9 @@ Compose-сети. При старте контейнер выполняет `ale
 сервис пишет в лог только имена полей и типы ошибок (`invalid_configuration`)
 и завершается с кодом 1.
 
-Воркер и клиент Ollama пока не реализованы: переменные `OLLAMA_*` и
-`GENERATION_*` только валидируются и пробрасываются в контейнер.
+Переменные `OLLAMA_*` и `GENERATION_*` читает воркер генерации (см. раздел «Фоновый
+воркер»). `GENERATION_MAX_PENDING` пока не используется: лимит очереди в API-1
+отложен решением Ivan.
 Compose требует `DB_NAME`, `DB_USER`, `DB_PASSWORD` и `OLLAMA_BASE_URL`
 (без них `docker compose` не запускается); `DB_HOST` и `DB_PORT` внутри Compose
 закреплены (`postgres:5432`). `.env` не попадает в Git и в образ; конфигурацию
@@ -353,7 +353,8 @@ OLLAMA_BASE_URL=http://localhost:11434 uv run python -m scripts.ollama_smoke \
 src/receipes/       приложение: config, database, main (create_app), health,
                     errors, observability, migration_diagnostics, __main__ (запуск uvicorn);
                     домен MS-4: models, domain, generated_menu, prompt, repositories;
-                    API-1/API-2: api (роутеры), schemas, service
+                    API-1/API-2: api (роутеры), schemas, service;
+                    воркер: ollama (клиент), worker
 migrations/         Alembic (async env.py), ревизии в versions/ (0001–0003)
 scripts/            ручные инструменты (ollama_smoke.py)
 docker/             entrypoint.sh: alembic upgrade head, затем запуск сервера
@@ -383,16 +384,63 @@ Alembic ждёт подключения не дольше `DB_TIMEOUT_SECONDS`, 
 `contents: read`; устаревшие запуски PR отменяются. Публикация образа и деплой
 (stage/prod) в CI не описаны: это решение Ivan и DevOps.
 
-## Задачи для воркера (SMAI-54)
+## Фоновый воркер
 
-- `OLLAMA_TIMEOUT_SECONDS` и `OLLAMA_NUM_PREDICT` нужно подобрать запуском
-  `scripts.ollama_smoke` на реальной Ollama: значения по умолчанию (900 с и 16384
-  токена) — оценка, а не измерение.
-- Если `PromptTemplateRepository.builder()` бросает `InvalidPromptTemplate`, воркер
-  логирует ошибку на уровне `error` с причиной **на каждом тике**, а не молча;
-  задачи остаются `pending` до исправления шаблона.
-- `done_reason=length` в ответе Ollama (обрыв по `num_predict`) обрабатывать явно:
-  помечать задачу ошибкой с понятным текстом, а не падать на разборе JSON.
+Запускается в `lifespan` приложения при `GENERATION_WORKER_ENABLED=true` и
+останавливается при завершении (отмена и ожидание задачи, затем закрытие клиента
+Ollama, затем пул БД). Один воркер на процесс; задачи обрабатываются по одной.
+
+**Тик** (раз в `GENERATION_WORKER_INTERVAL_SECONDS`; если задача была — следующий
+тик сразу, без паузы):
+1. Обслуживание очереди: `expire_stale` переводит `pending` старше
+   `GENERATION_PENDING_TTL_SECONDS` в `failed` (`Queue timeout`), а `in_progress`
+   старше `OLLAMA_TIMEOUT_SECONDS × (1 + GENERATION_BAD_RESPONSE_RETRIES) + 60 с`
+   — в `failed` (`Generation interrupted`); обновляется gauge очереди.
+2. Шаблон: `PromptTemplateRepository.builder()`. Нет шаблона или он сломан
+   (`InvalidPromptTemplate`) — ошибка в лог (`prompt_template_unusable`, уровень
+   `error`) **на каждом тике**, задачи остаются `pending`, воркер не падает.
+3. Захват: `claim_next` (`FOR UPDATE SKIP LOCKED`), промпт сохраняется в
+   `generation_task.prompt`, транзакция коммитится сразу.
+4. Вызов Ollama **вне транзакций БД** (`POST /api/generate`, `stream: false`,
+   `format` из `ollama_format_schema()`, опции `num_ctx`/`num_predict`/
+   `temperature`, `keep_alive`). Соединение ограничено
+   `OLLAMA_CONNECT_TIMEOUT_SECONDS`, весь вызов — `OLLAMA_TIMEOUT_SECONDS`.
+5. Результат: ответ проходит «ворота» `GeneratedMenu`; `complete` сохраняет меню и
+   переводит задачу в `done` одной транзакцией. Если задача к этому моменту уже не
+   `in_progress` (просрочена), меню не сохраняется, пишется предупреждение
+   `generation_result_discarded`.
+
+**Ошибки → `failed`** с коротким безопасным текстом (он виден в API-2; сырой ответ
+модели и детали транспорта в нём и в логах не появляются):
+
+| Причина (метка метрики) | `error` | Повтор |
+| --- | --- | --- |
+| `unavailable` (нет соединения, обрыв) | `Ollama is unavailable` | нет |
+| `timeout` | `Ollama request timed out` | нет |
+| `http_error` (любой HTTP ≥ 400, в т. ч. 503) | `Ollama returned an error` | нет |
+| `truncated` (`done_reason=length`) | `Model response was cut off (token limit reached)` | нет |
+| `invalid_response` (не JSON, не прошёл «ворота») | `Model returned an invalid menu` | да, `GENERATION_BAD_RESPONSE_RETRIES` раз (по умолчанию 1) |
+| `internal` (любая другая ошибка) | `Menu generation failed` | нет |
+
+Повторяется только невалидный ответ модели; недоступность и таймаут повторов не
+имеют. Если сам переход в `failed` записать не удалось, задача остаётся
+`in_progress` и её завершит `expire_stale`. Остановка сервиса во время вызова
+Ollama оставляет задачу `in_progress` по той же причине.
+
+**Метрики** (общий registry, без `task_id` и свободного текста):
+`generation_outcomes_total{outcome="done|failed",reason=…}`,
+`ollama_request_duration_seconds{result="ok|<причина>"}` (гистограмма),
+`generation_pending_tasks` (gauge), `generation_tasks_expired_total`,
+`generation_worker_tick_errors_total`, `generation_template_errors_total`.
+
+**Ограничения.**
+- `OLLAMA_TIMEOUT_SECONDS` (900 с) и `OLLAMA_NUM_PREDICT` (16384) — оценка; их нужно
+  подобрать запуском `scripts.ollama_smoke` на реальной Ollama. Воркер с реальной
+  Ollama не запускался: клиент и воркер проверены на заглушке Ollama
+  (`httpx.MockTransport`) и на локальном mock-сервере.
+- Один воркер на процесс; при нескольких репликах задачи не дублируются
+  (`SKIP LOCKED`), но каждая реплика делает свои запросы к Ollama.
+- `GENERATION_MAX_PENDING` не применяется (решение Ivan).
 
 ## Известные ограничения
 
