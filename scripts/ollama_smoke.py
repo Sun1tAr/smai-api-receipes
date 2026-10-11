@@ -104,7 +104,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--model", default=os.getenv("OLLAMA_MODEL", DEFAULT_MODEL))
     parser.add_argument("--people", type=int, default=2)
     parser.add_argument("--budget", default="5000")
-    parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=Settings.model_fields["ollama_timeout_seconds"].default,
+    )
     args = parser.parse_args(argv)
     try:
         parameters = GenerationParameters(args.people, Decimal(args.budget))

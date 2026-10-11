@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     ollama_base_url: AnyHttpUrl
     ollama_model: str = Field(default="qwen2.5:7b-instruct-q4_K_M", min_length=1)
     ollama_connect_timeout_seconds: float = Field(default=5, gt=0, le=60)
-    ollama_timeout_seconds: float = Field(default=300, gt=0, le=3600)
+    ollama_timeout_seconds: float = Field(default=900, gt=0, le=3600)
     ollama_num_ctx: int = Field(default=32768, ge=512, le=1_048_576)
     ollama_num_predict: int = Field(default=16384, ge=1, le=1_048_576)
     ollama_temperature: float = Field(default=0.3, ge=0, le=2)

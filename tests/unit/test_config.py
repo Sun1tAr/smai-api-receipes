@@ -50,7 +50,7 @@ def test_defaults() -> None:
     assert settings.otel_exporter_otlp_endpoint is None
     assert settings.ollama_model == "qwen2.5:7b-instruct-q4_K_M"
     assert settings.ollama_connect_timeout_seconds == 5
-    assert settings.ollama_timeout_seconds == 300
+    assert settings.ollama_timeout_seconds == 900
     assert settings.ollama_num_ctx == 32768
     assert settings.ollama_num_predict == 16384
     assert settings.ollama_temperature == 0.3

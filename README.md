@@ -73,9 +73,9 @@ Compose-сети. При старте контейнер выполняет `ale
 | `OLLAMA_BASE_URL` | Адрес Ollama (http/https) | Обязательна |
 | `OLLAMA_MODEL` | Модель | `qwen2.5:7b-instruct-q4_K_M` |
 | `OLLAMA_CONNECT_TIMEOUT_SECONDS` | Таймаут соединения, (0, 60] | `5` |
-| `OLLAMA_TIMEOUT_SECONDS` | Таймаут ответа, (0, 3600] | `300` |
+| `OLLAMA_TIMEOUT_SECONDS` | Таймаут ответа, (0, 3600]; подбирается смоком на реальной Ollama | `900` |
 | `OLLAMA_NUM_CTX` | Размер контекста, токенов | `32768` |
-| `OLLAMA_NUM_PREDICT` | Максимум токенов ответа (JSON с 21 рецептом не влезает в 4096; вместе с промптом ≈1 тыс. токенов помещается в `OLLAMA_NUM_CTX`) | `16384` |
+| `OLLAMA_NUM_PREDICT` | Максимум токенов ответа, подбирается смоком на реальной Ollama (JSON с 21 рецептом не влезает в 4096; вместе с промптом ≈1 тыс. токенов помещается в `OLLAMA_NUM_CTX`) | `16384` |
 | `OLLAMA_TEMPERATURE` | Температура, [0, 2] | `0.3` |
 | `OLLAMA_KEEP_ALIVE` | Сколько держать модель в памяти | `30m` |
 | `GENERATION_WORKER_ENABLED` | Включить фоновый воркер генерации | `true` |
@@ -335,6 +335,17 @@ Alembic ждёт подключения не дольше `DB_TIMEOUT_SECONDS`, 
 --wait`, затем `/health` и `/docs`), `docker-build`; у каждой джобы задан `timeout-minutes`. Права workflow —
 `contents: read`; устаревшие запуски PR отменяются. Публикация образа и деплой
 (stage/prod) в CI не описаны: это решение Ivan и DevOps.
+
+## Задачи для воркера (SMAI-54)
+
+- `OLLAMA_TIMEOUT_SECONDS` и `OLLAMA_NUM_PREDICT` нужно подобрать запуском
+  `scripts.ollama_smoke` на реальной Ollama: значения по умолчанию (900 с и 16384
+  токена) — оценка, а не измерение.
+- Если `PromptTemplateRepository.builder()` бросает `InvalidPromptTemplate`, воркер
+  логирует ошибку на уровне `error` с причиной **на каждом тике**, а не молча;
+  задачи остаются `pending` до исправления шаблона.
+- `done_reason=length` в ответе Ollama (обрыв по `num_predict`) обрабатывать явно:
+  помечать задачу ошибкой с понятным текстом, а не падать на разборе JSON.
 
 ## Известные ограничения
 
