@@ -1,12 +1,10 @@
 # smai-api-receipes
 
 MS-4 — сервис рецептов SmartMeal: ядро домена рецептов и генерация меню через
-Ollama. Готовы инфраструктура (**SMAI-58**: каркас приложения, PostgreSQL,
-миграции, health, метрики, трейсы и логи, Docker/Compose, CI) и слой данных и
-домен (**SMAI-57**: модели, миграции, доменные правила, репозитории, «ворота»
-ответа модели). Бизнес-эндпоинты API-1/API-2, воркер генерации, клиент Ollama,
-шаблон промпта и его начальное наполнение появятся в задачах SMAI-55, SMAI-56 и
-SMAI-54.
+Ollama. Готовы инфраструктура (**SMAI-58**), слой данных и домен (**SMAI-57**),
+шаблон промпта (**SMAI-56**) и API-1/API-2 (**SMAI-55**). Воркер генерации и клиент
+Ollama появятся в задачах SMAI-54 и SMAI-53: до тех пор созданные задачи остаются
+`pending`.
 
 ## Эндпоинты
 
@@ -14,10 +12,53 @@ SMAI-54.
 
 | Метод и путь | Назначение | Ответы | Статус |
 | --- | --- | --- | --- |
+| `POST /generate-menu` | API-1: создать задачу генерации меню `{"peopleCount": 1–20, "weeklyBudget": 0 < x ≤ 1 000 000, до 2 знаков}` | 202 `{"task_id": "<uuid>"}`, 400 `VALIDATION_ERROR`, 500 `INTERNAL_ERROR` | бизнес |
+| `GET /generate-menu/{task_id}` | API-2: статус и результат задачи | 200 `{"status", "menu", "error"}`, 404 `NOT_FOUND`, 500 `INTERNAL_ERROR` | бизнес |
 | `GET /health` | Готовность: `SELECT 1` к PostgreSQL (Ollama не проверяется); не пишет спаны, лог запроса на уровне DEBUG | 200 `{"status":"ok"}`, 503 `INTERNAL_ERROR` | служебный |
 | `GET /metrics` | Метрики Prometheus: HTTP, Python, GC и процесс (вне схемы OpenAPI) | 200 `text/plain` | служебный |
 | `GET /docs` | Swagger UI | 200 `text/html` | служебный |
 | `GET /openapi.json` | Схема OpenAPI | 200 `application/json` | служебный |
+
+### Примеры
+
+```sh
+curl -X POST http://127.0.0.1:8001/generate-menu \
+  -H 'Content-Type: application/json' \
+  -d '{"peopleCount": 4, "weeklyBudget": 5000}'
+# 202 {"task_id": "cde97b89-f3b2-426f-b001-89a1a15cac79"}
+
+curl http://127.0.0.1:8001/generate-menu/cde97b89-f3b2-426f-b001-89a1a15cac79
+# 200 {"status": "pending", "menu": null, "error": null}
+```
+
+Ответ API-2: `status` — `pending`, `in_progress`, `done` или `failed`. `menu`
+заполнено только при `done` (структура контракта: `recipes[]` с `name`,
+`ingredients[]` (`name`, `quantity`, `unit`), `calories`, `nutrition` (`calories`,
+`proteins`, `fats`, `carbohydrates`), `cookingTime` в минутах, `instructions[]`,
+`photo` — пока всегда `null`); все числа — JSON-числа, а не строки. `error` —
+строка только при `failed` (например `Queue timeout`). Идентификатор задачи в
+ответах — строка. Неизвестный и некорректный (не UUID) `task_id` — одинаково 404.
+
+Названия ингредиентов в ответе показываются с заглавной первой буквой, остальное
+как есть (`овсяные хлопья` → `Овсяные хлопья`, `ОВСЯНЫЕ ХЛОПЬЯ` без изменений); в
+БД имя не меняется (`domain.capitalize_ingredient_name`).
+
+Тело `POST` строгое: принимаются только поля `peopleCount` (целое, не `2.0`, не
+строка) и `weeklyBudget` (JSON-число; строки, `true`, `NaN`, `Infinity` и более двух
+знаков после запятой отклоняются), лишние поля и `snake_case` — 400.
+
+### Ошибки эндпоинтов
+
+| Код | HTTP | Когда |
+| --- | --- | --- |
+| `VALIDATION_ERROR` | 400 | неверное или пустое тело, типы, границы, лишние поля, битый JSON; `details.fields` — список `{"loc": [...], "type": "..."}` без введённых значений |
+| `NOT_FOUND` | 404 | `GET /generate-menu/{task_id}`: задачи нет или `task_id` не UUID |
+| `INTERNAL_ERROR` | 500 | необработанная ошибка (в том числе БД); без стектрейса, заголовок `X-Request-ID` есть |
+
+Коды ошибок заглавные, как в контракте gateway. Метрика
+`generation_tasks_created_total` считает принятые `POST`; HTTP-метрики идут по
+шаблону пути (`/generate-menu/{task_id}`), без идентификаторов и значений
+параметров.
 
 Все ошибки возвращаются в одном формате (без префикса `/api/v1` и без обёртки
 `data`/`meta`):
@@ -306,7 +347,8 @@ OLLAMA_BASE_URL=http://localhost:11434 uv run python -m scripts.ollama_smoke \
 ```text
 src/receipes/       приложение: config, database, main (create_app), health,
                     errors, observability, migration_diagnostics, __main__ (запуск uvicorn);
-                    домен MS-4: models, domain, generated_menu, prompt, repositories
+                    домен MS-4: models, domain, generated_menu, prompt, repositories;
+                    API-1/API-2: api (роутеры), schemas, service
 migrations/         Alembic (async env.py), ревизии в versions/ (0001–0003)
 scripts/            ручные инструменты (ollama_smoke.py)
 docker/             entrypoint.sh: alembic upgrade head, затем запуск сервера
