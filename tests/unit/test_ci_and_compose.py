@@ -57,3 +57,14 @@ def test_every_job_has_a_timeout() -> None:
 def test_lint_job_runs_mypy() -> None:
     lint = ci().split("  lint:")[1].split("\n  unit:")[0]
     assert "- run: uv run mypy" in lint
+
+
+def test_unit_job_fails_on_skipped_tests() -> None:
+    unit = ci().split("  unit:")[1].split("\n  integration:")[0]
+    assert 'FAIL_ON_SKIP: "1"' in unit and "pytest tests/unit" in unit
+
+
+def test_integration_job_runs_the_compose_test_stack_with_coverage() -> None:
+    integration = ci().split("  integration:")[1].split("\n  compose-smoke:")[0]
+    assert "docker-compose.test.yml up" in integration
+    assert "--exit-code-from tests" in integration

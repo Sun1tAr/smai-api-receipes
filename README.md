@@ -181,6 +181,58 @@ docker compose -p receipes-tests -f docker-compose.test.yml down
 Для своей тестовой БД задайте `TEST_DB_HOST`, `TEST_DB_PORT`, `TEST_DB_NAME`,
 `TEST_DB_USER`, `TEST_DB_PASSWORD` и выполните `uv run pytest`.
 
+## Тестирование
+
+```sh
+uv run pytest tests/unit                      # unit, без БД
+uv run pytest tests/unit --cov                # + покрытие по src/receipes
+# все тесты: PostgreSQL на tmpfs, покрытие, порог 95 %, пропуски = ошибка
+docker compose -p receipes-tests -f docker-compose.test.yml up --build \
+  --abort-on-container-exit --exit-code-from tests
+```
+
+Прогон в Compose (`CI`, job `integration`) — основной: 582 теста, 0 пропусков,
+покрытие 99,8 % (ветки включены; `concurrency = greenlet` в конфигурации coverage
+обязательна, иначе код SQLAlchemy-async недосчитывается). В test-образ копируются
+`.github`, `scripts`, миграции и compose-файлы, которые читают тесты; при
+`FAIL_ON_SKIP=1` (Compose-прогон и unit-job CI) любой пропущенный тест — ошибка.
+Без `TEST_DB_HOST` локально пропускаются только интеграционные тесты.
+Job `lint` запускает ruff и mypy, `compose-smoke` поднимает собранный образ.
+
+**Что покрыто (требование → тесты):**
+
+| Требование | Где |
+| --- | --- |
+| Захват задач (`SKIP LOCKED`, порядок, один воркер) | `test_task_repository.py`, `test_generation_worker.py::test_two_workers_…`, `test_worker_resilience.py` (advisory lock) |
+| Атомарность (меню и `done` одной транзакцией, откат, нет «полуменю») | `test_task_repository.py::test_complete_*`, `test_generation_worker.py::test_task_expired_during_the_call…`, `test_end_to_end.py::test_a_failure_while_saving…` |
+| Промпт сохраняется в задаче и содержит параметры | `test_task_repository.py::test_claim_saves_the_built_prompt…`, `test_end_to_end.py` (сравнение с `generation_task.prompt`), `test_prompt.py` |
+| Успех, 503, невалидный JSON (с повтором), таймаут, исключение, `truncated`, недоступность | `test_generation_worker.py`, `test_ollama_client.py`, сквозные `test_end_to_end.py` (через HTTP) |
+| Переходы `pending → in_progress → done/failed` через HTTP | `test_end_to_end.py::test_a_task_goes_pending_in_progress_done_through_http` |
+| API-1/API-2, границы, 404 на неизвестный и мусорный id | `test_generation_api.py` (unit и integration) |
+| Единый формат всех ошибок (400/404/405/500/503) | `test_contract.py::test_error_format_is_identical…`, `test_health.py` |
+| Контракт с gateway | `test_contract.py` (копия `contracts/receipes.openapi.json` gateway в `tests/contract/`) |
+| OpenAPI не меняется незаметно | `test_contract.py::test_openapi_matches_the_committed_snapshot` (снимок `tests/contract/openapi.snapshot.json`; обновление: `UPDATE_OPENAPI_SNAPSHOT=1 uv run pytest tests/unit/test_contract.py`) |
+| Миграции вверх/вниз/`alembic check`, обратимость seed | `test_migrations_schema.py`, `test_migration_timeouts.py`, `test_infrastructure.py` |
+| Ограничения БД (CHECK/UNIQUE/FK/каскады) | `test_schema_constraints.py` |
+| Breaker, остановка и отмена, backoff, метрики | `test_breaker.py`, `test_worker_loop.py`, `test_worker_resilience.py` |
+
+Ollama везде замокана (`httpx.MockTransport`, управляемые события вместо пауз; время
+breaker — через подставляемые часы), поэтому тесты детерминированы.
+
+**Не покрыто.** Реальная Ollama (качество и время ответа `qwen2.5:7b`, подбор
+`OLLAMA_TIMEOUT_SECONDS`/`OLLAMA_NUM_PREDICT`) — только ручной
+`scripts.ollama_smoke`, в CI не запускается. Молчаливый сетевой обрыв соединения с
+блокировкой воркера имитируется `pg_terminate_backend`, а не реальным разрывом сети.
+GitHub Actions не проверяется локально. Контракт gateway содержит пример `done` с
+одним рецептом при `minItems: 3` в схеме: тест сверяет пример без этого минимума.
+
+**Мутационная проверка** ключевых тестов проведена вручную (временная порча кода,
+тест должен упасть): отсутствие коммита после захвата, сохранение меню при проигранном
+переходе, неподставленный бюджет, 500 вместо 404 на мусорном id, отсутствие повторов
+невалидного ответа, breaker, не открывающийся, `peopleCount` до 21, потеря текста
+ошибки в API-2, незаметное изменение OpenAPI, неснятая блокировка — каждое
+изменение ловится тестом.
+
 ## Модель данных
 
 Схема по ERD статьи MS-4 (SMAI-A-110). Все первичные ключи — UUID, их создаёт
