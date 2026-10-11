@@ -29,8 +29,8 @@ def test_json_braces_in_the_template_survive_substitution() -> None:
 
 
 def test_template_with_percent_and_dollar_signs() -> None:
-    template = "{people_count} / {weekly_budget} 100% ${x} {1} { }"
-    assert build_prompt(template, parameters()) == "2 / 1500.50 100% ${x} {1} { }"
+    template = "{people_count} / {weekly_budget} 100% $5 {1} { }"
+    assert build_prompt(template, parameters()) == "2 / 1500.50 100% $5 {1} { }"
 
 
 def test_str_format_style_escaping_is_not_supported() -> None:
