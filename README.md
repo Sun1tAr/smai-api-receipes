@@ -191,15 +191,16 @@ docker compose -p receipes-tests -f docker-compose.test.yml up --build \
   --abort-on-container-exit --exit-code-from tests
 ```
 
-Прогон в Compose (`CI`, job `integration`) — основной: 586 тестов, 0 пропусков,
+Прогон в Compose (в CI его запускает job `integration`) — основной: 578 тестов, 0 пропусков,
 покрытие 99,8 % (ветки включены, в отчёт входят `src/receipes` и `scripts`;
 `concurrency = greenlet` в конфигурации coverage обязательна, иначе код
 SQLAlchemy-async недосчитывается), порог `--cov-fail-under=98`; зависший тест
 падает по `timeout = 120` (pytest-timeout), а не вешает прогон. В test-образ копируются
-`.github`, `scripts`, миграции и compose-файлы, которые читают тесты; при
-`FAIL_ON_SKIP=1` (Compose-прогон и unit-job CI) любой пропущенный тест — ошибка.
+`scripts`, миграции и compose-файлы, которые читают тесты; при `FAIL_ON_SKIP=1`
+(задан в `docker-compose.test.yml`) любой пропущенный тест — ошибка. Тестов, которые
+читают текст workflow, нет: CI не меняется без разрешения владельца.
 Без `TEST_DB_HOST` локально пропускаются только интеграционные тесты.
-Job `lint` запускает ruff и mypy, `compose-smoke` поднимает собранный образ.
+Ruff и mypy запускаются локально (см. выше); `compose-smoke` в CI поднимает собранный образ.
 
 **Что покрыто (требование → тесты):**
 

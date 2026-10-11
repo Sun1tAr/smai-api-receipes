@@ -47,7 +47,6 @@ def test_compose_requires_secrets_and_ollama_url() -> None:
 def test_test_stage_contains_the_files_the_tests_read() -> None:
     test_stage = _stage("test")
     for path in (
-        ".github",
         "scripts",
         "tests",
         "Dockerfile",
