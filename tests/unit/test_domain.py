@@ -8,7 +8,9 @@ from receipes.domain import (
     GenerationTaskNotFound,
     InvalidGenerationParameters,
     InvalidTaskTransition,
+    MenuNotFound,
     TaskStatus,
+    display_ingredient_name,
     normalize_ingredient_name,
 )
 
@@ -40,6 +42,8 @@ def test_domain_errors_carry_context_without_user_data() -> None:
     assert (error.current, error.target) == (TaskStatus.DONE, TaskStatus.PENDING)
     task_id = uuid4()
     assert GenerationTaskNotFound(task_id).task_id == task_id
+    menu_id = uuid4()
+    assert MenuNotFound(menu_id).menu_id == menu_id
     assert InvalidGenerationParameters("people_count", "bad").field == "people_count"
 
 
@@ -108,3 +112,7 @@ def test_parameters_are_immutable() -> None:
 )
 def test_ingredient_name_normalization(raw: str, normalized: str) -> None:
     assert normalize_ingredient_name(raw) == normalized
+
+
+def test_display_name_keeps_case_and_yo() -> None:
+    assert display_ingredient_name("  Мёд   Липовый\t") == "Мёд Липовый"

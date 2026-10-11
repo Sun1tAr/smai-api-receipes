@@ -13,7 +13,7 @@ BUDGET_DECIMAL_PLACES = 2
 # Размеры колонок: «ворота» ответа модели не пропускают строки длиннее.
 NAME_MAX_LENGTH = 255
 UNIT_MAX_LENGTH = 32
-INSTRUCTION_MAX_LENGTH = 2000
+INSTRUCTION_MAX_LENGTH = 10000
 
 
 class DomainError(Exception):
@@ -32,6 +32,12 @@ class InvalidGenerationParameters(DomainError):
         super().__init__(f"Invalid {field}: {reason}")
         self.field = field
         self.reason = reason
+
+
+class MenuNotFound(DomainError):
+    def __init__(self, menu_id: UUID) -> None:
+        super().__init__(f"Menu {menu_id} not found")
+        self.menu_id = menu_id
 
 
 class GenerationTaskNotFound(DomainError):
@@ -108,8 +114,12 @@ class GenerationParameters:
 _SPACES = re.compile(r"\s+")
 
 
-# Единственное место нормализации названий ингредиентов: по ней же считается
-# уникальность в БД (lower(btrim(name)) от уже нормализованного значения).
+# Отображаемое имя: только strip и схлопывание пробелов, регистр и «ё» сохраняются.
+def display_ingredient_name(name: str) -> str:
+    return _SPACES.sub(" ", unicodedata.normalize("NFC", name)).strip()
+
+
+# Единственное место вычисления ключа дедупликации ингредиентов (ingredient.name_key):
+# strip, схлопывание пробелов, casefold, ё→е. Только Python, БД ключ не считает.
 def normalize_ingredient_name(name: str) -> str:
-    collapsed = _SPACES.sub(" ", unicodedata.normalize("NFC", name)).strip()
-    return collapsed.casefold().replace("ё", "е")
+    return display_ingredient_name(name).casefold().replace("ё", "е")

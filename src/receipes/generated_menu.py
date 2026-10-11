@@ -1,13 +1,22 @@
 from decimal import ROUND_HALF_UP, Decimal
+from typing import Annotated
 
 import structlog
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 from pydantic.alias_generators import to_camel
 
 from receipes.domain import (
     INSTRUCTION_MAX_LENGTH,
     NAME_MAX_LENGTH,
     UNIT_MAX_LENGTH,
+    display_ingredient_name,
     normalize_ingredient_name,
 )
 
@@ -33,6 +42,17 @@ class GateModel(BaseModel):
     )
 
 
+# PostgreSQL не хранит \x00, а суррогаты нельзя закодировать в UTF-8: такие строки
+# отвергаются «воротами», а не падают при сохранении.
+def _clean_text(value: str) -> str:
+    if "\x00" in value or any("\ud800" <= char <= "\udfff" for char in value):
+        raise ValueError("text contains a NUL or surrogate character")
+    return value
+
+
+SafeStr = Annotated[str, AfterValidator(_clean_text)]
+
+
 def _amount(maximum: Decimal) -> Decimal:
     return Field(ge=0, le=maximum, allow_inf_nan=False)
 
@@ -52,35 +72,37 @@ class GeneratedNutrition(GateModel):
 
 
 class GeneratedIngredient(GateModel):
-    name: str = Field(min_length=1, max_length=NAME_MAX_LENGTH)
+    name: SafeStr = Field(min_length=1, max_length=NAME_MAX_LENGTH)
     quantity: Decimal = _amount(QUANTITY_MAX)
-    unit: str = Field(min_length=1, max_length=UNIT_MAX_LENGTH)
+    unit: SafeStr = Field(min_length=1, max_length=UNIT_MAX_LENGTH)
 
     _rounded = field_validator("quantity", mode="after")(_round)
 
+    # Название хранится отображаемым (пробелы схлопнуты), ключ считается отдельно.
     @field_validator("name", mode="after")
     @classmethod
-    def normalized_name_fits(cls, value: str) -> str:
-        # casefold может удлинить строку (ß → ss), а в колонке хранится результат.
-        normalized = normalize_ingredient_name(value)
-        if not normalized or len(normalized) > NAME_MAX_LENGTH:
-            raise ValueError("normalized name is empty or too long")
-        return value
+    def display_name_and_key_fit(cls, value: str) -> str:
+        display = display_ingredient_name(value)
+        key = normalize_ingredient_name(value)
+        # casefold может удлинить строку (ß → ss), а в колонке хранится ключ.
+        if not display or len(display) > NAME_MAX_LENGTH or len(key) > NAME_MAX_LENGTH:
+            raise ValueError("name is empty or too long")
+        return display
 
     @property
-    def normalized_name(self) -> str:
+    def name_key(self) -> str:
         return normalize_ingredient_name(self.name)
 
 
 class GeneratedRecipe(GateModel):
-    name: str = Field(min_length=1, max_length=NAME_MAX_LENGTH)
+    name: SafeStr = Field(min_length=1, max_length=NAME_MAX_LENGTH)
     ingredients: list[GeneratedIngredient] = Field(
         min_length=INGREDIENTS_MIN, max_length=INGREDIENTS_MAX
     )
     calories: Decimal = _amount(CALORIES_MAX)
     nutrition: GeneratedNutrition
     cooking_time: Decimal = _amount(COOKING_TIME_MAX)
-    instructions: list[str] = Field(min_length=STEPS_MIN, max_length=STEPS_MAX)
+    instructions: list[SafeStr] = Field(min_length=STEPS_MIN, max_length=STEPS_MAX)
     # Фотографию модель выдумать не может: поле принимается, но не хранится.
     photo: None = Field(default=None, exclude=True)
 
@@ -105,14 +127,17 @@ class GeneratedRecipe(GateModel):
     def merge_duplicate_ingredients(self) -> "GeneratedRecipe":
         merged: dict[str, GeneratedIngredient] = {}
         for ingredient in self.ingredients:
-            key = ingredient.normalized_name
+            key = ingredient.name_key
             first = merged.get(key)
             if first is None:
                 merged[key] = ingredient.model_copy()
-            elif first.unit.casefold() == ingredient.unit.casefold():
-                first.quantity += ingredient.quantity
-            else:
+            elif first.unit.casefold() != ingredient.unit.casefold():
                 logger.warning("duplicate_ingredient_dropped", ingredient=key)
+            elif first.quantity + ingredient.quantity > QUANTITY_MAX:
+                # Лимит проверяется после слияния: сумму выше него не храним.
+                logger.warning("duplicate_ingredient_sum_too_large", ingredient=key)
+            else:
+                first.quantity += ingredient.quantity
         self.ingredients = list(merged.values())
         return self
 

@@ -87,7 +87,7 @@ def test_recipe_count_bounds_rejected(count: int) -> None:
         lambda d: d["recipes"][0].update(name="я" * 256),
         lambda d: d["recipes"][0]["ingredients"][0].update(name="я" * 256),
         lambda d: d["recipes"][0]["ingredients"][0].update(unit="г" * 33),
-        lambda d: d["recipes"][0].update(instructions=["ш" * 2001]),
+        lambda d: d["recipes"][0].update(instructions=["ш" * 10001]),
         lambda d: d["recipes"][0].pop("nutrition"),
         lambda d: d["recipes"][0].pop("cookingTime"),
         lambda d: d["recipes"][0].pop("instructions"),
@@ -108,7 +108,7 @@ def test_non_finite_numbers_are_rejected(value) -> None:
     [
         lambda d: d["recipes"][0].update(name="я" * 255),
         lambda d: d["recipes"][0]["ingredients"][0].update(unit="г" * 32),
-        lambda d: d["recipes"][0].update(instructions=["ш" * 2000]),
+        lambda d: d["recipes"][0].update(instructions=["ш" * 10000]),
         lambda d: d["recipes"][0].update(calories=10000, cookingTime=1440),
         lambda d: d["recipes"][0]["ingredients"][0].update(quantity=0),
     ],
@@ -191,3 +191,45 @@ def test_dump_by_alias_uses_the_contract_names() -> None:
     dumped = GeneratedMenu.model_validate(payload()).model_dump(by_alias=True)
     assert "cookingTime" in dumped["recipes"][0]
     assert "photo" not in dumped["recipes"][0]
+
+
+TEXT_FIELDS = {
+    "recipe name": lambda d, v: d["recipes"][0].update(name=v),
+    "ingredient name": lambda d, v: d["recipes"][0]["ingredients"][0].update(name=v),
+    "unit": lambda d, v: d["recipes"][0]["ingredients"][0].update(unit=v),
+    "step": lambda d, v: d["recipes"][0].update(instructions=["шаг", v]),
+}
+
+
+@pytest.mark.parametrize("field", TEXT_FIELDS)
+@pytest.mark.parametrize("bad", ["a\x00b", "\x00", "x\ud800y"])
+def test_nul_and_surrogates_are_rejected_in_every_text_field(field, bad) -> None:
+    invalid(lambda d: TEXT_FIELDS[field](d, bad))
+
+
+def test_photo_with_nul_is_ignored_not_stored() -> None:
+    data = payload()
+    data["recipes"][0]["photo"] = "http://x/\x00"
+    assert GeneratedMenu.model_validate(data).recipes[0].photo is None
+
+
+def test_ingredient_keeps_the_display_name_and_derives_the_key() -> None:
+    data = payload()
+    data["recipes"][0]["ingredients"][0]["name"] = "  Мёд   ЛИПОВЫЙ "
+    ingredient = GeneratedMenu.model_validate(data).recipes[0].ingredients[0]
+    assert ingredient.name == "Мёд ЛИПОВЫЙ"
+    assert ingredient.name_key == "мед липовый"
+
+
+def test_merged_quantity_above_the_limit_is_not_summed() -> None:
+    from structlog.testing import capture_logs
+
+    data = payload()
+    data["recipes"][0]["ingredients"] = [
+        {"name": "Соль", "quantity": 60000, "unit": "г"},
+        {"name": "соль", "quantity": 60000, "unit": "г"},
+    ]
+    with capture_logs() as logs:
+        ingredients = GeneratedMenu.model_validate(data).recipes[0].ingredients
+    assert [i.quantity for i in ingredients] == [Decimal("60000.00")]
+    assert [e["event"] for e in logs] == ["duplicate_ingredient_sum_too_large"]
