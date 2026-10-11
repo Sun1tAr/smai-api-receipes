@@ -1,10 +1,12 @@
 # smai-api-receipes
 
 MS-4 — сервис рецептов SmartMeal: ядро домена рецептов и генерация меню через
-Ollama. Сейчас готова только инфраструктура (**SMAI-58**): каркас приложения,
-подключение к PostgreSQL, миграции, health, метрики, трейсы и логи, Docker/Compose
-и CI. Доменный код (модели, таблицы, воркер генерации, клиент Ollama) и
-бизнес-эндпоинты API-1/API-2 появятся в задачах SMAI-57 и SMAI-55.
+Ollama. Готовы инфраструктура (**SMAI-58**: каркас приложения, PostgreSQL,
+миграции, health, метрики, трейсы и логи, Docker/Compose, CI) и слой данных и
+домен (**SMAI-57**: модели, миграции, доменные правила, репозитории, «ворота»
+ответа модели). Бизнес-эндпоинты API-1/API-2, воркер генерации, клиент Ollama,
+шаблон промпта и его начальное наполнение появятся в задачах SMAI-55, SMAI-56 и
+SMAI-54.
 
 ## Эндпоинты
 
@@ -107,6 +109,15 @@ uv run ruff format --check .
 uv run pytest tests/unit
 ```
 
+Интеграционным тестам нужна PostgreSQL; быстрый способ без Compose:
+
+```sh
+docker run -d --name receipes-pg -e POSTGRES_PASSWORD=pw -e POSTGRES_USER=dev \
+  -e POSTGRES_DB=dev -p 127.0.0.1:55432:5432 postgres:17-alpine
+TEST_DB_HOST=127.0.0.1 TEST_DB_PORT=55432 TEST_DB_NAME=dev TEST_DB_USER=dev \
+  TEST_DB_PASSWORD=pw uv run pytest
+```
+
 Полный прогон (unit и integration) с отдельной PostgreSQL на tmpfs, без обращения
 к рабочей БД:
 
@@ -129,31 +140,32 @@ docker compose -p receipes-tests -f docker-compose.test.yml down
 | Таблица | Назначение и ключевые поля |
 | --- | --- |
 | `prompt_template` | `template` (Text), `created_at`; актуален последний |
-| `generation_parameters` | `people_count` (≥1), `weekly_budget` Numeric(12,2) (>0) |
+| `generation_parameters` | `people_count` (1–20), `weekly_budget` Numeric(12,2) (0 < x ≤ 1 000 000) |
 | `generation_task` | `task_id`, `status`, `prompt`, `parameters_id` (NOT NULL, UNIQUE, 1:1), `menu_id` (NULL до `done`), `created_at`, `started_at`, `finished_at`, `error` |
 | `menu` | только `id` |
 | `menu_recipes` | `menu_id`, `recipe_id`, `position` |
 | `recipe` | `name` (255), `calories`, `cooking_time` (минуты), `photo` (Text, NULL), `nutrition_id` |
-| `ingredient` | `name` (255), хранится в нормализованном виде |
+| `ingredient` | `name` (255, отображаемое написание), `name_key` (255, UNIQUE, ключ дедупликации) |
 | `recipe_ingredients` | `recipe_id`, `ingredient_id`, `quantity`, `unit` (32), `position` |
 | `instruction` | `recipe_id`, `text`, `position` |
 | `nutrition` | `calories`, `proteins`, `fats`, `carbohydrates` |
 
 Числа (калории, КБЖУ, количества, время готовки) — `Numeric(10,2)`; время
-`created_at`/`started_at`/`finished_at` — `timestamptz` (`created_at` по умолчанию
-`now()`).
+`created_at`/`started_at`/`finished_at` — `timestamptz`. `created_at` по умолчанию
+`now()` (начало транзакции), а `started_at`/`finished_at` пишутся
+`clock_timestamp()`: иначе при захвате задачи в той же транзакции, где она
+создана, `started_at` совпал бы с `created_at`.
 
 **Ограничения `generation_task`:** `status IN ('pending','in_progress','done','failed')`;
 `(status='done') = (menu_id IS NOT NULL)`; `(status='failed') = (error IS NOT NULL)`;
-`prompt` обязателен при `in_progress`/`done`; `started_at` обязателен при
-`in_progress`/`done`; `finished_at` — при `done`/`failed`.
-Остальное: `UNIQUE(menu_recipes.menu_id, recipe_id)` и `(menu_id, position)`,
-`UNIQUE(recipe_ingredients.recipe_id, ingredient_id)` и `(recipe_id, position)`,
-`UNIQUE(instruction.recipe_id, position)`, позиции ≥1, неотрицательные числа.
-Уникальность ингредиента — индекс `uq_ingredient_name_normalized` по
-`lower(btrim(name))`. Частичные индексы: `generation_task(created_at) WHERE
-status='pending'` (очередь) и `generation_task(started_at) WHERE
-status='in_progress'` (восстановление зависших).
+`prompt` и `started_at` обязательны при `in_progress`/`done`; `finished_at` —
+при `done`/`failed`. Остальное: `UNIQUE(menu_recipes.menu_id, recipe_id)` и
+`(menu_id, position)`, `UNIQUE(recipe_ingredients.recipe_id, ingredient_id)` и
+`(recipe_id, position)`, `UNIQUE(instruction.recipe_id, position)`, позиции ≥1,
+неотрицательные числа, границы `generation_parameters` (те же, что требует домен:
+строка вне них не может встать в очередь). Частичные индексы:
+`generation_task(created_at) WHERE status='pending'` (очередь) и
+`generation_task(started_at) WHERE status='in_progress'` (восстановление зависших).
 
 **Каскады.** `menu` → `menu_recipes` и `recipe` → `recipe_ingredients`,
 `instruction`: `ON DELETE CASCADE`. Все остальные ссылки — `RESTRICT`: нельзя
@@ -162,41 +174,75 @@ status='in_progress'` (восстановление зависших).
 результат, нарушив `menu_iff_done`).
 
 **Ревизии Alembic.**
-- `0001_base_schema` — схема строго по ERD.
-- `0002_ordering_task_times` — отличия от ERD: `position` в `menu_recipes` и
-  `recipe_ingredients` (без него порядок рецептов в меню и ингредиентов не
-  определён), `started_at`/`finished_at` в `generation_task` (нужны для
-  восстановления зависших задач и метрик длительности), связанные CHECK и
-  индекс. Вынесены отдельно: при отказе ревизию можно удалить, не трогая базовую.
-  Существующие строки получают позиции `1..n` по `id`, а `started_at`/`finished_at`
-  — `created_at`.
+- `0001_base_schema` — таблицы и колонки ровно по ERD плюс ограничения целостности
+  (CHECK, UNIQUE, индексы, FK с политиками удаления), не добавляющие колонок.
+- `0002_erd_deviations` — отклонения от ERD, добавляющие колонки: `position` в
+  `menu_recipes` и `recipe_ingredients` (без него порядок рецептов в меню и
+  ингредиентов не определён), `started_at`/`finished_at` в `generation_task` (нужны
+  для восстановления зависших задач и метрик длительности; плюс CHECK и индекс) и
+  `ingredient.name_key` (нормализованный уникальный ключ: дедуплицирует ингредиенты,
+  сохраняя отображаемое название). Отказ от отклонений — это не просто удаление
+  файла ревизии: от этих колонок зависят `models.py` и `repositories.py`
+  (`MenuRepository.save`/`load`, `TaskRepository.claim_next`/`transition`/
+  `expire_stale`/`complete`), поэтому код и ревизию нужно откатывать вместе.
+
+  Бэкфилл при `upgrade` 0002: `position` — `1..n` по `id`, `started_at`/
+  `finished_at` — `created_at`, `name_key` — **той же Python-функцией**
+  `normalize_ingredient_name`, что использует приложение (`casefold` в SQL точно не
+  повторить). Если у существующих строк совпадут ключи, UNIQUE остановит миграцию,
+  а не склеит ингредиенты молча.
 
 Обе ревизии обратимы (`upgrade` / `downgrade` / `upgrade` проверяются в
 интеграционных тестах, схема после `downgrade base` пуста, `alembic check` чист).
+Ревизии редактировались до первого применения; локальную dev-БД созданную по
+прежней версии нужно пересоздать: `docker compose down -v`.
 
-**Названия ингредиентов** нормализуются в одном месте
-(`domain.normalize_ingredient_name`: схлопывание пробелов, `casefold`, `ё`→`е`) и
-хранятся в нормализованном виде, поэтому в ответе они строчные (`овсяные хлопья`).
+**Названия ингредиентов.** `ingredient.name` хранит первое встреченное написание
+(только `strip` и схлопывание пробелов; «Мёд» остаётся «Мёд»). Ключ `name_key`
+(`strip`, пробелы, `casefold`, `ё`→`е`) считается только в Python — в
+`domain.normalize_ingredient_name`, БД ключ не вычисляет. Вставка идёт через
+`INSERT … ON CONFLICT (name_key) DO NOTHING`, затем `SELECT` по `name_key`; позднее
+меню с другим написанием («мёд», «МЁД») название не меняет.
 
 **Репозитории.**
-- `TaskRepository`: `create`, `get`, `claim_next(build_prompt)` (`SELECT … FOR
-  UPDATE SKIP LOCKED` старейшей `pending`; промпт задаётся при захвате, потому что
-  CHECK требует его у любой задачи `in_progress`), `transition(task_id, expected,
-  to, …)` — условный `UPDATE … WHERE status=:expected RETURNING`, `False` при
-  чужом статусе; допустимость перехода проверяет `TaskStatus`; `expire_stale(
-  pending_ttl, stale_after)` (`Queue timeout`, `Generation interrupted`),
-  `count_pending`, `oldest_pending_age`.
-- `MenuRepository`: `save(GeneratedMenu)` (ингредиенты через `INSERT … ON CONFLICT
-  (lower(btrim(name))) DO NOTHING`, позиции с 1) и `load(menu_id)` — рецепты,
-  ингредиенты и шаги отсортированы по `position`; связанные данные грузятся
-  `selectinload`/`joinedload` (несколько запросов, без N+1).
-- `PromptTemplateRepository.latest()` — `ORDER BY created_at DESC, id DESC`.
+- `TaskRepository`:
+  - `create`; `get` (бросает `GenerationTaskNotFound`).
+  - `claim_next(build_prompt)` — единственный путь в `in_progress`: `SELECT … FOR
+    UPDATE SKIP LOCKED` старейшей `pending` и `UPDATE` со `started_at =
+    clock_timestamp()`. Промпт задаётся при захвате, потому что CHECK требует его
+    у любой задачи `in_progress`. Если параметры или промпт не собираются
+    (`DomainError`), задача условно переводится в `failed` с ошибкой `Invalid
+    generation parameters`, и в том же вызове берётся следующая (не более 20
+    итераций) — «ядовитая» задача не блокирует очередь. Вызывающий коммитит
+    транзакцию сразу после `claim_next`, чтобы не держать блокировку строки.
+  - `complete(task_id, generated_menu)` — основной путь завершения: в savepoint
+    (`begin_nested`) сохраняет меню и условно переводит `in_progress` → `done`. Если
+    задача уже не `in_progress` (её просрочил `expire_stale`), savepoint
+    откатывается и возвращается `False`: не остаётся ни меню, ни рецептов, ни
+    нутриентов, ни шагов, ни связей, ни добавленных этим вызовом ингредиентов
+    (ингредиенты, существовавшие раньше, не затрагиваются). Внешней транзакцией
+    управляет вызывающий.
+  - `transition(task_id, expected, to, …)` — условный `UPDATE … WHERE
+    status=:expected RETURNING` в `done`/`failed`, `False` при чужом статусе;
+    допустимость перехода проверяет `TaskStatus`. Прямое использование для `done`
+    оставлено для тестов и частных случаев, в `in_progress` перехода нет.
+  - `expire_stale(pending_ttl, stale_after)` (`Queue timeout`, `Generation
+    interrupted`), `count_pending`, `oldest_pending_age`.
+- `MenuRepository`: `save(GeneratedMenu)` (позиции с 1) и `load(menu_id)` — рецепты,
+  ингредиенты и шаги отсортированы по `position`; бросает `MenuNotFound`. Связанные
+  данные грузятся `selectinload`/`joinedload` (несколько запросов, без N+1).
+- `PromptTemplateRepository.latest()` — `ORDER BY created_at DESC, id DESC`
+  (детерминирован и при равном `created_at`). Первый шаблон создаёт сид (SMAI-56):
+  до этого `latest()` возвращает `None`.
 
-**Ворота ответа модели** (`GeneratedMenu`): 3–21 рецепт, 1–50 ингредиентов и
-шагов, непустые строки не длиннее колонок, конечные числа ≥0 с верхними
-границами (калории ≤10000, время ≤1440 мин). Числа округляются до сотых,
-дубли ингредиентов схлопываются (одна единица — количества складываются, разная —
-остаётся первое и пишется предупреждение), `photo` игнорируется. Поля — camelCase
+**Ворота ответа модели** (`GeneratedMenu`): 3–21 рецепт (минимум 3 заложен
+контрактом API-2 и форматом API-3), 1–50 ингредиентов и шагов, непустые строки
+не длиннее колонок (шаг — до 10 000 символов), без `\x00` и суррогатов, конечные
+числа ≥0 с верхними границами (калории ≤10000, время ≤1440 мин, количество
+≤100000). Числа округляются до сотых, дубли ингредиентов в рецепте схлопываются
+(одна единица — количества складываются, если сумма не превышает лимит; иначе, как
+и при разных единицах, остаётся первое вхождение и пишется предупреждение), `photo`
+игнорируется (не хранится, поэтому его содержимое не проверяется). Поля — camelCase
 как в контракте API.
 
 ## Структура репозитория
@@ -242,5 +288,7 @@ Alembic ждёт подключения не дольше `DB_TIMEOUT_SECONDS`, 
 - Alembic использует те же настройки, что и приложение (`Settings`), включая
   обязательные `OLLAMA_*`; отдельного набора настроек для миграций нет.
 - Действия GitHub Actions закреплены тегами версий, а не SHA коммитов.
+- Политики очистки данных нет: удаление меню оставляет рецепты, нутриенты и
+  ингредиенты, удаление задачи оставляет `generation_parameters`.
 - При неверной конфигурации контейнер уходит в перезапуск (`restart: unless-stopped`),
   а `docker compose up --wait` завершается ошибкой.
