@@ -3,6 +3,7 @@ import uuid
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from receipes.domain import MenuNotFound
 from receipes.repositories import MenuRepository
@@ -120,7 +121,7 @@ async def test_failed_save_leaves_nothing_behind(session_factory) -> None:
     generated = menu_data()
     generated.recipes[0].name = "я" * 300  # обходит «ворота», ловится колонкой
     async with session_factory() as session:
-        with pytest.raises(Exception):  # noqa: B017  # DBAPIError драйвера
+        with pytest.raises(DBAPIError):  # value too long for the column
             await MenuRepository(session).save(generated)
         await session.rollback()
     async with session_factory() as session:

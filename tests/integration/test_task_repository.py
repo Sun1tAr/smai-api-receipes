@@ -6,6 +6,7 @@ from decimal import Decimal
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from receipes.domain import (
     DomainError,
@@ -391,7 +392,7 @@ async def test_complete_rolls_back_when_saving_fails(session) -> None:
     broken = menu_data()
     broken.recipes[0].name = "я" * 300  # обходит «ворота», ловится колонкой
     before = await counts(session)
-    with pytest.raises(Exception):  # noqa: B017  # DBAPIError драйвера
+    with pytest.raises(DBAPIError):  # value too long for the column
         await repository.complete(task.task_id, broken)
     assert await counts(session) == before
     # Savepoint откатан, внешняя транзакция по-прежнему рабочая.
