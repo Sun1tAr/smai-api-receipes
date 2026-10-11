@@ -60,6 +60,31 @@ def test_response_outside_the_gate_is_rejected(smoke) -> None:
         smoke.parse_response({"response": json.dumps(bad)})
 
 
+def test_truncated_response_is_reported_clearly(smoke, monkeypatch, capsys) -> None:
+    truncated = {"response": '{"recipes": [{"name": "Каш', "done_reason": "length"}
+    with pytest.raises(smoke.ResponseTruncated):
+        smoke.parse_response(truncated)
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        smoke.httpx,
+        "Client",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(lambda r: httpx.Response(200, json=truncated))
+        ),
+    )
+    assert smoke.main(["--base-url", "http://ollama.test"]) == 1
+    error = capsys.readouterr().err
+    assert "num_predict" in error and "JSONDecodeError" not in error
+
+
+@pytest.mark.parametrize("budget", ["abc", "1,5", "", "NaN-ish"])
+def test_non_numeric_budget_is_an_input_error_not_a_traceback(
+    smoke, capsys, budget
+) -> None:
+    assert smoke.main(["--budget", budget]) == 2
+    assert "--budget" in capsys.readouterr().err
+
+
 def test_main_reports_success_and_failures(smoke, monkeypatch, capsys) -> None:
     def ok(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"response": json.dumps(payload())})

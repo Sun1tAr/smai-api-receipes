@@ -150,20 +150,23 @@ class GeneratedMenu(GateModel):
 
 # JSON-схема для параметра format запроса к Ollama (структурированный вывод). Пишется
 # вручную: схема Pydantic для Decimal громоздка (anyOf number/string), а модели нужна
-# простая. photo не запрашивается. Границы совпадают с «воротами» выше.
+# простая. photo не запрашивается. Верхние границы длин и числа элементов (maxLength,
+# maxItems) в схему намеренно не входят: llama.cpp разворачивает их в грамматику, что
+# замедляет компиляцию и приводит к отказам; их проверяют «ворота» выше. Нижние
+# границы и диапазоны чисел совпадают с «воротами».
 def ollama_format_schema() -> dict[str, object]:
     def number(maximum: Decimal) -> dict[str, object]:
         return {"type": "number", "minimum": 0, "maximum": float(maximum)}
 
-    def text(maximum: int) -> dict[str, object]:
-        return {"type": "string", "minLength": 1, "maxLength": maximum}
+    def text() -> dict[str, object]:
+        return {"type": "string", "minLength": 1}
 
     ingredient = {
         "type": "object",
         "properties": {
-            "name": text(NAME_MAX_LENGTH),
+            "name": text(),
             "quantity": number(QUANTITY_MAX),
-            "unit": text(UNIT_MAX_LENGTH),
+            "unit": text(),
         },
         "required": ["name", "quantity", "unit"],
     }
@@ -178,21 +181,19 @@ def ollama_format_schema() -> dict[str, object]:
     recipe = {
         "type": "object",
         "properties": {
-            "name": text(NAME_MAX_LENGTH),
+            "name": text(),
             "ingredients": {
                 "type": "array",
                 "items": ingredient,
                 "minItems": INGREDIENTS_MIN,
-                "maxItems": INGREDIENTS_MAX,
             },
             "calories": number(CALORIES_MAX),
             "nutrition": nutrition,
             "cookingTime": number(COOKING_TIME_MAX),
             "instructions": {
                 "type": "array",
-                "items": text(INSTRUCTION_MAX_LENGTH),
+                "items": text(),
                 "minItems": STEPS_MIN,
-                "maxItems": STEPS_MAX,
             },
         },
         "required": [
@@ -211,7 +212,6 @@ def ollama_format_schema() -> dict[str, object]:
                 "type": "array",
                 "items": recipe,
                 "minItems": RECIPES_MIN,
-                "maxItems": RECIPES_MAX,
             }
         },
         "required": ["recipes"],

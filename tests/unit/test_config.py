@@ -52,7 +52,7 @@ def test_defaults() -> None:
     assert settings.ollama_connect_timeout_seconds == 5
     assert settings.ollama_timeout_seconds == 300
     assert settings.ollama_num_ctx == 32768
-    assert settings.ollama_num_predict == 4096
+    assert settings.ollama_num_predict == 16384
     assert settings.ollama_temperature == 0.3
     assert settings.ollama_keep_alive == "30m"
     assert settings.generation_worker_enabled is True

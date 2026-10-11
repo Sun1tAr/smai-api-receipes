@@ -1,4 +1,5 @@
 import copy
+import json
 from decimal import Decimal
 
 import pytest
@@ -255,7 +256,6 @@ def test_ollama_format_schema_accepts_what_the_gate_accepts() -> None:
         lambda d: d["recipes"][0].update(calories=-1),
         lambda d: d["recipes"][0].update(cookingTime=1441),
         lambda d: d["recipes"][0].pop("nutrition"),
-        lambda d: d["recipes"][0]["ingredients"][0].update(unit="г" * 33),
     ],
 )
 def test_ollama_format_schema_rejects_what_the_gate_rejects(mutate) -> None:
@@ -267,5 +267,41 @@ def test_ollama_format_schema_rejects_what_the_gate_rejects(mutate) -> None:
     mutate(data)
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(data, ollama_format_schema())
+    with pytest.raises(ValidationError):
+        GeneratedMenu.model_validate(data)
+
+
+def test_ollama_format_schema_has_no_upper_length_or_item_bounds() -> None:
+    from receipes.generated_menu import ollama_format_schema
+
+    text = json.dumps(ollama_format_schema())
+    assert "maxLength" not in text and "maxItems" not in text
+    assert "minItems" in text and "minLength" in text
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda d: d["recipes"].extend(recipe(f"Лишнее {n}") for n in range(19)),
+        lambda d: d["recipes"][0].update(
+            ingredients=[
+                {"name": f"i{n}", "quantity": 1, "unit": "г"} for n in range(51)
+            ]
+        ),
+        lambda d: d["recipes"][0].update(instructions=["шаг"] * 51),
+        lambda d: d["recipes"][0]["ingredients"][0].update(unit="г" * 33),
+        lambda d: d["recipes"][0].update(name="я" * 256),
+        lambda d: d["recipes"][0].update(instructions=["ш" * 10001]),
+    ],
+)
+def test_upper_bounds_are_enforced_only_by_the_gate(mutate) -> None:
+    import jsonschema
+
+    from receipes.generated_menu import ollama_format_schema
+
+    data = payload()
+    mutate(data)
+    # Схема для Ollama эти значения пропускает намеренно, «ворота» — нет.
+    jsonschema.validate(data, ollama_format_schema())
     with pytest.raises(ValidationError):
         GeneratedMenu.model_validate(data)

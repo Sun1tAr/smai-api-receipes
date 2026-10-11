@@ -15,7 +15,7 @@ import json
 import os
 import sys
 from collections.abc import Sequence
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -63,8 +63,15 @@ def build_request(prompt: str, model: str) -> dict[str, Any]:
     }
 
 
+class ResponseTruncated(Exception):
+    """Генерация оборвана по лимиту токенов (done_reason == "length")."""
+
+
 # Ответ Ollama → проверенное «воротами» меню; ошибки формата поднимаются наверх.
+# Обрыв по num_predict даёт невалидный JSON, поэтому он определяется заранее.
 def parse_response(body: dict[str, Any]) -> GeneratedMenu:
+    if body.get("done_reason") == "length":
+        raise ResponseTruncated
     return GeneratedMenu.model_validate(json.loads(body["response"]))
 
 
@@ -105,6 +112,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     except DomainError as error:
         print(f"Invalid input: {error}", file=sys.stderr)
         return 2
+    except InvalidOperation:
+        print("Invalid input: --budget must be a decimal number", file=sys.stderr)
+        return 2
+    except ResponseTruncated:
+        print(
+            "Response truncated: the answer hit the num_predict limit "
+            "(done_reason=length); raise OLLAMA_NUM_PREDICT",
+            file=sys.stderr,
+        )
+        return 1
     except httpx.HTTPError as error:
         print(f"Ollama request failed: {type(error).__name__}", file=sys.stderr)
         return 1
