@@ -84,11 +84,23 @@ def error_response(
 
 # Контракт gateway: loc — список строк. Для битого JSON loc несёт позицию символа,
 # а не поле, поэтому остаётся только ["body"].
+# Имя лишнего поля приходит от клиента, поэтому каждый элемент усекается: ключ в
+# несколько мегабайт не должен раздувать ответ.
+LOC_PART_MAX_LENGTH = 64
+TRUNCATION_MARK = "…"
+
+
+def truncate_loc_part(part: str) -> str:
+    if len(part) <= LOC_PART_MAX_LENGTH:
+        return part
+    return part[:LOC_PART_MAX_LENGTH] + TRUNCATION_MARK
+
+
 def error_location(item: Any) -> list[str]:
     location = item["loc"]
     if item["type"] == "json_invalid":
         location = [part for part in location if not isinstance(part, int)]
-    return [str(part) for part in location]
+    return [truncate_loc_part(str(part)) for part in location]
 
 
 # Только место и тип ошибки: текст исключений и введённые значения могут содержать
@@ -105,6 +117,13 @@ async def validation_error_handler(request: Request, error: Exception) -> JSONRe
 
 async def http_error_handler(request: Request, error: Exception) -> JSONResponse:
     assert isinstance(error, StarletteHTTPException)
+    if error.status_code == 400:
+        # Тело не удалось разобрать (в том числе слишком глубокая вложенность JSON,
+        # на которой падает парсер): та же ошибка валидации, что и для битого JSON.
+        fields = [{"loc": ["body"], "type": "json_invalid"}]
+        return error_response(
+            400, "VALIDATION_ERROR", "Request validation failed", {"fields": fields}
+        )
     code, message = HTTP_ERRORS.get(
         error.status_code,
         ("HTTP_ERROR", "Request failed")

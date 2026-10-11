@@ -20,7 +20,7 @@ VALIDATION_DOC = error_doc(
     "Некорректные параметры запроса.",
     "VALIDATION_ERROR",
     "Request validation failed",
-    {"fields": [{"loc": ["body", "peopleCount"], "type": "int_parsing"}]},
+    {"fields": [{"loc": ["body", "peopleCount"], "type": "int_type"}]},
 )
 INTERNAL_DOC = error_doc(
     "Внутренняя ошибка сервиса.", "INTERNAL_ERROR", "Internal server error"
@@ -85,7 +85,14 @@ Service = Annotated[MenuGenerationService, Depends(get_service)]
     ),
     response_model=TaskCreatedResponse,
     responses={
-        202: {"description": "Задача создана."},
+        202: {
+            "description": "Задача создана.",
+            "content": {
+                "application/json": {
+                    "example": {"task_id": "b1e2c3d4-5678-90ab-cdef-1234567890ab"}
+                }
+            },
+        },
         400: VALIDATION_DOC,
         500: INTERNAL_DOC,
     },

@@ -145,6 +145,13 @@ async def test_garbage_task_id_is_a_404_not_a_validation_error(client, task_id) 
         ("a", "A"),
         ("", ""),
         ("1% молоко", "1% молоко"),
+        ("ßeta", "Sseta"),
+        ("ǆ", "ǅ"),
+        ("ǆudo", "ǅudo"),
+        ("иван-чай", "Иван-чай"),
+        ("Иван-чай", "Иван-чай"),
+        ("ёжик", "Ёжик"),
+        ("  пробел", "  пробел"),
     ],
 )
 def test_ingredient_name_capitalization(raw: str, expected: str) -> None:
@@ -208,3 +215,48 @@ async def test_openapi_request_schema_and_examples_are_consistent(client) -> Non
 
 async def test_swagger_ui_is_served(client) -> None:
     assert (await client.get("/docs")).status_code == 200
+
+
+async def test_giant_unknown_field_name_does_not_inflate_the_response(client) -> None:
+    key = "k" * 5_000_000
+    body = '{"peopleCount": 2, "weeklyBudget": 10, "' + key + '": 1}'
+    response = await post(client, body)
+    assert response.status_code == 400
+    assert len(response.content) < 1000
+    loc = fields(response)[0]["loc"]
+    assert loc[0] == "body" and loc[1] == "k" * 64 + "…"
+    assert key not in response.text
+
+
+async def test_short_unknown_field_name_is_reported_as_is(client) -> None:
+    response = await post(client, {"peopleCount": 2, "weeklyBudget": 10, "x" * 64: 1})
+    assert fields(response) == [{"loc": ["body", "x" * 64], "type": "extra_forbidden"}]
+
+
+@pytest.mark.parametrize("depth", [1000, 50_000])
+async def test_deeply_nested_json_is_a_validation_error(client, depth) -> None:
+    response = await post(client, "[" * depth)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert fields(response) == [{"loc": ["body"], "type": "json_invalid"}]
+    nested = await post(client, '{"peopleCount": ' + "[" * depth + "]" * depth + "}")
+    assert nested.status_code == 400
+    assert nested.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+async def test_openapi_400_example_matches_a_live_response(client) -> None:
+    document = (await client.get("/openapi.json")).json()
+    example = document["paths"]["/generate-menu"]["post"]["responses"]["400"][
+        "content"
+    ]["application/json"]["example"]
+    live = await post(client, {"peopleCount": "4", "weeklyBudget": 5000})
+    assert live.json() == example
+    assert example["error"]["code"] == "VALIDATION_ERROR"
+
+
+async def test_openapi_202_response_has_an_example(client) -> None:
+    document = (await client.get("/openapi.json")).json()
+    accepted = document["paths"]["/generate-menu"]["post"]["responses"]["202"]
+    content = accepted["content"]["application/json"]
+    assert content["example"]["task_id"]
+    assert content["schema"]["$ref"].endswith("/TaskCreatedResponse")

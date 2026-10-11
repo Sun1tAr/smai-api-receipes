@@ -123,9 +123,9 @@ class GenerationParameters:
 
 
 # Отображение названия ингредиента в API: первая буква заглавная, остальное как есть
-# (в БД имя не меняется).
+# (в БД имя не меняется). title(), а не upper(): ǆ даёт «ǅ», а не «Ǆ»; ß — «Ss».
 def capitalize_ingredient_name(name: str) -> str:
-    return name[:1].upper() + name[1:]
+    return name[:1].title() + name[1:]
 
 
 _SPACES = re.compile(r"\s+")
