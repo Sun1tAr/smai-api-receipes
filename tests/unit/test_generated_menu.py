@@ -233,3 +233,39 @@ def test_merged_quantity_above_the_limit_is_not_summed() -> None:
         ingredients = GeneratedMenu.model_validate(data).recipes[0].ingredients
     assert [i.quantity for i in ingredients] == [Decimal("60000.00")]
     assert [e["event"] for e in logs] == ["duplicate_ingredient_sum_too_large"]
+
+
+def test_ollama_format_schema_accepts_what_the_gate_accepts() -> None:
+    import jsonschema
+
+    from receipes.generated_menu import ollama_format_schema
+
+    schema = ollama_format_schema()
+    jsonschema.Draft202012Validator.check_schema(schema)
+    jsonschema.validate(payload(), schema)
+    assert "photo" not in str(schema)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda d: d["recipes"].pop(),  # меньше трёх рецептов
+        lambda d: d["recipes"][0].update(ingredients=[]),
+        lambda d: d["recipes"][0].update(instructions=[]),
+        lambda d: d["recipes"][0].update(calories=-1),
+        lambda d: d["recipes"][0].update(cookingTime=1441),
+        lambda d: d["recipes"][0].pop("nutrition"),
+        lambda d: d["recipes"][0]["ingredients"][0].update(unit="г" * 33),
+    ],
+)
+def test_ollama_format_schema_rejects_what_the_gate_rejects(mutate) -> None:
+    import jsonschema
+
+    from receipes.generated_menu import ollama_format_schema
+
+    data = payload()
+    mutate(data)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(data, ollama_format_schema())
+    with pytest.raises(ValidationError):
+        GeneratedMenu.model_validate(data)

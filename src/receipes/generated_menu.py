@@ -146,3 +146,73 @@ class GeneratedMenu(GateModel):
     recipes: list[GeneratedRecipe] = Field(
         min_length=RECIPES_MIN, max_length=RECIPES_MAX
     )
+
+
+# JSON-схема для параметра format запроса к Ollama (структурированный вывод). Пишется
+# вручную: схема Pydantic для Decimal громоздка (anyOf number/string), а модели нужна
+# простая. photo не запрашивается. Границы совпадают с «воротами» выше.
+def ollama_format_schema() -> dict[str, object]:
+    def number(maximum: Decimal) -> dict[str, object]:
+        return {"type": "number", "minimum": 0, "maximum": float(maximum)}
+
+    def text(maximum: int) -> dict[str, object]:
+        return {"type": "string", "minLength": 1, "maxLength": maximum}
+
+    ingredient = {
+        "type": "object",
+        "properties": {
+            "name": text(NAME_MAX_LENGTH),
+            "quantity": number(QUANTITY_MAX),
+            "unit": text(UNIT_MAX_LENGTH),
+        },
+        "required": ["name", "quantity", "unit"],
+    }
+    nutrition = {
+        "type": "object",
+        "properties": {
+            key: number(NUTRIENT_MAX)
+            for key in ("calories", "proteins", "fats", "carbohydrates")
+        },
+        "required": ["calories", "proteins", "fats", "carbohydrates"],
+    }
+    recipe = {
+        "type": "object",
+        "properties": {
+            "name": text(NAME_MAX_LENGTH),
+            "ingredients": {
+                "type": "array",
+                "items": ingredient,
+                "minItems": INGREDIENTS_MIN,
+                "maxItems": INGREDIENTS_MAX,
+            },
+            "calories": number(CALORIES_MAX),
+            "nutrition": nutrition,
+            "cookingTime": number(COOKING_TIME_MAX),
+            "instructions": {
+                "type": "array",
+                "items": text(INSTRUCTION_MAX_LENGTH),
+                "minItems": STEPS_MIN,
+                "maxItems": STEPS_MAX,
+            },
+        },
+        "required": [
+            "name",
+            "ingredients",
+            "calories",
+            "nutrition",
+            "cookingTime",
+            "instructions",
+        ],
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "recipes": {
+                "type": "array",
+                "items": recipe,
+                "minItems": RECIPES_MIN,
+                "maxItems": RECIPES_MAX,
+            }
+        },
+        "required": ["recipes"],
+    }
