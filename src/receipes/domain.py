@@ -52,7 +52,7 @@ class MenuNotFound(DomainError):
 
 
 class GenerationTaskNotFound(DomainError):
-    def __init__(self, task_id: UUID) -> None:
+    def __init__(self, task_id: UUID | str) -> None:
         super().__init__(f"Generation task {task_id} not found")
         self.task_id = task_id
 
@@ -120,6 +120,12 @@ class GenerationParameters:
                 f"must have at most {BUDGET_DECIMAL_PLACES} decimal places",
             )
         return budget
+
+
+# Отображение названия ингредиента в API: первая буква заглавная, остальное как есть
+# (в БД имя не меняется).
+def capitalize_ingredient_name(name: str) -> str:
+    return name[:1].upper() + name[1:]
 
 
 _SPACES = re.compile(r"\s+")

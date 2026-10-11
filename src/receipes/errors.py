@@ -5,7 +5,10 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from pydantic.alias_generators import to_camel
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from receipes.domain import GenerationTaskNotFound, InvalidGenerationParameters
 
 logger = structlog.get_logger()
 
@@ -40,6 +43,25 @@ class ErrorResponse(BaseModel):
                 }
             }
         }
+    }
+
+
+# Описание ошибок для OpenAPI: единый формат и пример на каждый код.
+def error_doc(description: str, code: str, message: str, details: dict | None = None):
+    return {
+        "model": ErrorResponse,
+        "description": description,
+        "content": {
+            "application/json": {
+                "example": {
+                    "error": {
+                        "code": code,
+                        "message": message,
+                        "details": details or {},
+                    }
+                }
+            }
+        },
     }
 
 
@@ -100,7 +122,24 @@ async def unexpected_error_handler(request: Request, error: Exception) -> JSONRe
     return error_response(500, "INTERNAL_ERROR", "Internal server error")
 
 
+# Параметры, не прошедшие доменную проверку, — тот же 400, что и ошибка схемы.
+async def invalid_parameters_handler(
+    request: Request, error: Exception
+) -> JSONResponse:
+    assert isinstance(error, InvalidGenerationParameters)
+    fields = [{"loc": ["body", to_camel(error.field)], "type": "value_error"}]
+    return error_response(
+        400, "VALIDATION_ERROR", "Request validation failed", {"fields": fields}
+    )
+
+
+async def task_not_found_handler(request: Request, error: Exception) -> JSONResponse:
+    return error_response(404, "NOT_FOUND", "Generation task not found")
+
+
 def register_error_handlers(app: FastAPI) -> None:
+    app.add_exception_handler(InvalidGenerationParameters, invalid_parameters_handler)
+    app.add_exception_handler(GenerationTaskNotFound, task_not_found_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(StarletteHTTPException, http_error_handler)
     app.add_exception_handler(Exception, unexpected_error_handler)

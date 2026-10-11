@@ -34,7 +34,11 @@ async def test_health_is_fully_documented_and_metrics_is_hidden(app) -> None:
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         document = (await client.get("/openapi.json")).json()
-    assert set(document["paths"]) == {"/health"}
+    assert set(document["paths"]) == {
+        "/health",
+        "/generate-menu",
+        "/generate-menu/{task_id}",
+    }
     operation = document["paths"]["/health"]["get"]
     assert operation["summary"]
     assert operation["description"]

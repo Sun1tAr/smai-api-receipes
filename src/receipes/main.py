@@ -12,6 +12,7 @@ from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 from prometheus_client import (
     CollectorRegistry,
+    Counter,
     GCCollector,
     PlatformCollector,
     ProcessCollector,
@@ -19,6 +20,8 @@ from prometheus_client import (
 from prometheus_fastapi_instrumentator import Instrumentator
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from receipes.api import STATUS_EXAMPLES
+from receipes.api import router as generation_router
 from receipes.config import Settings
 from receipes.database import create_engine
 from receipes.errors import error_response, register_error_handlers
@@ -58,6 +61,15 @@ def route_path(request: Request) -> str:
     return "unmatched"
 
 
+# FastAPI выбрасывает из схемы все null, а примеры pending/failed держат
+# "menu": null и "error": null; возвращаем примеры как есть.
+def restore_status_examples(schema: dict[str, Any]) -> None:
+    operation = schema["paths"].get("/generate-menu/{task_id}", {}).get("get")
+    if operation is not None:
+        content = operation["responses"]["200"]["content"]["application/json"]
+        content["examples"] = STATUS_EXAMPLES
+
+
 # Ошибки валидации отдаются в формате сервиса (400), поэтому 422 FastAPI не нужен.
 def build_openapi(app: FastAPI) -> dict[str, Any]:
     if app.openapi_schema is None:
@@ -72,6 +84,7 @@ def build_openapi(app: FastAPI) -> dict[str, Any]:
                 operation["responses"].pop("422", None)
         for name in ("HTTPValidationError", "ValidationError"):
             schema.get("components", {}).get("schemas", {}).pop(name, None)
+        restore_status_examples(schema)
         app.openapi_schema = schema
     return app.openapi_schema
 
@@ -137,7 +150,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
     app.state.tracer_provider = provider
     app.state.metrics_registry = metrics_registry
+    app.state.tasks_created = Counter(
+        "generation_tasks_created",
+        "Menu generation tasks accepted by API-1.",
+        registry=metrics_registry,
+    )
     app.include_router(router)
+    app.include_router(generation_router)
 
     # Request ID относится к текущему HTTP-вызову; query и тела не логируются.
     @app.middleware("http")
