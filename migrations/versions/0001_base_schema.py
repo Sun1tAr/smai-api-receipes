@@ -31,7 +31,7 @@ def upgrade() -> None:
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
-            server_default=now(),
+            server_default=sa.text("clock_timestamp()"),
             nullable=False,
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_prompt_template")),

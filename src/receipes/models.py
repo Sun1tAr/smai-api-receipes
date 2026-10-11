@@ -37,8 +37,10 @@ class PromptTemplate(Base):
 
     id: Mapped[uuid.UUID] = uuid_pk()
     template: Mapped[str] = mapped_column(Text)
+    # clock_timestamp(): шаблоны, созданные в одной транзакции, различаются по времени,
+    # и latest() выбирает действительно последний, а не больший случайный id.
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
+        DateTime(timezone=True), server_default=func.clock_timestamp()
     )
 
 

@@ -168,18 +168,31 @@ class TaskRepository:
         )
         return result.first() is not None
 
-    # Сохраняет меню и переводит in_progress → done в savepoint. Если задача уже не
-    # in_progress (её просрочил expire_stale), savepoint откатывается: меню и
-    # добавленные им ингредиенты не остаются, возвращается False. Внешней
-    # транзакцией по-прежнему управляет вызывающий.
+    # Блокирует задачу in_progress (SELECT … FOR UPDATE; если её нет, например её
+    # просрочил expire_stale, возвращает False, ничего не записав), затем в savepoint
+    # сохраняет меню и переводит in_progress → done. Если переход всё же не
+    # состоялся или сохранение упало, savepoint откатывается: меню и добавленные им
+    # ингредиенты не остаются. Внешней транзакцией управляет вызывающий. Отмену
+    # корутины (CancelledError) откат не перехватывает: транзакцию завершает
+    # владелец сессии.
     async def complete(self, task_id: uuid.UUID, generated: GeneratedMenu) -> bool:
+        locked = await self.session.scalar(
+            select(GenerationTask.task_id)
+            .where(
+                GenerationTask.task_id == task_id,
+                GenerationTask.status == TaskStatus.IN_PROGRESS,
+            )
+            .with_for_update()
+        )
+        if locked is None:
+            return False
         savepoint = await self.session.begin_nested()
         try:
             menu_id = await MenuRepository(self.session).save(generated)
             done = await self.transition(
                 task_id, TaskStatus.IN_PROGRESS, TaskStatus.DONE, menu_id=menu_id
             )
-        except BaseException:
+        except Exception:
             await savepoint.rollback()
             raise
         if done:

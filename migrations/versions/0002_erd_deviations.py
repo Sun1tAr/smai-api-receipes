@@ -7,12 +7,12 @@ transition, expire_stale), so the code and this revision have to be reverted
 together.
 """
 
+import re
+import unicodedata
 from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
-
-from receipes.domain import normalize_ingredient_name
 
 revision: str = "0002_erd_deviations"
 down_revision: str | None = "0001_base_schema"
@@ -23,6 +23,20 @@ ORDERED = (
     ("menu_recipes", "menu_id", "uq_menu_recipes_menu_id_position"),
     ("recipe_ingredients", "recipe_id", "uq_recipe_ingredients_recipe_id_position"),
 )
+
+
+_SPACES = re.compile(r"\s+")
+
+
+# Копия domain.display_ingredient_name / normalize_ingredient_name на момент ревизии.
+# Копия намеренная: историческая миграция не должна меняться вместе с кодом
+# приложения, иначе повторное применение даст другие ключи.
+def _display_name(name: str) -> str:
+    return _SPACES.sub(" ", unicodedata.normalize("NFC", name)).strip()
+
+
+def _name_key(name: str) -> str:
+    return _display_name(name).casefold().replace("ё", "е")
 
 
 # Применяем изменения этой ревизии схемы.
@@ -41,17 +55,24 @@ def upgrade() -> None:
         )
         op.create_unique_constraint(unique_name, table, [parent, "position"])
 
-    # Ключ дедупликации ингредиентов. Бэкфилл считает его той же Python-функцией, что
-    # и приложение (casefold нельзя повторить в SQL точно); при коллизии ключей
-    # UNIQUE ниже остановит миграцию вместо тихого слияния ингредиентов.
+    # Ключ дедупликации ингредиентов. Бэкфилл считает его Python-функцией (casefold
+    # нельзя повторить в SQL точно) и заодно схлопывает пробелы в отображаемом имени;
+    # на ключ это не влияет. При коллизии ключей UNIQUE ниже остановит миграцию
+    # вместо тихого слияния ингредиентов.
     op.add_column("ingredient", sa.Column("name_key", sa.String(255), nullable=True))
     bind = op.get_bind()
     rows = bind.execute(sa.text("SELECT id, name FROM ingredient")).all()
     if rows:
         bind.execute(
-            sa.text("UPDATE ingredient SET name_key = :key WHERE id = :id"),
+            sa.text(
+                "UPDATE ingredient SET name = :name, name_key = :key WHERE id = :id"
+            ),
             [
-                {"id": row.id, "key": normalize_ingredient_name(row.name)}
+                {
+                    "id": row.id,
+                    "name": _display_name(row.name),
+                    "key": _name_key(row.name),
+                }
                 for row in rows
             ],
         )

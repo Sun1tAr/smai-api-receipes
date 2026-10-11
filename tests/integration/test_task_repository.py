@@ -343,6 +343,34 @@ async def test_lost_complete_leaves_no_menu_data_behind(session) -> None:
     assert (await counts(session))["menu"] == 1
 
 
+async def test_complete_does_not_write_when_the_task_is_not_in_progress(
+    session, monkeypatch
+) -> None:
+    async def forbidden(self, generated):
+        raise AssertionError("the menu must not be saved")
+
+    monkeypatch.setattr(MenuRepository, "save", forbidden)
+    task = await make_task(session)  # pending, не in_progress
+    assert not await TaskRepository(session).complete(task.task_id, menu_data())
+    assert not await TaskRepository(session).complete(uuid.uuid4(), menu_data())
+
+
+async def test_complete_rolls_back_when_the_transition_is_lost(
+    session, monkeypatch
+) -> None:
+    repository = TaskRepository(session)
+    task = await make_task(session)
+    await start(session, task.task_id)
+    before = await counts(session)
+
+    async def lost(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(repository, "transition", lost)
+    assert not await repository.complete(task.task_id, menu_data())
+    assert await counts(session) == before
+
+
 async def test_complete_rolls_back_when_saving_fails(session) -> None:
     repository = TaskRepository(session)
     task = await make_task(session)
@@ -412,3 +440,13 @@ async def test_started_and_finished_use_the_real_clock_inside_a_transaction(
     )
     done = await repository.get(task.task_id)
     assert done.finished_at > done.started_at
+
+
+async def test_templates_created_in_one_transaction_are_ordered_by_time(
+    session,
+) -> None:
+    # Без явного created_at: порядок задаёт clock_timestamp() по умолчанию, а не id.
+    for template in ("first", "second", "third"):
+        session.add(PromptTemplate(id=uuid.uuid4(), template=template))
+        await session.flush()
+    assert (await PromptTemplateRepository(session).latest()).template == "third"

@@ -151,8 +151,8 @@ docker compose -p receipes-tests -f docker-compose.test.yml down
 | `nutrition` | `calories`, `proteins`, `fats`, `carbohydrates` |
 
 Числа (калории, КБЖУ, количества, время готовки) — `Numeric(10,2)`; время
-`created_at`/`started_at`/`finished_at` — `timestamptz`. `created_at` по умолчанию
-`now()` (начало транзакции), а `started_at`/`finished_at` пишутся
+`created_at`/`started_at`/`finished_at` — `timestamptz`. `generation_task.created_at`
+по умолчанию `now()` (начало транзакции), а `started_at`/`finished_at` пишутся
 `clock_timestamp()`: иначе при захвате задачи в той же транзакции, где она
 создана, `started_at` совпал бы с `created_at`.
 
@@ -187,9 +187,10 @@ docker compose -p receipes-tests -f docker-compose.test.yml down
   `expire_stale`/`complete`), поэтому код и ревизию нужно откатывать вместе.
 
   Бэкфилл при `upgrade` 0002: `position` — `1..n` по `id`, `started_at`/
-  `finished_at` — `created_at`, `name_key` — **той же Python-функцией**
-  `normalize_ingredient_name`, что использует приложение (`casefold` в SQL точно не
-  повторить). Если у существующих строк совпадут ключи, UNIQUE остановит миграцию,
+  `finished_at` — `created_at`, `name_key` — Python-функцией, **скопированной в
+  миграцию** из приложения (`casefold` в SQL точно не повторить; копия намеренная:
+  историческая миграция не должна меняться вместе с кодом); заодно в `name`
+  схлопываются пробелы и убираются крайние. Если у существующих строк совпадут ключи, UNIQUE остановит миграцию,
   а не склеит ингредиенты молча.
 
 Обе ревизии обратимы (`upgrade` / `downgrade` / `upgrade` проверяются в
@@ -213,12 +214,16 @@ docker compose -p receipes-tests -f docker-compose.test.yml down
     у любой задачи `in_progress`. Если параметры или промпт не собираются
     (`DomainError`), задача условно переводится в `failed` с ошибкой `Invalid
     generation parameters`, и в том же вызове берётся следующая (не более 20
-    итераций) — «ядовитая» задача не блокирует очередь. Вызывающий коммитит
+    итераций) — «ядовитая» задача не блокирует очередь. Если лимит итераций
+    исчерпан, `claim_next` возвращает `None`, как при пустой очереди; оставшиеся
+    `pending` воркер подберёт на следующем тике. Вызывающий коммитит
     транзакцию сразу после `claim_next`, чтобы не держать блокировку строки.
-  - `complete(task_id, generated_menu)` — основной путь завершения: в savepoint
-    (`begin_nested`) сохраняет меню и условно переводит `in_progress` → `done`. Если
-    задача уже не `in_progress` (её просрочил `expire_stale`), savepoint
-    откатывается и возвращается `False`: не остаётся ни меню, ни рецептов, ни
+  - `complete(task_id, generated_menu)` — основной путь завершения: сначала
+    `SELECT … FOR UPDATE` задачи в `in_progress` (нет такой, например её просрочил
+    `expire_stale` — `False` без записи), затем в savepoint (`begin_nested`)
+    сохраняет меню и условно переводит `in_progress` → `done`. При неудаче
+    перехода или ошибке сохранения savepoint откатывается и возвращается `False`
+    (или пробрасывается исключение): не остаётся ни меню, ни рецептов, ни
     нутриентов, ни шагов, ни связей, ни добавленных этим вызовом ингредиентов
     (ингредиенты, существовавшие раньше, не затрагиваются). Внешней транзакцией
     управляет вызывающий.
@@ -232,7 +237,8 @@ docker compose -p receipes-tests -f docker-compose.test.yml down
   ингредиенты и шаги отсортированы по `position`; бросает `MenuNotFound`. Связанные
   данные грузятся `selectinload`/`joinedload` (несколько запросов, без N+1).
 - `PromptTemplateRepository.latest()` — `ORDER BY created_at DESC, id DESC`
-  (детерминирован и при равном `created_at`). Первый шаблон создаёт сид (SMAI-56):
+  (`created_at` по умолчанию `clock_timestamp()`, поэтому шаблоны из одной транзакции
+  различаются по времени; при полном равенстве решает больший `id`). Первый шаблон создаёт сид (SMAI-56):
   до этого `latest()` возвращает `None`.
 
 **Ворота ответа модели** (`GeneratedMenu`): 3–21 рецепт (минимум 3 заложен

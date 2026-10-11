@@ -166,11 +166,11 @@ async def test_erd_deviations_backfill_existing_rows(
             "SELECT created_at, started_at, finished_at FROM generation_task"
         )
         assert row["started_at"] == row["created_at"] == row["finished_at"]
-        # name_key считается той же Python-функцией, name не меняется.
+        # Ключ считается Python-функцией; в имени схлопнуты пробелы, регистр цел.
         keys = await connection.fetch("SELECT name, name_key FROM ingredient")
         assert {(r["name"], r["name_key"]) for r in keys} == {
             ("Мёд", "мед"),
-            ("  Овсяные   ХЛОПЬЯ ", "овсяные хлопья"),
+            ("Овсяные ХЛОПЬЯ", "овсяные хлопья"),
         }
     finally:
         alembic(alembic_env, "upgrade", "head")
