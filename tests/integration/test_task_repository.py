@@ -13,6 +13,7 @@ from receipes.domain import (
     GenerationParameters,
     GenerationTaskNotFound,
     InvalidTaskTransition,
+    PromptTemplateNotFound,
     TaskStatus,
 )
 from receipes.models import GenerationTask, PromptTemplate
@@ -467,3 +468,44 @@ async def test_templates_created_in_one_transaction_are_ordered_by_time(
         session.add(PromptTemplate(id=uuid.uuid4(), template=template))
         await session.flush()
     assert await latest_template(PromptTemplateRepository(session)) == "third"
+
+
+async def seed_template(session, template: str) -> None:
+    session.add(PromptTemplate(id=uuid.uuid4(), template=template))
+    await session.flush()
+
+
+async def test_claim_saves_the_built_prompt_in_the_task(session) -> None:
+    await seed_template(
+        session, 'Людей: {people_count}, бюджет {weekly_budget}. Формат {"a": 1}'
+    )
+    task = await make_task(session)
+    builder = await PromptTemplateRepository(session).builder()
+    claimed = await TaskRepository(session).claim_next(builder)
+    assert claimed is not None and claimed.task_id == task.task_id
+    expected = 'Людей: 2, бюджет 1500.50. Формат {"a": 1}'
+    assert claimed.prompt == expected
+    stored = await session.scalar(
+        text("SELECT prompt FROM generation_task WHERE task_id = :id"),
+        {"id": task.task_id},
+    )
+    assert stored == expected
+
+
+async def test_broken_template_fails_the_task_instead_of_blocking_the_queue(
+    session,
+) -> None:
+    await seed_template(session, "нет плейсхолдера бюджета {people_count}")
+    task = await make_task(session)
+    builder = await PromptTemplateRepository(session).builder()
+    assert await TaskRepository(session).claim_next(builder) is None
+    failed = await TaskRepository(session).get(task.task_id)
+    assert (failed.status, failed.error) == (
+        TaskStatus.FAILED,
+        INVALID_PARAMETERS_ERROR,
+    )
+
+
+async def test_builder_requires_a_stored_template(session) -> None:
+    with pytest.raises(PromptTemplateNotFound):
+        await PromptTemplateRepository(session).builder()

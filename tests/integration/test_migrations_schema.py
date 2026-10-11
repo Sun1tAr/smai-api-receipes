@@ -178,3 +178,54 @@ async def test_erd_deviations_backfill_existing_rows(
             "TRUNCATE generation_task, generation_parameters, menu, recipe, "
             "nutrition, ingredient CASCADE"
         )
+
+
+SEED_ID = "6f3b1c0e-5d2a-4f7e-9a41-0c8b7d2e1a10"
+
+
+async def test_seed_revision_inserts_the_prompt_template_and_is_reversible(
+    connection, alembic_env, migrated_database, settings
+) -> None:
+    from decimal import Decimal
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from receipes.database import create_engine
+    from receipes.domain import GenerationParameters
+    from receipes.prompt import build_prompt
+    from receipes.repositories import PromptTemplateRepository
+
+    try:
+        alembic(alembic_env, "downgrade", "0002_erd_deviations")
+        assert await connection.fetchval("SELECT count(*) FROM prompt_template") == 0
+        alembic(alembic_env, "upgrade", "head")
+        assert await connection.fetchval("SELECT count(*) FROM prompt_template") == 1
+        alembic(alembic_env, "check")
+        engine = create_engine(settings)
+        try:
+            async with AsyncSession(engine) as session:
+                latest = await PromptTemplateRepository(session).latest()
+        finally:
+            await engine.dispose()
+        assert latest is not None and str(latest.id) == SEED_ID
+        prompt = build_prompt(latest.template, GenerationParameters(2, Decimal("5000")))
+        assert "2 чел." in prompt and "5000.00 руб." in prompt
+    finally:
+        alembic(alembic_env, "upgrade", "head")
+
+
+async def test_seed_downgrade_keeps_other_templates(
+    connection, alembic_env, migrated_database
+) -> None:
+    try:
+        alembic(alembic_env, "upgrade", "head")
+        await connection.execute(
+            "INSERT INTO prompt_template (id, template) VALUES ($1, 'custom')",
+            uuid.uuid4(),
+        )
+        alembic(alembic_env, "downgrade", "0002_erd_deviations")
+        rows = await connection.fetch("SELECT template FROM prompt_template")
+        assert [row["template"] for row in rows] == ["custom"]
+    finally:
+        await connection.execute("DELETE FROM prompt_template WHERE template='custom'")
+        alembic(alembic_env, "upgrade", "head")
