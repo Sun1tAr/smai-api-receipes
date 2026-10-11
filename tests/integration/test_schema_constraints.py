@@ -39,7 +39,7 @@ async def parents(session_factory):
             "INSERT INTO recipe VALUES (:recipe, 'r', 1, 1, NULL, :nutrition)",
             "INSERT INTO recipe VALUES (:recipe2, 'r2', 1, 1, NULL, :nutrition)",
             "INSERT INTO menu VALUES (:menu)",
-            "INSERT INTO ingredient VALUES (:ingredient, 'молоко')",
+            "INSERT INTO ingredient VALUES (:ingredient, 'Молоко', 'молоко')",
             "INSERT INTO generation_parameters VALUES (:params, 2, 100)",
             "INSERT INTO generation_parameters VALUES (:params2, 2, 100)",
             "INSERT INTO menu_recipes VALUES (gen_random_uuid(), :menu, :recipe, 1)",
@@ -81,16 +81,24 @@ def task(status, prompt="'p'", menu=None, error=None, started=None, finished=Non
 NOW = "now()"
 CASES = [
     # CHECK
-    (
-        "INSERT INTO generation_parameters VALUES (gen_random_uuid(), 0, 10)",
-        CHECK,
-        "ck_generation_parameters_people_count_positive",
-    ),
-    (
-        "INSERT INTO generation_parameters VALUES (gen_random_uuid(), 1, 0)",
-        CHECK,
-        "ck_generation_parameters_weekly_budget_positive",
-    ),
+    *[
+        (
+            "INSERT INTO generation_parameters VALUES "
+            f"(gen_random_uuid(), {people}, 10)",
+            CHECK,
+            "ck_generation_parameters_people_count_range",
+        )
+        for people in (0, 21, 25)
+    ],
+    *[
+        (
+            "INSERT INTO generation_parameters VALUES "
+            f"(gen_random_uuid(), 1, {budget})",
+            CHECK,
+            "ck_generation_parameters_weekly_budget_range",
+        )
+        for budget in (0, -1, "1000000.01")
+    ],
     (
         "INSERT INTO nutrition VALUES (gen_random_uuid(), -1, 0, 0, 0)",
         CHECK,
@@ -191,9 +199,9 @@ CASES = [
         "uq_instruction_recipe_id_position",
     ),
     (
-        "INSERT INTO ingredient VALUES (gen_random_uuid(), '  МОЛОКО ')",
+        "INSERT INTO ingredient VALUES (gen_random_uuid(), 'Другое', 'молоко')",
         UNIQUE,
-        "uq_ingredient_name_normalized",
+        "uq_ingredient_name_key",
     ),
     # FOREIGN KEY
     (
@@ -259,7 +267,7 @@ CASES = [
         None,
     ),
     (
-        "INSERT INTO ingredient VALUES (gen_random_uuid(), repeat('я', 256))",
+        "INSERT INTO ingredient VALUES (gen_random_uuid(), repeat('я', 256), 'k')",
         TOO_LONG,
         None,
     ),
@@ -271,6 +279,19 @@ async def test_constraint_violation_is_rejected(
     parents, sql: str, sqlstate: str, constraint: str | None
 ) -> None:
     await violation(parents, sql, sqlstate, constraint)
+
+
+@pytest.mark.parametrize(("people", "budget"), [(1, "0.01"), (20, "1000000")])
+async def test_parameter_bounds_are_inclusive(parents, people, budget) -> None:
+    async with parents() as session:
+        await session.execute(
+            text(
+                "INSERT INTO generation_parameters VALUES "
+                "(gen_random_uuid(), :people, :budget)"
+            ),
+            {"people": people, "budget": budget},
+        )
+        await session.commit()
 
 
 async def test_valid_task_rows_are_accepted(parents) -> None:

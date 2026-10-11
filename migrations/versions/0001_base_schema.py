@@ -1,4 +1,9 @@
-"""Base schema of MS-4 strictly per the ERD (SMAI-A-110)."""
+"""Base schema of MS-4: the ERD (SMAI-A-110) plus integrity constraints.
+
+Columns and tables are exactly those of the ERD. On top of them: CHECK, UNIQUE and
+partial/foreign-key indexes that add no columns. Deviations from the ERD that add
+columns live in revision 0002.
+"""
 
 from collections.abc import Sequence
 
@@ -37,12 +42,12 @@ def upgrade() -> None:
         sa.Column("people_count", sa.Integer(), nullable=False),
         sa.Column("weekly_budget", sa.Numeric(12, 2), nullable=False),
         sa.CheckConstraint(
-            "people_count >= 1",
-            name=op.f("ck_generation_parameters_people_count_positive"),
+            "people_count BETWEEN 1 AND 20",
+            name=op.f("ck_generation_parameters_people_count_range"),
         ),
         sa.CheckConstraint(
-            "weekly_budget > 0",
-            name=op.f("ck_generation_parameters_weekly_budget_positive"),
+            "weekly_budget > 0 AND weekly_budget <= 1000000",
+            name=op.f("ck_generation_parameters_weekly_budget_range"),
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_generation_parameters")),
     )
@@ -69,12 +74,6 @@ def upgrade() -> None:
         sa.Column("id", UUID_PK, nullable=False),
         sa.Column("name", sa.String(255), nullable=False),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_ingredient")),
-    )
-    op.create_index(
-        "uq_ingredient_name_normalized",
-        "ingredient",
-        [sa.text("lower(btrim(name))")],
-        unique=True,
     )
     op.create_table(
         "generation_task",
@@ -245,7 +244,6 @@ def downgrade() -> None:
         postgresql_where=sa.text("status = 'pending'"),
     )
     op.drop_table("generation_task")
-    op.drop_index("uq_ingredient_name_normalized", table_name="ingredient")
     op.drop_table("ingredient")
     op.drop_table("nutrition")
     op.drop_table("menu")

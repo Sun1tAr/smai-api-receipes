@@ -1,7 +1,10 @@
-"""Deviations from the ERD: ordering of menu recipes and ingredients, task timestamps.
+"""Deviations from the ERD: position, started_at/finished_at, ingredient.name_key.
 
-Separate revision on purpose: if the lead rejects these deviations, this file is
-removed without touching the base schema.
+Kept in a separate revision so the deviations are visible and reviewable on their
+own. Rejecting them is not just deleting this file: models.py and repositories.py
+depend on these columns (MenuRepository.save/load, TaskRepository.claim_next,
+transition, expire_stale), so the code and this revision have to be reverted
+together.
 """
 
 from collections.abc import Sequence
@@ -9,7 +12,9 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0002_ordering_task_times"
+from receipes.domain import normalize_ingredient_name
+
+revision: str = "0002_erd_deviations"
 down_revision: str | None = "0001_base_schema"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
@@ -35,6 +40,23 @@ def upgrade() -> None:
             op.f(f"ck_{table}_position_positive"), table, "position >= 1"
         )
         op.create_unique_constraint(unique_name, table, [parent, "position"])
+
+    # Ключ дедупликации ингредиентов. Бэкфилл считает его той же Python-функцией, что
+    # и приложение (casefold нельзя повторить в SQL точно); при коллизии ключей
+    # UNIQUE ниже остановит миграцию вместо тихого слияния ингредиентов.
+    op.add_column("ingredient", sa.Column("name_key", sa.String(255), nullable=True))
+    bind = op.get_bind()
+    rows = bind.execute(sa.text("SELECT id, name FROM ingredient")).all()
+    if rows:
+        bind.execute(
+            sa.text("UPDATE ingredient SET name_key = :key WHERE id = :id"),
+            [
+                {"id": row.id, "key": normalize_ingredient_name(row.name)}
+                for row in rows
+            ],
+        )
+    op.alter_column("ingredient", "name_key", nullable=False)
+    op.create_unique_constraint("uq_ingredient_name_key", "ingredient", ["name_key"])
 
     op.add_column(
         "generation_task",
@@ -73,6 +95,8 @@ def upgrade() -> None:
 
 # Откатываем изменения этой ревизии схемы.
 def downgrade() -> None:
+    op.drop_constraint("uq_ingredient_name_key", "ingredient", type_="unique")
+    op.drop_column("ingredient", "name_key")
     op.drop_index(
         "ix_generation_task_started_at_in_progress",
         table_name="generation_task",

@@ -45,8 +45,12 @@ class PromptTemplate(Base):
 class GenerationParametersRecord(Base):
     __tablename__ = "generation_parameters"
     __table_args__ = (
-        CheckConstraint("people_count >= 1", name="people_count_positive"),
-        CheckConstraint("weekly_budget > 0", name="weekly_budget_positive"),
+        # Границы совпадают с доменом (GenerationParameters): строка вне них не
+        # попадёт в очередь и не сможет её заблокировать.
+        CheckConstraint("people_count BETWEEN 1 AND 20", name="people_count_range"),
+        CheckConstraint(
+            "weekly_budget > 0 AND weekly_budget <= 1000000", name="weekly_budget_range"
+        ),
     )
 
     id: Mapped[uuid.UUID] = uuid_pk()
@@ -179,15 +183,13 @@ class Recipe(Base):
 
 class Ingredient(Base):
     __tablename__ = "ingredient"
+    __table_args__ = (UniqueConstraint("name_key", name="uq_ingredient_name_key"),)
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    # Хранится в нормализованном виде (см. domain.normalize_ingredient_name).
+    # Отображаемое имя: первое встреченное написание.
     name: Mapped[str] = mapped_column(String(NAME_MAX_LENGTH))
-
-
-# Уникальность по нормализованному имени; вставка использует то же выражение.
-INGREDIENT_NAME_KEY = func.lower(func.btrim(Ingredient.name))
-Index("uq_ingredient_name_normalized", INGREDIENT_NAME_KEY, unique=True)
+    # Ключ дедупликации; считается только в Python (domain.normalize_ingredient_name).
+    name_key: Mapped[str] = mapped_column(String(NAME_MAX_LENGTH))
 
 
 class MenuRecipe(Base):

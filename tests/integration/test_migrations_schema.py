@@ -81,7 +81,7 @@ async def test_upgrade_downgrade_upgrade_and_schema_matches_models(
         alembic(alembic_env, "upgrade", "head")
 
 
-async def test_ordering_revision_is_separate_and_reversible(
+async def test_erd_deviations_are_a_separate_reversible_revision(
     connection, alembic_env, migrated_database
 ) -> None:
     try:
@@ -92,6 +92,12 @@ async def test_ordering_revision_is_separate_and_reversible(
         assert "position" in await columns(connection, "instruction")
         task_columns = await columns(connection, "generation_task")
         assert not {"started_at", "finished_at"} & task_columns
+        assert "name_key" not in await columns(connection, "ingredient")
+        # В базовой схеме ключа ингредиента нет, уникальных индексов по имени тоже.
+        assert not await connection.fetch(
+            "SELECT 1 FROM pg_indexes WHERE tablename = 'ingredient' "
+            "AND indexname <> 'pk_ingredient'"
+        )
         alembic(alembic_env, "upgrade", "head")
         assert "position" in await columns(connection, "menu_recipes")
         assert {"started_at", "finished_at"} <= await columns(
@@ -110,13 +116,12 @@ async def test_partial_indexes_exist(connection, migrated_database) -> None:
     assert "WHERE" in definitions["ix_generation_task_created_at_pending"]
     assert "in_progress" in definitions["ix_generation_task_started_at_in_progress"]
     ingredient = await connection.fetchval(
-        "SELECT indexdef FROM pg_indexes "
-        "WHERE indexname = 'uq_ingredient_name_normalized'"
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'uq_ingredient_name_key'"
     )
-    assert "UNIQUE" in ingredient and "lower(btrim(" in ingredient
+    assert "UNIQUE" in ingredient and "(name_key)" in ingredient
 
 
-async def test_ordering_revision_backfills_existing_rows(
+async def test_erd_deviations_backfill_existing_rows(
     connection, alembic_env, migrated_database
 ) -> None:
     ids = {name: uuid.uuid4() for name in ("n", "r", "m", "i")}
@@ -135,8 +140,9 @@ async def test_ordering_revision_backfills_existing_rows(
             ids["m"],
             ids["r"],
         )
+        await connection.execute("INSERT INTO ingredient VALUES ($1, 'Мёд')", ids["i"])
         await connection.execute(
-            "INSERT INTO ingredient VALUES ($1, 'молоко')", ids["i"]
+            "INSERT INTO ingredient VALUES (gen_random_uuid(), '  Овсяные   ХЛОПЬЯ ')"
         )
         await connection.execute(
             "INSERT INTO recipe_ingredients VALUES (gen_random_uuid(), $1, $2, 1, 'г')",
@@ -160,6 +166,12 @@ async def test_ordering_revision_backfills_existing_rows(
             "SELECT created_at, started_at, finished_at FROM generation_task"
         )
         assert row["started_at"] == row["created_at"] == row["finished_at"]
+        # name_key считается той же Python-функцией, name не меняется.
+        keys = await connection.fetch("SELECT name, name_key FROM ingredient")
+        assert {(r["name"], r["name_key"]) for r in keys} == {
+            ("Мёд", "мед"),
+            ("  Овсяные   ХЛОПЬЯ ", "овсяные хлопья"),
+        }
     finally:
         alembic(alembic_env, "upgrade", "head")
         await connection.execute(

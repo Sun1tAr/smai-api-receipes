@@ -28,14 +28,17 @@ def downgrade() -> None:
 '''
 
 
-# Временная ветка миграций с настоящим env.py проекта и одной ревизией.
-def run_alembic(tmp_path: Path, env: dict[str, str], statement: str):
+def current_head() -> str:
     from alembic.config import Config
     from alembic.script import ScriptDirectory
 
-    head = ScriptDirectory.from_config(
-        Config(str(ROOT / "alembic.ini"))
-    ).get_current_head()
+    config = Config(str(ROOT / "alembic.ini"))
+    return ScriptDirectory.from_config(config).get_current_head()
+
+
+# Временная ветка миграций с настоящим env.py проекта и одной ревизией.
+def run_alembic(tmp_path: Path, env: dict[str, str], statement: str):
+    head = current_head()
     shutil.copytree(ROOT / "migrations", tmp_path / "migrations")
     (tmp_path / "migrations" / "versions" / "tmp0001.py").write_text(
         REVISION.format(statement=statement, head=head)
@@ -54,7 +57,7 @@ def run_alembic(tmp_path: Path, env: dict[str, str], statement: str):
 
 
 def test_migration_longer_than_db_timeout_succeeds(
-    tmp_path: Path, alembic_env: dict[str, str]
+    tmp_path: Path, alembic_env: dict[str, str], migrated_database: None
 ) -> None:
     env = {**alembic_env, "DB_TIMEOUT_SECONDS": "1"}
     result = run_alembic(tmp_path, env, "SELECT pg_sleep(2.5)")
@@ -68,7 +71,7 @@ def test_migration_longer_than_db_timeout_succeeds(
 
 
 def test_failed_migration_logs_sqlstate_and_revisions_without_secrets(
-    tmp_path: Path, alembic_env: dict[str, str]
+    tmp_path: Path, alembic_env: dict[str, str], migrated_database: None
 ) -> None:
     result = run_alembic(tmp_path, alembic_env, "SELECT * FROM missing_table")
     assert result.returncode != 0
@@ -80,8 +83,8 @@ def test_failed_migration_logs_sqlstate_and_revisions_without_secrets(
         if item["message"] == "migration_failed"
     )
     assert failure["sqlstate"] == "42P01"
-    # Ревизия, с которой начали, — текущий head проекта (или None на пустой БД).
-    assert "from_revision" in failure
+    # Миграция началась с head проекта: схема уже применена фикстурой.
+    assert failure["from_revision"] == current_head()
     assert failure["error_type"]
 
 
