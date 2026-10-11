@@ -24,7 +24,9 @@ from pydantic import ValidationError
 
 from receipes.config import Settings
 from receipes.domain import DomainError, GenerationParameters
-from receipes.generated_menu import GeneratedMenu, ollama_format_schema
+from receipes.generated_menu import GeneratedMenu
+from receipes.ollama import ResponseTruncated, parse_response
+from receipes.ollama import build_request as ollama_request
 from receipes.prompt import build_prompt
 
 SEED_MIGRATION = (
@@ -49,30 +51,14 @@ def load_seed_template(path: Path = SEED_MIGRATION) -> str:
 
 def build_request(prompt: str, model: str) -> dict[str, Any]:
     fields = Settings.model_fields
-    return {
-        "model": model,
-        "prompt": prompt,
-        "format": ollama_format_schema(),
-        "stream": False,
-        "keep_alive": fields["ollama_keep_alive"].default,
-        "options": {
-            "temperature": fields["ollama_temperature"].default,
-            "num_ctx": fields["ollama_num_ctx"].default,
-            "num_predict": fields["ollama_num_predict"].default,
-        },
-    }
-
-
-class ResponseTruncated(Exception):
-    """Генерация оборвана по лимиту токенов (done_reason == "length")."""
-
-
-# Ответ Ollama → проверенное «воротами» меню; ошибки формата поднимаются наверх.
-# Обрыв по num_predict даёт невалидный JSON, поэтому он определяется заранее.
-def parse_response(body: dict[str, Any]) -> GeneratedMenu:
-    if body.get("done_reason") == "length":
-        raise ResponseTruncated
-    return GeneratedMenu.model_validate(json.loads(body["response"]))
+    return ollama_request(
+        prompt,
+        model,
+        num_ctx=fields["ollama_num_ctx"].default,
+        num_predict=fields["ollama_num_predict"].default,
+        temperature=fields["ollama_temperature"].default,
+        keep_alive=fields["ollama_keep_alive"].default,
+    )
 
 
 def run(
