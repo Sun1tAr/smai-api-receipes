@@ -128,6 +128,8 @@ Compose-сети. При старте контейнер выполняет `ale
 | `GENERATION_PENDING_TTL_SECONDS` | Время жизни ожидающей задачи, [1, 86400] | `900` |
 | `GENERATION_MAX_PENDING` | Лимит ожидающих задач (пока не применяется) | Не задан — без лимита |
 | `GENERATION_BAD_RESPONSE_RETRIES` | Повторы при некорректном ответе модели, [0, 10] | `1` |
+| `GENERATION_BREAKER_MIN_PAUSE_SECONDS` | Начальная пауза воркера после сбоя Ollama, (0, 3600] | `5` |
+| `GENERATION_BREAKER_MAX_PAUSE_SECONDS` | Предельная пауза (не меньше минимальной), (0, 3600] | `60` |
 | `RECEIPES_HTTP_PORT` | Хостовой порт Compose (только Compose) | `8001` |
 
 Пустые и состоящие из пробелов `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`
@@ -387,59 +389,100 @@ Alembic ждёт подключения не дольше `DB_TIMEOUT_SECONDS`, 
 ## Фоновый воркер
 
 Запускается в `lifespan` приложения при `GENERATION_WORKER_ENABLED=true` и
-останавливается при завершении (отмена и ожидание задачи, затем закрытие клиента
-Ollama, затем пул БД). Один воркер на процесс; задачи обрабатываются по одной.
+останавливается при завершении (отмена и ожидание задачи, затем снятие блокировки и
+закрытие клиента Ollama, затем пул БД; каждый шаг в своём `try/finally`, поэтому
+сбой остановки воркера не оставляет пул открытым). Задачи обрабатываются по одной.
+
+**Один активный воркер на кластер.** Ollama обрабатывает запросы последовательно, и
+вторая реплика получала бы таймауты. Поэтому воркер берёт `pg_try_advisory_lock` на
+отдельном соединении (AUTOCOMMIT): активна одна реплика, остальные на каждом тике
+пробуют взять блокировку. Блокировка снимается при остановке и при обрыве
+соединения; потеря соединения замечается на следующем тике (воркер перестаёт
+считать себя активным и пробует взять блокировку заново). Окно между потерей
+соединения и следующим тиком возможно: данные при этом не портятся (`SKIP LOCKED`
+и условные переходы), но две реплики на короткое время могут вызвать Ollama
+одновременно. Метрика `generation_worker_active` показывает, держит ли реплика
+блокировку.
 
 **Тик** (раз в `GENERATION_WORKER_INTERVAL_SECONDS`; если задача была — следующий
 тик сразу, без паузы):
-1. Обслуживание очереди: `expire_stale` переводит `pending` старше
+1. Блокировка активного воркера (см. выше); неактивная реплика тик пропускает.
+2. Обслуживание очереди: `expire_stale` переводит `pending` старше
    `GENERATION_PENDING_TTL_SECONDS` в `failed` (`Queue timeout`), а `in_progress`
    старше `OLLAMA_TIMEOUT_SECONDS × (1 + GENERATION_BAD_RESPONSE_RETRIES) + 60 с`
    — в `failed` (`Generation interrupted`); обновляется gauge очереди.
-2. Шаблон: `PromptTemplateRepository.builder()`. Нет шаблона или он сломан
+3. Шаблон: `PromptTemplateRepository.builder()`. Нет шаблона или он сломан
    (`InvalidPromptTemplate`) — ошибка в лог (`prompt_template_unusable`, уровень
    `error`) **на каждом тике**, задачи остаются `pending`, воркер не падает.
-3. Захват: `claim_next` (`FOR UPDATE SKIP LOCKED`), промпт сохраняется в
+4. Circuit breaker (см. ниже): при открытом breaker новые задачи не берутся.
+5. Захват: `claim_next` (`FOR UPDATE SKIP LOCKED`), промпт сохраняется в
    `generation_task.prompt`, транзакция коммитится сразу.
-4. Вызов Ollama **вне транзакций БД** (`POST /api/generate`, `stream: false`,
+6. Вызов Ollama **вне транзакций БД** (`POST /api/generate`, `stream: false`,
    `format` из `ollama_format_schema()`, опции `num_ctx`/`num_predict`/
    `temperature`, `keep_alive`). Соединение ограничено
    `OLLAMA_CONNECT_TIMEOUT_SECONDS`, весь вызов — `OLLAMA_TIMEOUT_SECONDS`.
-5. Результат: ответ проходит «ворота» `GeneratedMenu`; `complete` сохраняет меню и
+7. Результат: ответ проходит «ворота» `GeneratedMenu`; `complete` сохраняет меню и
    переводит задачу в `done` одной транзакцией. Если задача к этому моменту уже не
    `in_progress` (просрочена), меню не сохраняется, пишется предупреждение
    `generation_result_discarded`.
 
+**Circuit breaker.** Недоступная Ollama не должна «вычищать» очередь: после сбоя
+`unavailable`, `timeout` или `http_error` текущая задача остаётся `failed`, но новые
+не берутся. Пауза 5 с → 10 → 20 → … до 60 с
+(`GENERATION_BREAKER_MIN_PAUSE_SECONDS` / `_MAX_PAUSE_SECONDS`); после паузы
+выполняется проба `GET /api/tags`. Неудачная проба удваивает паузу, удачная
+закрывает breaker. Пауза сбрасывается к минимальной только после успешной
+генерации (а не после удачной пробы), поэтому «мигающая» Ollama не получает по
+задаче каждые 5 секунд. Пока breaker открыт, задачи остаются `pending` и истекают по
+TTL (`Queue timeout`), если Ollama не вернулась. Невалидный ответ, обрыв по длине и
+внутренние ошибки breaker не открывают. Метрики: `generation_breaker_open` (gauge),
+`generation_breaker_opened_total`.
+
+**Остановка во время вызова.** При отмене воркера (деплой, перезапуск) задача, чей
+вызов Ollama прерван, помечается `failed` с `Generation interrupted` (запись
+защищена от повторной отмены и ограничена 5 секундами), после чего отмена
+пробрасывается. Если записать не удалось, задачу завершит `expire_stale`.
+
+**Ошибки тика** (например, недоступна БД): лог `generation_tick_failed` с счётчиком
+подряд идущих ошибок пишется на 1-й, 2-й, 4-й, 8-й … ошибке, а не на каждой; пауза
+растёт экспоненциально от интервала до 30 с; первый успешный тик пишет
+`generation_worker_recovered` и возвращает обычный интервал.
+
 **Ошибки → `failed`** с коротким безопасным текстом (он виден в API-2; сырой ответ
 модели и детали транспорта в нём и в логах не появляются):
 
-| Причина (метка метрики) | `error` | Повтор |
-| --- | --- | --- |
-| `unavailable` (нет соединения, обрыв) | `Ollama is unavailable` | нет |
-| `timeout` | `Ollama request timed out` | нет |
-| `http_error` (любой HTTP ≥ 400, в т. ч. 503) | `Ollama returned an error` | нет |
-| `truncated` (`done_reason=length`) | `Model response was cut off (token limit reached)` | нет |
-| `invalid_response` (не JSON, не прошёл «ворота») | `Model returned an invalid menu` | да, `GENERATION_BAD_RESPONSE_RETRIES` раз (по умолчанию 1) |
-| `internal` (любая другая ошибка) | `Menu generation failed` | нет |
+| Причина (метка метрики) | `error` | Повтор | Breaker |
+| --- | --- | --- | --- |
+| `unavailable` (нет соединения, обрыв) | `Ollama is unavailable` | нет | да |
+| `timeout` | `Ollama request timed out` | нет | да |
+| `http_error` (любой HTTP ≥ 400, в т. ч. 503) | `Ollama returned an error` | нет | да |
+| `truncated` (`done_reason=length`) | `Model response was cut off (token limit reached)` | нет | нет |
+| `invalid_response` (не JSON, слишком глубокая вложенность, не прошёл «ворота») | `Model returned an invalid menu` | да, `GENERATION_BAD_RESPONSE_RETRIES` раз (по умолчанию 1) | нет |
+| `internal` (любая другая ошибка) | `Menu generation failed` | нет | нет |
+| `interrupted` (остановка воркера) | `Generation interrupted` | нет | нет |
 
-Повторяется только невалидный ответ модели; недоступность и таймаут повторов не
-имеют. Если сам переход в `failed` записать не удалось, задача остаётся
-`in_progress` и её завершит `expire_stale`. Остановка сервиса во время вызова
-Ollama оставляет задачу `in_progress` по той же причине.
+Если сам переход в `failed` записать не удалось, задача остаётся `in_progress` и её
+завершит `expire_stale`.
 
 **Метрики** (общий registry, без `task_id` и свободного текста):
-`generation_outcomes_total{outcome="done|failed",reason=…}`,
+`generation_outcomes_total{outcome="done|failed|discarded",reason=…}` — исход
+считается **после** записи в БД; `discarded` означает, что результат не удалось
+записать, потому что задачу уже завершили (просрочена), а `reason` — исход, который
+предполагался (`done` или причина сбоя),
 `ollama_request_duration_seconds{result="ok|<причина>"}` (гистограмма),
-`generation_pending_tasks` (gauge), `generation_tasks_expired_total`,
-`generation_worker_tick_errors_total`, `generation_template_errors_total`.
+`generation_pending_tasks`, `generation_tasks_expired_total`,
+`generation_worker_tick_errors_total`, `generation_template_errors_total`,
+`generation_breaker_open`, `generation_breaker_opened_total`,
+`generation_worker_active`.
 
 **Ограничения.**
 - `OLLAMA_TIMEOUT_SECONDS` (900 с) и `OLLAMA_NUM_PREDICT` (16384) — оценка; их нужно
   подобрать запуском `scripts.ollama_smoke` на реальной Ollama. Воркер с реальной
   Ollama не запускался: клиент и воркер проверены на заглушке Ollama
   (`httpx.MockTransport`) и на локальном mock-сервере.
-- Один воркер на процесс; при нескольких репликах задачи не дублируются
-  (`SKIP LOCKED`), но каждая реплика делает свои запросы к Ollama.
+- Блокировка активного воркера привязана к соединению с БД (см. окно потери
+  соединения выше); через pgbouncer в режиме transaction pooling она работать не
+  будет.
 - `GENERATION_MAX_PENDING` не применяется (решение Ivan).
 
 ## Известные ограничения
