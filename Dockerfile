@@ -34,7 +34,10 @@ ENV UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never RUFF_CACHE_DIR=/tmp/ruff-cache
 COPY pyproject.toml uv.lock ./
 COPY src ./src
 COPY tests ./tests
-COPY Dockerfile docker-compose.yml ./
+# Файлы, которые читают тесты (CI, smoke-скрипт): без них тесты пропускались бы.
+COPY .github ./.github
+COPY scripts ./scripts
+COPY Dockerfile docker-compose.yml docker-compose.test.yml ./
 RUN uv sync --locked --no-editable
 USER receipes
 HEALTHCHECK NONE

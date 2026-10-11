@@ -1,6 +1,7 @@
 import asyncio
 import os
 from datetime import timedelta
+from typing import Any
 
 import httpx
 import pytest
@@ -483,4 +484,27 @@ async def test_a_repeated_cancellation_during_the_interruption_write_propagates(
             break
         await asyncio.sleep(0.02)
     assert (await state(factory, task_id))["error"] == "Generation interrupted"
+    await worker.stop()
+
+
+async def test_a_failure_while_taking_the_lock_does_not_leak_the_connection(
+    ready, monkeypatch
+) -> None:
+    settings, factory = ready
+    worker = worker_for(settings, factory, FakeOllama())
+
+    async def broken(connection: Any) -> None:
+        raise ConnectionError("lost while enabling keepalive")
+
+    monkeypatch.setattr(worker, "enable_keepalive", broken)
+    with pytest.raises(ConnectionError):
+        await worker.tick()
+    assert worker.is_active is False
+    async with factory() as session:
+        held = await session.scalar(
+            text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'")
+        )
+    assert held == 0
+    monkeypatch.undo()
+    assert await worker.tick() is False and worker.is_active is True
     await worker.stop()

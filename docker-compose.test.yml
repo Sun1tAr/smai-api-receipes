@@ -10,6 +10,17 @@ services:
       TEST_DB_USER: receipes_test
       TEST_DB_PASSWORD: receipes-test-only
       OLLAMA_BASE_URL: http://ollama.test:11434
+      # Любой пропущенный тест в этом прогоне — ошибка (см. tests/conftest.py).
+      FAIL_ON_SKIP: "1"
+      COVERAGE_FILE: /tmp/.coverage
+    command:
+      - pytest
+      - -p
+      - no:cacheprovider
+      - -q
+      - --cov
+      - --cov-report=term-missing
+      - --cov-fail-under=95
     depends_on:
       postgres-test:
         condition: service_healthy

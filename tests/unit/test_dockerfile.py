@@ -42,3 +42,22 @@ def test_compose_requires_secrets_and_ollama_url() -> None:
     compose = (ROOT / "docker-compose.yml").read_text()
     for name in ("DB_NAME", "DB_USER", "DB_PASSWORD", "OLLAMA_BASE_URL"):
         assert f"${{{name}:?" in compose
+
+
+def test_test_stage_contains_the_files_the_tests_read() -> None:
+    test_stage = _stage("test")
+    for path in (
+        ".github",
+        "scripts",
+        "tests",
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.test.yml",
+    ):
+        assert re.search(rf"^COPY .*{re.escape(path)}", test_stage, re.MULTILINE), path
+
+
+def test_compose_test_run_fails_on_skips_and_low_coverage() -> None:
+    compose = (ROOT / "docker-compose.test.yml").read_text()
+    assert 'FAIL_ON_SKIP: "1"' in compose
+    assert "--cov-fail-under=95" in compose
