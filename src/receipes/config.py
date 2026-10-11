@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     # Не задан — очередь без лимита.
     generation_max_pending: int | None = Field(default=None, ge=1)
     generation_bad_response_retries: int = Field(default=1, ge=0, le=10)
+    # Реплика без блокировки активного воркера проверяет её не чаще этого интервала.
+    generation_standby_interval_seconds: float = Field(default=10, gt=0, le=3600)
+    # TCP keepalive соединения с advisory-блокировкой (простаивает во время вызова
+    # Ollama): первая проба через столько секунд простоя, дальше втрое чаще.
+    generation_lock_keepalive_seconds: int = Field(default=30, ge=3, le=3600)
     # Circuit breaker воркера: пауза после сбоя Ollama растёт от min до max.
     generation_breaker_min_pause_seconds: float = Field(default=5, gt=0, le=3600)
     generation_breaker_max_pause_seconds: float = Field(default=60, gt=0, le=3600)

@@ -180,15 +180,22 @@ class GenerationWorker:
                 if processed:
                     continue
                 interval = self.settings.generation_worker_interval_seconds
-                await asyncio.sleep(
-                    min(interval * 2**errors, TICK_BACKOFF_CAP_SECONDS)
-                    if errors
-                    else interval
-                )
+                if errors:
+                    delay = min(interval * 2**errors, TICK_BACKOFF_CAP_SECONDS)
+                elif self.is_active:
+                    delay = interval
+                else:
+                    # Неактивная реплика не открывает соединение каждые 2 секунды.
+                    delay = self.settings.generation_standby_interval_seconds
+                await asyncio.sleep(delay)
         finally:
             logger.info("generation_worker_stopped")
 
     # --- один активный воркер -----------------------------------------------
+
+    @property
+    def is_active(self) -> bool:
+        return self._lock_connection is not None
 
     # Блокировка держится на отдельном соединении в AUTOCOMMIT; она снимается при
     # закрытии или обрыве соединения. Потеря соединения замечается на следующем тике:
@@ -206,6 +213,7 @@ class GenerationWorker:
             connection = await connection.execution_options(
                 isolation_level="AUTOCOMMIT"
             )
+            await self.enable_keepalive(connection)
             acquired = await connection.scalar(
                 text("SELECT pg_try_advisory_lock(:id)"), {"id": ADVISORY_LOCK_ID}
             )
@@ -219,6 +227,38 @@ class GenerationWorker:
         self.metrics.leader.set(1)
         logger.info("generation_worker_active")
         return True
+
+    # Соединение блокировки простаивает, пока идёт вызов Ollama: keepalive на стороне
+    # сервера быстрее замечает молчаливый обрыв и снимает блокировку.
+    async def enable_keepalive(self, connection: AsyncConnection) -> None:
+        idle = self.settings.generation_lock_keepalive_seconds
+        for name, value in (
+            ("tcp_keepalives_idle", idle),
+            ("tcp_keepalives_interval", max(idle // 3, 1)),
+            ("tcp_keepalives_count", 3),
+        ):
+            await connection.execute(
+                text("SELECT set_config(:name, :value, false)"),
+                {"name": name, "value": str(value)},
+            )
+
+    # Блокировка ещё принадлежит этому соединению (pg_locks по собственному pid).
+    async def holds_lock(self) -> bool:
+        connection = self._lock_connection
+        if connection is None:
+            return False
+        try:
+            held = await connection.scalar(
+                text(
+                    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' "
+                    "AND granted AND pid = pg_backend_pid() "
+                    "AND (classid::bigint << 32) | objid::bigint = :id"
+                ),
+                {"id": ADVISORY_LOCK_ID},
+            )
+        except Exception:
+            return False
+        return bool(held)
 
     async def release_leadership(self) -> None:
         connection, self._lock_connection = self._lock_connection, None
@@ -319,6 +359,7 @@ class GenerationWorker:
         log = logger.bind(task_id=str(task_id))
         try:
             menu = await self.generate(prompt, log)
+            await self.verify_leadership(log)
             done = await self.finish(task_id, menu)
         except GenerationFailure as failure:
             self.note_ollama_failure(failure.reason)
@@ -343,6 +384,14 @@ class GenerationWorker:
             self.metrics.outcomes.labels("discarded", "done").inc()
             log.warning("generation_result_discarded")
 
+    # Во время долгого вызова соединение блокировки простаивало: если блокировка
+    # потеряна, воркер перестаёт считать себя активным (готовый результат всё равно
+    # сохраняется: задача уже его, а другая реплика берёт только другие задачи).
+    async def verify_leadership(self, log: structlog.stdlib.BoundLogger) -> None:
+        if self._lock_connection is not None and not await self.holds_lock():
+            log.warning("generation_lock_lost_during_call")
+            await self.release_leadership()
+
     async def record_interruption(
         self, task_id: uuid.UUID, log: structlog.stdlib.BoundLogger
     ) -> None:
@@ -351,7 +400,12 @@ class GenerationWorker:
                 asyncio.shield(self.fail(task_id, FailureReason.INTERRUPTED, log)),
                 INTERRUPT_WRITE_TIMEOUT_SECONDS,
             )
-        except (TimeoutError, asyncio.CancelledError, Exception):
+        except asyncio.CancelledError:
+            # Повторная отмена: запись продолжает выполняться под shield, а отмена
+            # не проглатывается.
+            log.warning("generation_interruption_not_recorded")
+            raise
+        except (TimeoutError, Exception):
             # Не удалось вовремя: задачу завершит expire_stale.
             log.warning("generation_interruption_not_recorded")
 

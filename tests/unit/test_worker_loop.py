@@ -147,6 +147,7 @@ async def test_tick_errors_back_off_exponentially_and_log_sparsely(monkeypatch) 
     import receipes.worker as module
 
     worker, _ = make_worker(interval=2)
+    worker._lock_connection = object()
     delays: list[float] = []
     enough = asyncio.Event()
     outcomes = iter([RuntimeError] * 8 + [False])
@@ -175,3 +176,32 @@ async def test_tick_errors_back_off_exponentially_and_log_sparsely(monkeypatch) 
     assert [e["consecutive"] for e in failures] == [1, 2, 4, 8]
     recovered = [e for e in logs if e["event"] == "generation_worker_recovered"]
     assert [e["after_errors"] for e in recovered] == [8]
+
+
+@pytest.mark.parametrize(("active", "expected"), [(True, 0.02), (False, 0.5)])
+async def test_standby_replicas_wait_longer_than_the_active_one(
+    monkeypatch, active, expected
+) -> None:
+    import receipes.worker as module
+
+    worker, _ = make_worker(interval=0.02, generation_standby_interval_seconds=0.5)
+    if active:
+        worker._lock_connection = object()
+    delays: list[float] = []
+    enough = asyncio.Event()
+
+    async def tick() -> bool:
+        return False
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        enough.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(worker, "tick", tick)
+    monkeypatch.setattr(module.asyncio, "sleep", fake_sleep)
+    worker.start()
+    await enough.wait()
+    await worker.stop()
+    assert delays == [expected]
+    assert worker.is_active is False

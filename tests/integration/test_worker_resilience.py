@@ -397,3 +397,90 @@ async def test_a_failing_worker_stop_does_not_leave_the_engine_open(
         async with app.router.lifespan_context(app):
             pass
     assert disposed == [True]
+
+
+async def test_the_lock_connection_has_tcp_keepalive_enabled(ready) -> None:
+    settings, factory = ready
+    worker = worker_for(
+        settings, factory, FakeOllama(), generation_lock_keepalive_seconds=45
+    )
+    await worker.tick()
+    connection = worker._lock_connection
+    assert connection is not None
+    values = {
+        name: await connection.scalar(text(f"SHOW {name}"))
+        for name in (
+            "tcp_keepalives_idle",
+            "tcp_keepalives_interval",
+            "tcp_keepalives_count",
+        )
+    }
+    assert values == {
+        "tcp_keepalives_idle": "45",
+        "tcp_keepalives_interval": "15",
+        "tcp_keepalives_count": "3",
+    }
+    assert await worker.holds_lock() is True
+    await worker.stop()
+    assert await worker.holds_lock() is False
+
+
+async def test_a_lock_lost_during_the_call_is_noticed_before_the_result_is_saved(
+    ready,
+) -> None:
+    settings, factory = ready
+    task_id = await new_task(factory)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        # Молчаливый обрыв соединения блокировки, пока идёт вызов Ollama.
+        async with factory() as session:
+            await session.scalar(
+                text(
+                    "SELECT count(*) FROM (SELECT pg_terminate_backend(pid) FROM "
+                    "pg_locks WHERE locktype = 'advisory' AND granted) AS t"
+                )
+            )
+            await session.commit()
+        return valid()
+
+    worker = worker_for(settings, factory, handler)
+    with capture_logs() as logs:
+        assert await worker.tick() is True
+    assert "generation_lock_lost_during_call" in [e["event"] for e in logs]
+    assert worker.is_active is False
+    assert worker.metrics.leader._value.get() == 0
+    # Готовый результат не пропадает: задача завершена, меню сохранено.
+    assert (await state(factory, task_id))["status"] == "done"
+    # Следующий тик заново берёт блокировку.
+    assert await worker.tick() is False
+    assert worker.is_active is True
+    await worker.stop()
+
+
+async def test_a_repeated_cancellation_during_the_interruption_write_propagates(
+    ready,
+) -> None:
+    settings, factory = ready
+    task_id = await new_task(factory)
+    entered = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        await asyncio.Event().wait()
+        return valid()
+
+    worker = worker_for(settings, factory, handler)
+    runner = asyncio.create_task(worker.tick())
+    await entered.wait()
+    runner.cancel()
+    await asyncio.sleep(0)  # воркер начал запись «Generation interrupted»
+    runner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runner
+    # Запись идёт под shield и завершается, несмотря на вторую отмену.
+    for _ in range(100):
+        if (await state(factory, task_id))["status"] == "failed":
+            break
+        await asyncio.sleep(0.02)
+    assert (await state(factory, task_id))["error"] == "Generation interrupted"
+    await worker.stop()
