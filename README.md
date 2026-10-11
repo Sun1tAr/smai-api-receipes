@@ -252,13 +252,52 @@ docker compose -p receipes-tests -f docker-compose.test.yml down
 игнорируется (не хранится, поэтому его содержимое не проверяется). Поля — camelCase
 как в контракте API.
 
+## Шаблон промпта
+
+Шаблон хранится в `prompt_template` (актуален последний по `created_at`). Первый
+шаблон кладёт seed-ревизия `0003_seed_prompt_template` (фиксированный `id`, откат
+удаляет только эту строку). Текст — на русском: роль диетолога/повара, задача,
+параметры, требования (3–21 рецепт, без ссылок на фото, без повторов ингредиентов
+в рецепте) и формат ответа — строго один JSON в camelCase по схеме. Плейсхолдеры:
+`{people_count}` и `{weekly_budget}`. Новую версию шаблона добавляют новой ревизией
+с новой строкой (старую не правят).
+
+Подстановка — `receipes.prompt.build_prompt(template, parameters)`: явная замена двух
+плейсхолдеров, а не `str.format`, поэтому фигурные скобки JSON в тексте шаблона
+безопасны. Число людей — целое, бюджет — всегда с двумя знаками без научной
+нотации (`1000` → `1000.00`). Шаблон без одного из плейсхолдеров или с неизвестным
+(`{слово}` из строчных латинских букв и `_`) даёт `InvalidPromptTemplate`
+(`DomainError`): `claim_next` переведёт такую задачу в `failed`. Экранирования
+скобок в стиле `str.format` нет. `PromptTemplateRepository.builder()` возвращает
+готовый `build_prompt` для `claim_next(build_prompt)` на основе актуального шаблона
+(`PromptTemplateNotFound`, если шаблонов нет); результат сохраняется в
+`generation_task.prompt`.
+
+Для запроса к Ollama `generated_menu.ollama_format_schema()` даёт JSON-схему
+параметра `format` (структурированный вывод; `photo` не запрашивается, границы
+совпадают с «воротами»).
+
+**Ручной smoke против реальной Ollama** (в CI не запускается, нужна работающая
+Ollama с моделью `qwen2.5:7b-instruct-q4_K_M`):
+
+```sh
+OLLAMA_BASE_URL=http://localhost:11434 uv run python -m scripts.ollama_smoke \
+  --people 2 --budget 5000
+```
+
+Скрипт собирает промпт из шаблона seed-ревизии, отправляет `POST /api/generate` с
+`format` и опциями по умолчанию (`temperature`, `num_ctx`, `num_predict`) и
+проверяет ответ «воротами» `GeneratedMenu`. Код возврата: 0 — меню принято, 1 —
+ошибка запроса или ответ не прошёл «ворота», 2 — неверные параметры.
+
 ## Структура репозитория
 
 ```text
 src/receipes/       приложение: config, database, main (create_app), health,
                     errors, observability, migration_diagnostics, __main__ (запуск uvicorn);
-                    домен MS-4: models, domain, generated_menu, repositories
-migrations/         Alembic (async env.py), ревизии в versions/ (0001, 0002)
+                    домен MS-4: models, domain, generated_menu, prompt, repositories
+migrations/         Alembic (async env.py), ревизии в versions/ (0001–0003)
+scripts/            ручные инструменты (ollama_smoke.py)
 docker/             entrypoint.sh: alembic upgrade head, затем запуск сервера
 tests/unit/         unit-тесты (без БД)
 tests/integration/  интеграционные тесты (нужна PostgreSQL, TEST_DB_HOST)
