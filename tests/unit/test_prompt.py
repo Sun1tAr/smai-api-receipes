@@ -66,15 +66,39 @@ def test_missing_placeholder_is_a_domain_error(template: str) -> None:
     assert "missing" in error.value.reason
 
 
-@pytest.mark.parametrize("extra", ["{budget}", "{people}", "{x_y}"])
+@pytest.mark.parametrize(
+    "extra", ["{budget}", "{people}", "{x_y}", "{People}", "{x1}", "{_hidden}"]
+)
 def test_unknown_placeholder_is_a_domain_error(extra: str) -> None:
     with pytest.raises(InvalidPromptTemplate) as error:
         build_prompt(f"{{people_count}} {{weekly_budget}} {extra}", parameters())
     assert extra in error.value.reason
 
 
-def test_prompt_builder_binds_the_template() -> None:
+@pytest.mark.parametrize(
+    "template",
+    [
+        "{{people_count}} {weekly_budget}",
+        "{people_count} {{ weekly_budget }}",
+        "{people_count} {weekly_budget} {{x}}",
+    ],
+)
+def test_doubled_braces_are_rejected_not_silently_substituted(template) -> None:
+    with pytest.raises(InvalidPromptTemplate) as error:
+        build_prompt(template, parameters())
+    assert "escaped" in error.value.reason or "missing" in error.value.reason
+
+
+def test_json_with_digits_and_quotes_is_not_a_placeholder() -> None:
+    template = '{people_count} {weekly_budget} {"a1": {"b": [1, 2]}, "c": {}}'
+    assert build_prompt(template, parameters()).endswith(
+        '{"a1": {"b": [1, 2]}, "c": {}}'
+    )
+
+
+def test_prompt_builder_validates_the_template_once_and_binds_it() -> None:
     build = prompt_builder(TEMPLATE)
     assert build(parameters(5, "10")).startswith("Меню на 5 чел., бюджет 10.00")
+    # Дефект шаблона виден сразу при получении builder, а не при каждой задаче.
     with pytest.raises(InvalidPromptTemplate):
-        prompt_builder("{people_count}")(parameters())
+        prompt_builder("{people_count}")

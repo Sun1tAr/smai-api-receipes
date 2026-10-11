@@ -229,3 +229,21 @@ async def test_seed_downgrade_keeps_other_templates(
     finally:
         await connection.execute("DELETE FROM prompt_template WHERE template='custom'")
         alembic(alembic_env, "upgrade", "head")
+
+
+async def test_seed_upgrade_tolerates_an_existing_row_with_the_same_id(
+    connection, alembic_env, migrated_database
+) -> None:
+    try:
+        alembic(alembic_env, "downgrade", "0002_erd_deviations")
+        await connection.execute(
+            "INSERT INTO prompt_template (id, template) VALUES ($1, 'manual')",
+            uuid.UUID(SEED_ID),
+        )
+        alembic(alembic_env, "upgrade", "head")
+        assert await connection.fetchval("SELECT count(*) FROM prompt_template") == 1
+        template = await connection.fetchval("SELECT template FROM prompt_template")
+        assert template == "manual"
+    finally:
+        await connection.execute("DELETE FROM prompt_template")
+        alembic(alembic_env, "upgrade", "head")

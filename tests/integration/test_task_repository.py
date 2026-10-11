@@ -9,9 +9,10 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from receipes.domain import (
-    DomainError,
     GenerationParameters,
     GenerationTaskNotFound,
+    InvalidGenerationParameters,
+    InvalidPromptTemplate,
     InvalidTaskTransition,
     PromptTemplateNotFound,
     TaskStatus,
@@ -409,7 +410,7 @@ async def test_poison_task_fails_and_the_next_one_is_claimed(session) -> None:
     def prompt(parameters: GenerationParameters) -> str:
         calls.append(parameters.people_count)
         if len(calls) == 1:
-            raise DomainError("cannot build the prompt")
+            raise InvalidGenerationParameters("people_count", "cannot build")
         return "prompt"
 
     claimed = await repository.claim_next(prompt)
@@ -433,7 +434,7 @@ async def test_only_poison_tasks_leave_the_queue_empty(session, monkeypatch) -> 
         await make_task(session, timedelta(minutes=age))
 
     def broken(parameters: GenerationParameters) -> str:
-        raise DomainError("no")
+        raise InvalidGenerationParameters("people_count", "no")
 
     # Цикл ограничен: три итерации пропускают три задачи, две остаются в очереди.
     assert await repository.claim_next(broken) is None
@@ -492,18 +493,29 @@ async def test_claim_saves_the_built_prompt_in_the_task(session) -> None:
     assert stored == expected
 
 
-async def test_broken_template_fails_the_task_instead_of_blocking_the_queue(
+async def test_broken_template_is_rejected_and_leaves_the_tasks_pending(
     session,
 ) -> None:
     await seed_template(session, "нет плейсхолдера бюджета {people_count}")
+    for age in range(25, 0, -1):
+        await make_task(session, timedelta(minutes=age))
+    with pytest.raises(InvalidPromptTemplate):
+        await PromptTemplateRepository(session).builder()
+    # Задачи не тронуты: дефект шаблона не должен переводить их в failed.
+    assert await TaskRepository(session).count_pending() == 25
+
+
+async def test_prompt_template_error_inside_claim_next_is_not_swallowed(
+    session,
+) -> None:
     task = await make_task(session)
-    builder = await PromptTemplateRepository(session).builder()
-    assert await TaskRepository(session).claim_next(builder) is None
-    failed = await TaskRepository(session).get(task.task_id)
-    assert (failed.status, failed.error) == (
-        TaskStatus.FAILED,
-        INVALID_PARAMETERS_ERROR,
-    )
+
+    def broken(parameters: GenerationParameters) -> str:
+        raise InvalidPromptTemplate("placeholder is missing")
+
+    with pytest.raises(InvalidPromptTemplate):
+        await TaskRepository(session).claim_next(broken)
+    assert (await TaskRepository(session).get(task.task_id)).status == "pending"
 
 
 async def test_builder_requires_a_stored_template(session) -> None:

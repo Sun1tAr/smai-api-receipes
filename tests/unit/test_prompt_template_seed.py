@@ -37,6 +37,13 @@ def test_seed_revision_follows_the_erd_deviations() -> None:
     assert module.down_revision == "0002_erd_deviations"
 
 
+def test_seed_insert_is_idempotent() -> None:
+    path = MIGRATION / "0003_seed_prompt_template.py"
+    if not path.exists():
+        pytest.skip("migrations are not part of the test image")
+    assert "ON CONFLICT (id) DO NOTHING" in path.read_text()
+
+
 def test_seeded_template_has_each_placeholder_and_builds() -> None:
     template = seeded_template()
     for placeholder in PLACEHOLDERS:

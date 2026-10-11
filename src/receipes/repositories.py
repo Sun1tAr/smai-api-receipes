@@ -9,9 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
 
 from receipes.domain import (
-    DomainError,
     GenerationParameters,
     GenerationTaskNotFound,
+    InvalidGenerationParameters,
     InvalidTaskTransition,
     MenuNotFound,
     PromptTemplateNotFound,
@@ -75,9 +75,11 @@ class TaskRepository:
     # Единственный путь в in_progress. Старейшая pending-задача переходит в
     # in_progress; залоченные другой транзакцией пропускаются. Промпт собирается из
     # параметров здесь же: CHECK требует его у любой задачи in_progress. Задача с
-    # невалидными параметрами или промптом, который не собрать, не должна блокировать
-    # очередь: она переводится в failed, и берётся следующая. Вызывающий коммитит
-    # транзакцию сразу после claim_next, чтобы не держать блокировку строки.
+    # невалидными параметрами не должна блокировать очередь: она переводится в failed,
+    # и берётся следующая. Ошибка шаблона (InvalidPromptTemplate) — дефект шаблона, а не
+    # задачи: она пробрасывается, задачи остаются pending (шаблон проверяет builder()).
+    # Вызывающий коммитит транзакцию сразу после claim_next, чтобы не держать
+    # блокировку строки.
     async def claim_next(
         self, build_prompt: Callable[[GenerationParameters], str]
     ) -> GenerationTask | None:
@@ -100,10 +102,11 @@ class TaskRepository:
                 return None
             task, record = row
             try:
-                prompt = build_prompt(
-                    GenerationParameters(record.people_count, record.weekly_budget)
+                parameters = GenerationParameters(
+                    record.people_count, record.weekly_budget
                 )
-            except DomainError as error:
+                prompt = build_prompt(parameters)
+            except InvalidGenerationParameters as error:
                 logger.error(
                     "invalid_task_parameters",
                     task_id=str(task.task_id),

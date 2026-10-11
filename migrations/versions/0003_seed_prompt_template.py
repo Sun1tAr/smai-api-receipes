@@ -55,7 +55,10 @@ TEMPLATE = """\
 # Применяем изменения этой ревизии схемы.
 def upgrade() -> None:
     op.get_bind().execute(
-        sa.text("INSERT INTO prompt_template (id, template) VALUES (:id, :template)"),
+        sa.text(
+            "INSERT INTO prompt_template (id, template) VALUES (:id, :template) "
+            "ON CONFLICT (id) DO NOTHING"
+        ),
         {"id": TEMPLATE_ID, "template": TEMPLATE},
     )
 
