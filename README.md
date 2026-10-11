@@ -191,7 +191,7 @@ docker compose -p receipes-tests -f docker-compose.test.yml up --build \
   --abort-on-container-exit --exit-code-from tests
 ```
 
-Прогон в Compose (`CI`, job `integration`) — основной: 582 теста, 0 пропусков,
+Прогон в Compose (`CI`, job `integration`) — основной: 586 тестов, 0 пропусков,
 покрытие 99,8 % (ветки включены, в отчёт входят `src/receipes` и `scripts`;
 `concurrency = greenlet` в конфигурации coverage обязательна, иначе код
 SQLAlchemy-async недосчитывается), порог `--cov-fail-under=98`; зависший тест
