@@ -19,6 +19,8 @@ def settings() -> Settings:
         db_user=os.environ["TEST_DB_USER"],
         db_password=os.environ["TEST_DB_PASSWORD"],
         ollama_base_url="http://ollama.test:11434",
+        # Воркер включается только в тестах, которым он нужен.
+        generation_worker_enabled=False,
     )
 
 

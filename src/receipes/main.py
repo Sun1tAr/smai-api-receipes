@@ -27,6 +27,8 @@ from receipes.database import create_engine
 from receipes.errors import error_response, register_error_handlers
 from receipes.health import dependencies_ready, router
 from receipes.observability import configure_logging, create_tracer_provider
+from receipes.ollama import OllamaClient
+from receipes.worker import GenerationWorker, WorkerMetrics
 
 logger = structlog.get_logger()
 
@@ -127,12 +129,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         instrumentor = SQLAlchemyInstrumentor()
         instrumentor.instrument(engine=engine.sync_engine, tracer_provider=provider)
+        worker: GenerationWorker | None = None
         try:
             if not await dependencies_ready(engine, settings):
                 raise RuntimeError("Service dependencies are unavailable")
-            logger.info("service_started")
+            if settings.generation_worker_enabled:
+                worker = GenerationWorker(
+                    settings=settings,
+                    session_factory=app.state.session_factory,
+                    client=OllamaClient(settings),
+                    metrics=app.state.worker_metrics,
+                )
+                worker.start()
+            logger.info("service_started", worker_enabled=worker is not None)
             yield
         finally:
+            # Воркер останавливается раньше пула соединений, на котором он работает.
+            if worker is not None:
+                await worker.stop()
             await engine.dispose()
             instrumentor.uninstrument()
             provider.shutdown()
@@ -150,6 +164,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
     app.state.tracer_provider = provider
     app.state.metrics_registry = metrics_registry
+    app.state.worker_metrics = WorkerMetrics(metrics_registry)
     app.state.tasks_created = Counter(
         "generation_tasks_created",
         "Menu generation tasks accepted by API-1.",
