@@ -150,3 +150,64 @@ async def test_gate_rejection_does_not_log_the_model_output(capsys) -> None:
 def test_every_reason_has_a_short_safe_message() -> None:
     assert set(SAFE_MESSAGES) == set(FailureReason)
     assert all(0 < len(message) < 80 for message in SAFE_MESSAGES.values())
+
+
+async def test_probe_reports_availability_without_a_model_call() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"models": []})
+
+    client = client_for(handler)
+    assert await client.probe() is True
+    await client.close()
+    assert seen == ["/api/tags"]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [httpx.ConnectError("x"), httpx.ReadTimeout("y"), httpx.Response(503)],
+)
+async def test_probe_is_false_when_ollama_is_down(outcome) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    client = client_for(handler)
+    assert await client.probe() is False
+    await client.close()
+
+
+async def test_probe_is_bounded_by_the_connect_timeout() -> None:
+    never = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await never.wait()
+        return httpx.Response(200)
+
+    client = client_for(handler, ollama_connect_timeout_seconds=0.05)
+    assert await client.probe() is False
+    await client.close()
+
+
+@pytest.mark.parametrize("depth", [2000, 100_000])
+async def test_deeply_nested_model_output_is_an_invalid_response(depth) -> None:
+    nested = "[" * depth + "]" * depth
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"response": nested})
+
+    failure = await failure_of(client_for(handler))
+    assert failure.reason is FailureReason.INVALID_RESPONSE and failure.retryable
+
+
+async def test_deeply_nested_envelope_is_an_invalid_response() -> None:
+    envelope = "[" * 100_000 + "]" * 100_000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=envelope.encode())
+
+    failure = await failure_of(client_for(handler))
+    assert failure.reason is FailureReason.INVALID_RESPONSE

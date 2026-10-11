@@ -22,6 +22,8 @@ class FailureReason(StrEnum):
     TRUNCATED = "truncated"
     INVALID_RESPONSE = "invalid_response"
     INTERNAL = "internal"
+    # Воркер остановлен во время вызова (деплой, перезапуск).
+    INTERRUPTED = "interrupted"
 
 
 # Короткие безопасные тексты: попадают в generation_task.error и в ответ API-2, поэтому
@@ -33,6 +35,7 @@ SAFE_MESSAGES = {
     FailureReason.TRUNCATED: "Model response was cut off (token limit reached)",
     FailureReason.INVALID_RESPONSE: "Model returned an invalid menu",
     FailureReason.INTERNAL: "Menu generation failed",
+    FailureReason.INTERRUPTED: "Generation interrupted",
 }
 
 
@@ -103,6 +106,16 @@ class OllamaClient:
     async def close(self) -> None:
         await self.http.aclose()
 
+    # Лёгкая проба доступности (GET /api/tags) для circuit breaker: без модели и без
+    # промпта. Любой сбой — просто «недоступна».
+    async def probe(self) -> bool:
+        try:
+            async with asyncio.timeout(self.settings.ollama_connect_timeout_seconds):
+                response = await self.http.get("/api/tags")
+        except (TimeoutError, httpx.HTTPError):
+            return False
+        return response.status_code < 400
+
     async def generate_menu(self, prompt: str) -> GeneratedMenu:
         request = build_request(
             prompt,
@@ -123,6 +136,7 @@ class OllamaClient:
             KeyError,
             TypeError,
             AttributeError,
+            RecursionError,  # json.loads на глубоко вложенном ответе
         ) as error:
             # Только тип ошибки: в сообщениях Pydantic есть фрагменты ответа модели.
             logger.warning("ollama_invalid_response", error_type=type(error).__name__)
@@ -147,7 +161,7 @@ class OllamaClient:
             raise GenerationFailure(FailureReason.HTTP_ERROR)
         try:
             body = response.json()
-        except ValueError:
+        except (ValueError, RecursionError):
             raise GenerationFailure(FailureReason.INVALID_RESPONSE) from None
         if not isinstance(body, dict):
             raise GenerationFailure(FailureReason.INVALID_RESPONSE)

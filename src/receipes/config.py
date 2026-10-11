@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import AnyHttpUrl, Field, SecretStr, field_validator
+from pydantic import AnyHttpUrl, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import URL
 
@@ -44,6 +44,18 @@ class Settings(BaseSettings):
     # Не задан — очередь без лимита.
     generation_max_pending: int | None = Field(default=None, ge=1)
     generation_bad_response_retries: int = Field(default=1, ge=0, le=10)
+    # Circuit breaker воркера: пауза после сбоя Ollama растёт от min до max.
+    generation_breaker_min_pause_seconds: float = Field(default=5, gt=0, le=3600)
+    generation_breaker_max_pause_seconds: float = Field(default=60, gt=0, le=3600)
+
+    @model_validator(mode="after")
+    def breaker_pauses_are_ordered(self) -> "Settings":
+        if (
+            self.generation_breaker_max_pause_seconds
+            < self.generation_breaker_min_pause_seconds
+        ):
+            raise ValueError("breaker max pause must not be below the min pause")
+        return self
 
     # LOG_LEVEL=info допустим: регистр в окружении легко перепутать.
     @field_validator("log_level", mode="before")

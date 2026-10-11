@@ -30,5 +30,7 @@ def clean_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "GENERATION_PENDING_TTL_SECONDS",
         "GENERATION_MAX_PENDING",
         "GENERATION_BAD_RESPONSE_RETRIES",
+        "GENERATION_BREAKER_MIN_PAUSE_SECONDS",
+        "GENERATION_BREAKER_MAX_PAUSE_SECONDS",
     ):
         monkeypatch.delenv(key, raising=False)

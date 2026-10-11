@@ -60,6 +60,8 @@ def test_defaults() -> None:
     assert settings.generation_pending_ttl_seconds == 900
     assert settings.generation_max_pending is None
     assert settings.generation_bad_response_retries == 1
+    assert settings.generation_breaker_min_pause_seconds == 5
+    assert settings.generation_breaker_max_pause_seconds == 60
 
 
 def test_environment_overrides_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -176,6 +178,12 @@ def test_log_level_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
         {"generation_max_pending": 0},
         {"generation_bad_response_retries": -1},
         {"generation_bad_response_retries": 11},
+        {"generation_breaker_min_pause_seconds": 0},
+        {"generation_breaker_max_pause_seconds": 3601},
+        {
+            "generation_breaker_min_pause_seconds": 30,
+            "generation_breaker_max_pause_seconds": 10,
+        },
     ],
 )
 def test_out_of_range_values_are_rejected(override: dict[str, object]) -> None:
