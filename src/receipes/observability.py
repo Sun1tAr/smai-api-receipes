@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import traceback
+from collections.abc import MutableMapping
 from typing import Any
 
 import structlog
@@ -10,6 +11,7 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from structlog.typing import Processor
 
 from receipes.config import Settings
 
@@ -25,8 +27,8 @@ MAX_CAUSES = 5
 def add_context(
     logger: Any,
     method_name: str,
-    event: dict[str, Any],
-) -> dict[str, Any]:
+    event: MutableMapping[str, Any],
+) -> MutableMapping[str, Any]:
     context = trace.get_current_span().get_span_context()
     event["service"] = SERVICE_NAME
     event["trace_id"] = f"{context.trace_id:032x}" if context.is_valid else None
@@ -39,8 +41,8 @@ def add_context(
 def exception_summary(
     logger: Any,
     method_name: str,
-    event: dict[str, Any],
-) -> dict[str, Any]:
+    event: MutableMapping[str, Any],
+) -> MutableMapping[str, Any]:
     exc_info = event.pop("exc_info", None)
     if exc_info is True:
         exc_info = sys.exc_info()
@@ -80,7 +82,7 @@ def exception_summary(
 
 # Одинаковый формат применяется к structlog и стандартным логгерам библиотек.
 def configure_logging(level: str) -> None:
-    shared = [
+    shared: list[Processor] = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True),

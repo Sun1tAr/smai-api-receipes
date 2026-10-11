@@ -5,7 +5,6 @@ from datetime import timedelta
 from decimal import Decimal
 
 import pytest
-from seed import make_task, menu_data, parameters, start
 from sqlalchemy import text
 
 from receipes.domain import (
@@ -15,7 +14,7 @@ from receipes.domain import (
     InvalidTaskTransition,
     TaskStatus,
 )
-from receipes.models import PromptTemplate
+from receipes.models import GenerationTask, PromptTemplate
 from receipes.repositories import (
     INTERRUPTED_ERROR,
     INVALID_PARAMETERS_ERROR,
@@ -24,11 +23,24 @@ from receipes.repositories import (
     PromptTemplateRepository,
     TaskRepository,
 )
+from tests.integration.seed import make_task, menu_data, parameters, start
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(not os.getenv("TEST_DB_HOST"), reason="TEST_DB_HOST is not set"),
 ]
+
+
+async def claim(repository: TaskRepository) -> GenerationTask:
+    claimed = await repository.claim_next(prompt_for)
+    assert claimed is not None
+    return claimed
+
+
+async def latest_template(repository: PromptTemplateRepository) -> str:
+    template = await repository.latest()
+    assert template is not None
+    return template.template
 
 
 def prompt_for(parameters: GenerationParameters) -> str:
@@ -61,12 +73,12 @@ async def test_claim_next_takes_the_oldest_pending_task_once(session) -> None:
     newer = await make_task(session, timedelta(minutes=1))
     oldest = await make_task(session, timedelta(minutes=5))
     repository = TaskRepository(session)
-    claimed = await repository.claim_next(prompt_for)
+    claimed = await claim(repository)
     assert claimed.task_id == oldest.task_id
     assert claimed.status == TaskStatus.IN_PROGRESS
     assert claimed.prompt == "2 people, 1500.50"
     assert claimed.started_at is not None
-    again = await repository.claim_next(prompt_for)
+    again = await claim(repository)
     assert again.task_id == newer.task_id
     assert await repository.claim_next(prompt_for) is None
 
@@ -94,7 +106,7 @@ async def test_concurrent_claims_skip_a_locked_task(session_factory) -> None:
 
     async def first_worker() -> None:
         async with session_factory() as session:
-            claimed = await TaskRepository(session).claim_next(prompt_for)
+            claimed = await claim(TaskRepository(session))
             results["first"] = claimed.task_id
             first_claimed.set()
             await release.wait()  # транзакция остаётся открытой
@@ -272,6 +284,7 @@ async def test_pending_queue_metrics(session) -> None:
     )
     assert await repository.count_pending() == 2
     age = await repository.oldest_pending_age()
+    assert age is not None
     assert timedelta(minutes=10) <= age < timedelta(minutes=11)
 
 
@@ -293,11 +306,11 @@ async def test_latest_prompt_template(session) -> None:
         )
     session.add(PromptTemplate(id=uuid.uuid4(), template="newest"))
     await session.flush()
-    assert (await repository.latest()).template == "newest"
+    assert await latest_template(repository) == "newest"
     await session.execute(text("DELETE FROM prompt_template WHERE template = 'newest'"))
-    assert (await repository.latest()).template == "old"
+    assert await latest_template(repository) == "old"
     await session.execute(text("DELETE FROM prompt_template WHERE template = 'old'"))
-    assert (await repository.latest()).template == "tie-high"
+    assert await latest_template(repository) == "tie-high"
 
 
 async def test_complete_saves_the_menu_and_finishes_the_task(session) -> None:
@@ -398,6 +411,7 @@ async def test_poison_task_fails_and_the_next_one_is_claimed(session) -> None:
         return "prompt"
 
     claimed = await repository.claim_next(prompt)
+    assert claimed is not None
     assert claimed.task_id == healthy.task_id
     failed = await repository.get(poison.task_id)
     assert (failed.status, failed.error) == (
@@ -431,7 +445,8 @@ async def test_started_and_finished_use_the_real_clock_inside_a_transaction(
     task = await make_task(session)
     # now() заморожен в начале транзакции, clock_timestamp() — нет.
     await session.execute(text("SELECT pg_sleep(0.05)"))
-    claimed = await repository.claim_next(prompt_for)
+    claimed = await claim(repository)
+    assert claimed.started_at is not None
     assert claimed.started_at > claimed.created_at
     await session.execute(text("SELECT pg_sleep(0.05)"))
     menu_id = await MenuRepository(session).save(menu_data())
@@ -439,6 +454,7 @@ async def test_started_and_finished_use_the_real_clock_inside_a_transaction(
         task.task_id, TaskStatus.IN_PROGRESS, TaskStatus.DONE, menu_id=menu_id
     )
     done = await repository.get(task.task_id)
+    assert done.finished_at and done.started_at
     assert done.finished_at > done.started_at
 
 
@@ -449,4 +465,4 @@ async def test_templates_created_in_one_transaction_are_ordered_by_time(
     for template in ("first", "second", "third"):
         session.add(PromptTemplate(id=uuid.uuid4(), template=template))
         await session.flush()
-    assert (await PromptTemplateRepository(session).latest()).template == "third"
+    assert await latest_template(PromptTemplateRepository(session)) == "third"

@@ -266,15 +266,12 @@ class MenuRepository:
             )
             .on_conflict_do_nothing(index_elements=[Ingredient.name_key])
         )
-        ingredient_ids = dict(
-            (
-                await self.session.execute(
-                    select(Ingredient.name_key, Ingredient.id).where(
-                        Ingredient.name_key.in_(list(display_names))
-                    )
-                )
-            ).all()
+        found = await self.session.execute(
+            select(Ingredient.name_key, Ingredient.id).where(
+                Ingredient.name_key.in_(list(display_names))
+            )
         )
+        ingredient_ids: dict[str, uuid.UUID] = {row[0]: row[1] for row in found}
 
         menu_id = uuid.uuid4()
         nutrition_rows, recipe_rows, link_rows = [], [], []

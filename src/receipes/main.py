@@ -84,6 +84,12 @@ def is_client_disconnect(error: Exception) -> bool:
     return isinstance(error, RuntimeError) and str(error) == "No response returned."
 
 
+# Своя схема OpenAPI без ложных 422 фреймворка.
+class ReceipesApp(FastAPI):
+    def openapi(self) -> dict[str, Any]:
+        return build_openapi(self)
+
+
 def resolve_request_id(incoming: str | None) -> str:
     if incoming is not None and REQUEST_ID_PATTERN.fullmatch(incoming):
         return incoming
@@ -119,7 +125,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             provider.shutdown()
             logger.info("service_stopped")
 
-    app = FastAPI(
+    app = ReceipesApp(
         title="SmartMeal recipes service",
         version="0.1.0",
         description=API_DESCRIPTION,
@@ -132,7 +138,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.tracer_provider = provider
     app.state.metrics_registry = metrics_registry
     app.include_router(router)
-    app.openapi = lambda: build_openapi(app)
 
     # Request ID относится к текущему HTTP-вызову; query и тела не логируются.
     @app.middleware("http")

@@ -106,6 +106,7 @@ Python 3.12, зависимости фиксируются в `uv.lock`:
 uv sync --locked
 uv run ruff check .
 uv run ruff format --check .
+uv run mypy
 uv run pytest tests/unit
 ```
 

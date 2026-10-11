@@ -1,10 +1,11 @@
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
 
-def required_settings(**extra: object) -> dict[str, object]:
+def required_settings(**extra: Any) -> dict[str, Any]:
     return {
         "db_host": "postgres",
         "db_name": "receipes",
@@ -15,7 +16,7 @@ def required_settings(**extra: object) -> dict[str, object]:
     }
 
 
-def make(**extra: object):
+def make(**extra: Any):
     from receipes.config import Settings
 
     return Settings(_env_file=None, **required_settings(**extra))

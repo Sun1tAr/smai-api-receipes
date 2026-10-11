@@ -1,9 +1,11 @@
+from typing import Any
+
 from receipes.config import Settings
 
 
 # Порт 1 заведомо закрыт: БД «недоступна» без обращения к сети.
 def unavailable_db_settings(**extra: object) -> Settings:
-    values: dict[str, object] = {
+    values: dict[str, Any] = {
         "db_host": "127.0.0.1",
         "db_port": 1,
         "db_user": "receipes",

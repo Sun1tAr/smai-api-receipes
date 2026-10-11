@@ -59,6 +59,7 @@ async def violation(factory, sql: str, sqlstate: str, constraint: str | None) ->
         with pytest.raises(DBAPIError) as error:
             await session.execute(text(sql), IDS)
         driver_error = find_postgres_error(error.value)
+        assert driver_error is not None
         assert driver_error.sqlstate == sqlstate
         if constraint is not None:
             assert driver_error.constraint_name == constraint

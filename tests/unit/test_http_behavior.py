@@ -3,11 +3,12 @@ import sys
 
 import httpx
 import pytest
-from fakes import unavailable_db_settings
 from fastapi import Query
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import BaseModel
+
+from tests.unit.fakes import unavailable_db_settings
 
 
 class Payload(BaseModel):

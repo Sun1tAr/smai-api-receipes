@@ -52,3 +52,8 @@ def test_every_job_has_a_timeout() -> None:
     assert len(jobs) == 5
     for job in jobs:
         assert re.search(r"^    timeout-minutes: \d+$", job, re.MULTILINE), job
+
+
+def test_lint_job_runs_mypy() -> None:
+    lint = ci().split("  lint:")[1].split("\n  unit:")[0]
+    assert "- run: uv run mypy" in lint

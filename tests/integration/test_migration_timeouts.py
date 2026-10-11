@@ -33,7 +33,9 @@ def current_head() -> str:
     from alembic.script import ScriptDirectory
 
     config = Config(str(ROOT / "alembic.ini"))
-    return ScriptDirectory.from_config(config).get_current_head()
+    head = ScriptDirectory.from_config(config).get_current_head()
+    assert head is not None
+    return head
 
 
 # Временная ветка миграций с настоящим env.py проекта и одной ревизией.

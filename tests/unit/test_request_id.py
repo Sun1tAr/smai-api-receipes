@@ -1,6 +1,7 @@
 import httpx
 import pytest
-from fakes import unavailable_db_settings
+
+from tests.unit.fakes import unavailable_db_settings
 
 
 @pytest.fixture

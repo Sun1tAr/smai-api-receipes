@@ -22,10 +22,12 @@ dependencies = [
 [dependency-groups]
 dev = [
     "jsonschema>=4.23,<5",
+    "mypy>=2.4,<3",
     "pytest>=8,<10",
     "pytest-asyncio>=1,<2",
     "pytest-cov>=6,<8",
     "ruff>=0.11,<1",
+    "types-jsonschema>=4.23,<5",
 ]
 
 [build-system]
@@ -47,3 +49,15 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "migrations", "tests"]
+# Плагин понимает поля pydantic и BaseSettings, читающие значения из окружения.
+plugins = ["pydantic.mypy"]
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+# asyncpg не публикует аннотаций типов.
+module = ["asyncpg", "asyncpg.*"]
+ignore_missing_imports = true

@@ -96,7 +96,7 @@ async def test_http_and_database_traces_correlate_with_json_logs(
         spans = exporter.get_finished_spans()
         server = next(span for span in spans if span.kind == SpanKind.SERVER)
         assert any(
-            span.attributes.get("db.statement") == "SELECT 1"
+            (span.attributes or {}).get("db.statement") == "SELECT 1"
             and span.context.trace_id == server.context.trace_id
             for span in spans
         )

@@ -1,7 +1,8 @@
 import httpx
 import pytest
-from fakes import unavailable_db_settings
 from sqlalchemy import text
+
+from tests.unit.fakes import unavailable_db_settings
 
 
 def client_for(app) -> httpx.AsyncClient:

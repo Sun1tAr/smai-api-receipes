@@ -2,11 +2,11 @@ import os
 import uuid
 
 import pytest
-from seed import menu_data
 from sqlalchemy import text
 
 from receipes.domain import MenuNotFound
 from receipes.repositories import MenuRepository
+from tests.integration.seed import menu_data
 
 pytestmark = [
     pytest.mark.integration,

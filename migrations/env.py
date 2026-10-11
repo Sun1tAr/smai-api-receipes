@@ -1,7 +1,10 @@
 import asyncio
+from collections.abc import Collection, Mapping
+from typing import Any
 
 import structlog
 from alembic import context
+from alembic.runtime.migration import MigrationContext, MigrationInfo
 from asyncpg import PostgresError
 from sqlalchemy import Connection
 from sqlalchemy.exc import SQLAlchemyError
@@ -34,7 +37,13 @@ def run_migrations_offline() -> None:
 
 # Alembic выполняет синхронные операции через async-соединение SQLAlchemy.
 def migrate(connection: Connection) -> None:
-    def record_applied(*, ctx, step, heads, run_args) -> None:
+    # Alembic вызывает хук с именованными аргументами: имена должны совпадать.
+    def record_applied(
+        ctx: MigrationContext,
+        step: MigrationInfo,
+        heads: Collection[Any],
+        run_args: Mapping[str, Any],
+    ) -> None:
         progress["last_applied"] = step.up_revision_id
 
     context.configure(
