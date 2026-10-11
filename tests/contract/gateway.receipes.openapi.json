@@ -1,0 +1,470 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "smai-api-receipes (контракт MS-4, снимок)",
+    "version": "v1",
+    "description": "Снимок контракта API-1 (SMAI-A-121) и API-2 (SMAI-A-127). Заменяется экспортом OpenAPI из MS-4, когда он готов (SMAI-55)."
+  },
+  "paths": {
+    "/generate-menu": {
+      "post": {
+        "summary": "Запуск генерации меню (API-1)",
+        "description": "Создаёт задачу генерации недельного меню и сразу возвращает её идентификатор. Сама генерация выполняется в фоне; результат запрашивается через `GET /recipes/generate-menu/{task_id}`. Если ответ потерян (например, 504), повторять запрос автоматически нельзя: задача могла быть создана, а повтор запустит вторую генерацию.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "peopleCount",
+                  "weeklyBudget"
+                ],
+                "properties": {
+                  "peopleCount": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "description": "Количество человек."
+                  },
+                  "weeklyBudget": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "maximum": 1000000,
+                    "description": "Недельный бюджет в рублях, не более двух знаков после запятой."
+                  }
+                }
+              },
+              "example": {
+                "peopleCount": 4,
+                "weeklyBudget": 5000
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Задача создана.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "task_id"
+                  ],
+                  "properties": {
+                    "task_id": {
+                      "type": "string",
+                      "description": "Идентификатор задачи."
+                    }
+                  }
+                },
+                "example": {
+                  "task_id": "b1e2c3d4-5678-90ab-cdef-1234567890ab"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Некорректные параметры запроса.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "required": [
+                        "code",
+                        "message",
+                        "details"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "details": {
+                          "type": "object",
+                          "additionalProperties": true
+                        }
+                      }
+                    }
+                  }
+                },
+                "example": {
+                  "error": {
+                    "code": "VALIDATION_ERROR",
+                    "message": "Request is invalid",
+                    "details": {
+                      "fields": [
+                        {
+                          "loc": [
+                            "body",
+                            "peopleCount"
+                          ],
+                          "type": "int_parsing"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Ошибка создания задачи.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "required": [
+                        "code",
+                        "message",
+                        "details"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "details": {
+                          "type": "object",
+                          "additionalProperties": true
+                        }
+                      }
+                    }
+                  }
+                },
+                "example": {
+                  "error": {
+                    "code": "INTERNAL_ERROR",
+                    "message": "Internal server error",
+                    "details": {}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/generate-menu/{task_id}": {
+      "get": {
+        "summary": "Получение результата генерации (API-2)",
+        "description": "Возвращает статус задачи; при `done` также меню. Клиент опрашивает этот эндпоинт, пока статус не станет `done` или `failed`. Неизвестный или некорректный `task_id` даёт 404.",
+        "responses": {
+          "200": {
+            "description": "Статус задачи.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "status",
+                    "menu",
+                    "error"
+                  ],
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "pending",
+                        "in_progress",
+                        "done",
+                        "failed"
+                      ]
+                    },
+                    "menu": {
+                      "type": [
+                        "object",
+                        "null"
+                      ],
+                      "description": "Результат генерации; null, если status не done.",
+                      "properties": {
+                        "recipes": {
+                          "type": "array",
+                          "minItems": 3,
+                          "items": {
+                            "type": "object",
+                            "required": [
+                              "name",
+                              "ingredients",
+                              "calories",
+                              "nutrition",
+                              "cookingTime",
+                              "instructions"
+                            ],
+                            "properties": {
+                              "name": {
+                                "type": "string"
+                              },
+                              "ingredients": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                  "type": "object",
+                                  "required": [
+                                    "name",
+                                    "quantity",
+                                    "unit"
+                                  ],
+                                  "properties": {
+                                    "name": {
+                                      "type": "string"
+                                    },
+                                    "quantity": {
+                                      "type": "number"
+                                    },
+                                    "unit": {
+                                      "type": "string"
+                                    }
+                                  }
+                                }
+                              },
+                              "calories": {
+                                "type": "number",
+                                "description": "Калорийность, ккал."
+                              },
+                              "nutrition": {
+                                "type": "object",
+                                "required": [
+                                  "calories",
+                                  "proteins",
+                                  "fats",
+                                  "carbohydrates"
+                                ],
+                                "properties": {
+                                  "calories": {
+                                    "type": "number"
+                                  },
+                                  "proteins": {
+                                    "type": "number"
+                                  },
+                                  "fats": {
+                                    "type": "number"
+                                  },
+                                  "carbohydrates": {
+                                    "type": "number"
+                                  }
+                                }
+                              },
+                              "cookingTime": {
+                                "type": "number",
+                                "description": "Время готовки, мин."
+                              },
+                              "instructions": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                  "type": "string"
+                                }
+                              },
+                              "photo": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ],
+                                "description": "Ссылка на фотографию."
+                              }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Описание ошибки; null, если status не failed."
+                    }
+                  }
+                },
+                "examples": {
+                  "pending": {
+                    "summary": "Задача в очереди",
+                    "value": {
+                      "status": "pending",
+                      "menu": null,
+                      "error": null
+                    }
+                  },
+                  "in_progress": {
+                    "summary": "Задача выполняется",
+                    "value": {
+                      "status": "in_progress",
+                      "menu": null,
+                      "error": null
+                    }
+                  },
+                  "done": {
+                    "summary": "Задача завершена",
+                    "value": {
+                      "status": "done",
+                      "menu": {
+                        "recipes": [
+                          {
+                            "name": "Овсяная каша с ягодами",
+                            "ingredients": [
+                              {
+                                "name": "Овсяные хлопья",
+                                "quantity": 200,
+                                "unit": "г"
+                              },
+                              {
+                                "name": "Молоко",
+                                "quantity": 500,
+                                "unit": "мл"
+                              },
+                              {
+                                "name": "Ягоды",
+                                "quantity": 150,
+                                "unit": "г"
+                              }
+                            ],
+                            "calories": 320,
+                            "nutrition": {
+                              "calories": 320,
+                              "proteins": 12,
+                              "fats": 8,
+                              "carbohydrates": 50
+                            },
+                            "cookingTime": 15,
+                            "instructions": [
+                              "Вскипятить молоко.",
+                              "Добавить овсяные хлопья и варить 5 минут.",
+                              "Добавить ягоды и подать."
+                            ],
+                            "photo": "https://example.com/photos/oatmeal.jpg"
+                          }
+                        ]
+                      },
+                      "error": null
+                    }
+                  },
+                  "failed": {
+                    "summary": "Задача завершилась ошибкой",
+                    "value": {
+                      "status": "failed",
+                      "menu": null,
+                      "error": "Neurocore timeout"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Задача не найдена.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "required": [
+                        "code",
+                        "message",
+                        "details"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "details": {
+                          "type": "object",
+                          "additionalProperties": true
+                        }
+                      }
+                    }
+                  }
+                },
+                "example": {
+                  "error": {
+                    "code": "NOT_FOUND",
+                    "message": "Generation task not found",
+                    "details": {}
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Ошибка при получении статуса.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "required": [
+                        "code",
+                        "message",
+                        "details"
+                      ],
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "details": {
+                          "type": "object",
+                          "additionalProperties": true
+                        }
+                      }
+                    }
+                  }
+                },
+                "example": {
+                  "error": {
+                    "code": "INTERNAL_ERROR",
+                    "message": "Internal server error",
+                    "details": {}
+                  }
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Идентификатор задачи, полученный от API-1."
+          }
+        ]
+      }
+    }
+  }
+}
