@@ -459,7 +459,7 @@ async def test_a_lock_lost_during_the_call_is_noticed_before_the_result_is_saved
 
 
 async def test_a_repeated_cancellation_during_the_interruption_write_propagates(
-    ready,
+    ready, monkeypatch
 ) -> None:
     settings, factory = ready
     task_id = await new_task(factory)
@@ -471,18 +471,25 @@ async def test_a_repeated_cancellation_during_the_interruption_write_propagates(
         return valid()
 
     worker = worker_for(settings, factory, handler)
+    written = asyncio.Event()
+    original_fail = worker.fail
+
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        try:
+            await original_fail(*args, **kwargs)
+        finally:
+            written.set()
+
+    monkeypatch.setattr(worker, "fail", fail)
     runner = asyncio.create_task(worker.tick())
     await entered.wait()
     runner.cancel()
-    await asyncio.sleep(0)  # воркер начал запись «Generation interrupted»
+    await asyncio.sleep(0)  # лишь уступка циклу: воркер начал запись прерывания
     runner.cancel()
     with pytest.raises(asyncio.CancelledError):
         await runner
     # Запись идёт под shield и завершается, несмотря на вторую отмену.
-    for _ in range(100):
-        if (await state(factory, task_id))["status"] == "failed":
-            break
-        await asyncio.sleep(0.02)
+    await asyncio.wait_for(written.wait(), 15)
     assert (await state(factory, task_id))["error"] == "Generation interrupted"
     await worker.stop()
 

@@ -107,3 +107,45 @@ def test_main_reports_success_and_failures(smoke, monkeypatch, capsys) -> None:
     )
     assert smoke.main(["--base-url", "http://ollama.test"]) == 1
     assert "Ollama request failed" in capsys.readouterr().err
+
+
+def test_a_seed_file_without_a_template_string_is_reported(smoke, tmp_path) -> None:
+    broken = tmp_path / "seed.py"
+    broken.write_text("TEMPLATE = 42\n")
+    with pytest.raises(RuntimeError, match="TEMPLATE"):
+        smoke.load_seed_template(broken)
+    not_python = tmp_path / "seed.txt"
+    not_python.write_text("TEMPLATE = 'x'\n")
+    with pytest.raises(RuntimeError, match="cannot load"):
+        smoke.load_seed_template(not_python)
+
+
+def test_a_response_rejected_by_the_gate_is_exit_code_one(
+    smoke, monkeypatch, capsys
+) -> None:
+    short = payload()
+    short["recipes"] = short["recipes"][:1]
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        smoke.httpx,
+        "Client",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(200, json={"response": json.dumps(short)})
+            )
+        ),
+    )
+    assert smoke.main(["--base-url", "http://ollama.test"]) == 1
+    assert "rejected by the gate" in capsys.readouterr().err
+
+
+@pytest.mark.filterwarnings("ignore:.*found in sys.modules:RuntimeWarning")
+def test_running_the_module_as_a_script_exits_with_the_main_code(
+    smoke, monkeypatch
+) -> None:
+    import runpy
+
+    monkeypatch.setattr("sys.argv", ["ollama_smoke", "--people", "99"])
+    with pytest.raises(SystemExit) as exit_info:
+        runpy.run_module("scripts.ollama_smoke", run_name="__main__")
+    assert exit_info.value.code == 2

@@ -60,4 +60,4 @@ def test_test_stage_contains_the_files_the_tests_read() -> None:
 def test_compose_test_run_fails_on_skips_and_low_coverage() -> None:
     compose = (ROOT / "docker-compose.test.yml").read_text()
     assert 'FAIL_ON_SKIP: "1"' in compose
-    assert "--cov-fail-under=95" in compose
+    assert "--cov-fail-under=98" in compose

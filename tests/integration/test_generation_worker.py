@@ -421,6 +421,16 @@ async def test_running_service_processes_a_task_end_to_end(
     monkeypatch.setattr(
         main, "OllamaClient", lambda s: OllamaClient(s, transport=transport)
     )
+    processed: asyncio.Queue[None] = asyncio.Queue()
+    original = GenerationWorker.process
+
+    async def process(self: GenerationWorker, task: Any) -> None:
+        try:
+            await original(self, task)
+        finally:
+            processed.put_nowait(None)
+
+    monkeypatch.setattr(GenerationWorker, "process", process)
     app = main.create_app(
         settings.model_copy(
             update={
@@ -437,12 +447,11 @@ async def test_running_service_processes_a_task_end_to_end(
                 "/generate-menu", json={"peopleCount": 2, "weeklyBudget": 1000}
             )
             task_id = created.json()["task_id"]
-            body: dict[str, Any] = {}
-            for _ in range(200):
-                body = (await client.get(f"/generate-menu/{task_id}")).json()
-                if body["status"] in ("done", "failed"):
-                    break
-                await asyncio.sleep(0.05)
+            # Воркер сам сообщает, что обработал задачу: ожидание без опроса.
+            await asyncio.wait_for(processed.get(), 15)
+            body: dict[str, Any] = (
+                await client.get(f"/generate-menu/{task_id}")
+            ).json()
             metrics = (await client.get("/metrics")).text
     assert body["status"] == "done" and len(body["menu"]["recipes"]) == 3
     assert 'generation_outcomes_total{outcome="done",reason="none"} 1.0' in metrics

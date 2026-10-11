@@ -350,6 +350,74 @@
                               "Добавить ягоды и подать."
                             ],
                             "photo": "https://example.com/photos/oatmeal.jpg"
+                          },
+                          {
+                            "name": "Куриная грудка с гречкой",
+                            "ingredients": [
+                              {
+                                "name": "Куриная грудка",
+                                "quantity": 300,
+                                "unit": "г"
+                              },
+                              {
+                                "name": "Гречка",
+                                "quantity": 150,
+                                "unit": "г"
+                              },
+                              {
+                                "name": "Лук",
+                                "quantity": 1,
+                                "unit": "шт"
+                              }
+                            ],
+                            "calories": 520,
+                            "nutrition": {
+                              "calories": 520,
+                              "proteins": 45,
+                              "fats": 9,
+                              "carbohydrates": 62
+                            },
+                            "cookingTime": 35,
+                            "instructions": [
+                              "Отварить гречку до готовности.",
+                              "Нарезать и обжарить куриную грудку с луком.",
+                              "Подать курицу с гречкой."
+                            ],
+                            "photo": "https://example.com/photos/chicken-buckwheat.jpg"
+                          },
+                          {
+                            "name": "Овощной суп с чечевицей",
+                            "ingredients": [
+                              {
+                                "name": "Чечевица",
+                                "quantity": 100,
+                                "unit": "г"
+                              },
+                              {
+                                "name": "Морковь",
+                                "quantity": 2,
+                                "unit": "шт"
+                              },
+                              {
+                                "name": "Картофель",
+                                "quantity": 3,
+                                "unit": "шт"
+                              }
+                            ],
+                            "calories": 280,
+                            "nutrition": {
+                              "calories": 280,
+                              "proteins": 14,
+                              "fats": 4,
+                              "carbohydrates": 48
+                            },
+                            "cookingTime": 40,
+                            "instructions": [
+                              "Нарезать овощи.",
+                              "Варить чечевицу с овощами 25 минут.",
+                              "Посолить и подать."
+                            ],
+                            "photo": null
                           }
                         ]
                       },

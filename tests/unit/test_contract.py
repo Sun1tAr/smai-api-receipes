@@ -2,13 +2,18 @@
 
 1. Совместимость с контрактом gateway (tests/contract/gateway.receipes.openapi.json,
    копия contracts/receipes.openapi.json репозитория smai-api-gateway): пути, коды
-   ответов, схема запроса, примеры в обе стороны.
+   ответов, схема запроса, примеры в обе стороны. Копия снята с ветки feature/SMAI-55
+   gateway, коммит e0b8eb2 («пример done: 3 рецепта»). Обновление: скопировать файл
+   `contracts/receipes.openapi.json` из актуального gateway
+   (`cp ../smai-api-gateway/contracts/receipes.openapi.json
+   tests/contract/gateway.receipes.openapi.json`) и прогнать этот файл тестов; если
+   gateway и MS-4 разошлись, падает именно этот модуль. Репозиторий gateway при этом
+   только читается.
 2. Снимок собственной OpenAPI (tests/contract/openapi.snapshot.json): тест падает при
    любом незамеченном изменении схемы. Осознанное изменение фиксируется командой
    `UPDATE_OPENAPI_SNAPSHOT=1 uv run pytest tests/unit/test_contract.py`.
 """
 
-import copy
 import json
 import os
 from pathlib import Path
@@ -115,13 +120,15 @@ def test_gateway_status_examples_round_trip_through_our_models() -> None:
         assert dumped == value, name
 
 
+def test_the_gateway_done_example_has_the_required_three_recipes() -> None:
+    operation = gateway()["paths"]["/generate-menu/{task_id}"]["get"]
+    done = json_content(operation["responses"]["200"])["examples"]["done"]["value"]
+    assert len(done["menu"]["recipes"]) >= 3
+
+
 def test_our_status_responses_satisfy_the_gateway_schema() -> None:
     operation = gateway()["paths"]["/generate-menu/{task_id}"]["get"]
-    schema = copy.deepcopy(json_content(operation["responses"]["200"])["schema"])
-    # В контракте gateway пример done содержит один рецепт, хотя схема требует не
-    # менее трёх (minItems: 3): пример противоречит собственной схеме. Для сверки
-    # примера минимум снимается; сам минимум проверяют тесты «ворот» GeneratedMenu.
-    del schema["properties"]["menu"]["properties"]["recipes"]["minItems"]
+    schema = json_content(operation["responses"]["200"])["schema"]
     for example in json_content(operation["responses"]["200"])["examples"].values():
         body = TaskStatusResponse.model_validate(example["value"]).model_dump(
             mode="json", by_alias=True

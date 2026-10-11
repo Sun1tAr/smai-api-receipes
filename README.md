@@ -186,14 +186,16 @@ docker compose -p receipes-tests -f docker-compose.test.yml down
 ```sh
 uv run pytest tests/unit                      # unit, без БД
 uv run pytest tests/unit --cov                # + покрытие по src/receipes
-# все тесты: PostgreSQL на tmpfs, покрытие, порог 95 %, пропуски = ошибка
+# все тесты: PostgreSQL на tmpfs, покрытие, порог 98 %, пропуски = ошибка
 docker compose -p receipes-tests -f docker-compose.test.yml up --build \
   --abort-on-container-exit --exit-code-from tests
 ```
 
 Прогон в Compose (`CI`, job `integration`) — основной: 582 теста, 0 пропусков,
-покрытие 99,8 % (ветки включены; `concurrency = greenlet` в конфигурации coverage
-обязательна, иначе код SQLAlchemy-async недосчитывается). В test-образ копируются
+покрытие 99,8 % (ветки включены, в отчёт входят `src/receipes` и `scripts`;
+`concurrency = greenlet` в конфигурации coverage обязательна, иначе код
+SQLAlchemy-async недосчитывается), порог `--cov-fail-under=98`; зависший тест
+падает по `timeout = 120` (pytest-timeout), а не вешает прогон. В test-образ копируются
 `.github`, `scripts`, миграции и compose-файлы, которые читают тесты; при
 `FAIL_ON_SKIP=1` (Compose-прогон и unit-job CI) любой пропущенный тест — ошибка.
 Без `TEST_DB_HOST` локально пропускаются только интеграционные тесты.
@@ -210,21 +212,32 @@ Job `lint` запускает ruff и mypy, `compose-smoke` поднимает �
 | Переходы `pending → in_progress → done/failed` через HTTP | `test_end_to_end.py::test_a_task_goes_pending_in_progress_done_through_http` |
 | API-1/API-2, границы, 404 на неизвестный и мусорный id | `test_generation_api.py` (unit и integration) |
 | Единый формат всех ошибок (400/404/405/500/503) | `test_contract.py::test_error_format_is_identical…`, `test_health.py` |
-| Контракт с gateway | `test_contract.py` (копия `contracts/receipes.openapi.json` gateway в `tests/contract/`) |
+| Контракт с gateway | `test_contract.py` (копия `contracts/receipes.openapi.json` gateway в `tests/contract/gateway.receipes.openapi.json`) |
 | OpenAPI не меняется незаметно | `test_contract.py::test_openapi_matches_the_committed_snapshot` (снимок `tests/contract/openapi.snapshot.json`; обновление: `UPDATE_OPENAPI_SNAPSHOT=1 uv run pytest tests/unit/test_contract.py`) |
 | Миграции вверх/вниз/`alembic check`, обратимость seed | `test_migrations_schema.py`, `test_migration_timeouts.py`, `test_infrastructure.py` |
 | Ограничения БД (CHECK/UNIQUE/FK/каскады) | `test_schema_constraints.py` |
 | Breaker, остановка и отмена, backoff, метрики | `test_breaker.py`, `test_worker_loop.py`, `test_worker_resilience.py` |
 
-Ollama везде замокана (`httpx.MockTransport`, управляемые события вместо пауз; время
-breaker — через подставляемые часы), поэтому тесты детерминированы.
+Ollama везде замокана (`httpx.MockTransport`). Ожидания в тестах строятся на событиях
+и очередях (заглушка сообщает о начале вызова, воркер — об обработке задачи), время
+breaker — через подставляемые часы. Реальных пауз нет, кроме `asyncio.sleep(0)` (лишь
+уступка циклу событий) и коротких значений таймаутов в нескольких unit-тестах клиента
+(например, `ollama_timeout_seconds=0.05` для проверки общего таймаута): они
+срабатывают по таймеру, а не по гонке.
 
 **Не покрыто.** Реальная Ollama (качество и время ответа `qwen2.5:7b`, подбор
 `OLLAMA_TIMEOUT_SECONDS`/`OLLAMA_NUM_PREDICT`) — только ручной
 `scripts.ollama_smoke`, в CI не запускается. Молчаливый сетевой обрыв соединения с
 блокировкой воркера имитируется `pg_terminate_backend`, а не реальным разрывом сети.
-GitHub Actions не проверяется локально. Контракт gateway содержит пример `done` с
-одним рецептом при `minItems: 3` в схеме: тест сверяет пример без этого минимума.
+GitHub Actions не проверяется локально.
+
+**Копия контракта gateway.** `tests/contract/gateway.receipes.openapi.json` — копия
+`contracts/receipes.openapi.json` из репозитория `smai-api-gateway` (снята с ветки
+`feature/SMAI-55`, коммит `e0b8eb2`, где пример `done` содержит 3 рецепта, как требует
+схема). Обновление: `cp ../smai-api-gateway/contracts/receipes.openapi.json
+tests/contract/gateway.receipes.openapi.json`, затем `uv run pytest
+tests/unit/test_contract.py`; расхождение gateway и MS-4 проявляется падением именно
+этого модуля. Репозиторий gateway при этом только читается.
 
 **Мутационная проверка** ключевых тестов проведена вручную (временная порча кода,
 тест должен упасть): отсутствие коммита после захвата, сохранение меню при проигранном
