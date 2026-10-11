@@ -61,3 +61,13 @@ warn_unused_ignores = true
 # asyncpg не публикует аннотаций типов.
 module = ["asyncpg", "asyncpg.*"]
 ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["receipes"]
+branch = true
+# SQLAlchemy asyncio выполняет код в greenlet: без этого покрытие занижено.
+concurrency = ["thread", "greenlet"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
