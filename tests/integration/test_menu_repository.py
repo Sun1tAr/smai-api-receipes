@@ -5,6 +5,7 @@ import pytest
 from seed import menu_data
 from sqlalchemy import text
 
+from receipes.domain import MenuNotFound
 from receipes.repositories import MenuRepository
 
 pytestmark = [
@@ -36,9 +37,9 @@ async def test_saved_menu_is_loaded_in_the_saved_order(session_factory) -> None:
             (item.ingredient.name, item.quantity, item.unit, item.position)
             for item in first.recipe_ingredients
         ] == [
-            ("овсянка", 100, "г", 1),
-            ("молоко", 200, "мл", 2),
-            ("мед", 1, "ложка", 3),
+            ("Овсянка", 100, "г", 1),
+            ("Молоко", 200, "мл", 2),
+            ("Мёд", 1, "ложка", 3),
         ]
         assert [step.text for step in first.instructions] == [
             "Первый шаг.",
@@ -51,7 +52,10 @@ async def test_saved_menu_is_loaded_in_the_saved_order(session_factory) -> None:
 
 
 async def test_unknown_menu_is_not_found(session) -> None:
-    assert await MenuRepository(session).load(uuid.uuid4()) is None
+    missing = uuid.uuid4()
+    with pytest.raises(MenuNotFound) as error:
+        await MenuRepository(session).load(missing)
+    assert error.value.menu_id == missing
 
 
 async def test_ingredients_are_reused_between_recipes_and_menus(session) -> None:
@@ -60,7 +64,7 @@ async def test_ingredients_are_reused_between_recipes_and_menus(session) -> None
     second = await repository.save(menu_data(["Пирог", "Блины", "Омлет"]))
     assert first != second
     # «молоко» и «мука» у шести рецептов двух меню — ровно две строки.
-    assert await ingredient_names(session) == ["молоко", "мука"]
+    assert await ingredient_names(session) == ["Молоко", "Мука"]
     links = await session.scalar(text("SELECT count(*) FROM recipe_ingredients"))
     assert links == 12
 
@@ -69,24 +73,47 @@ async def test_ingredient_spelling_variants_are_one_ingredient(session) -> None:
     generated = menu_data(
         ["Каша", "Суп", "Салат"],
         Каша=[("Мёд", 1, "ложка")],
-        Суп=[("  МЕД ", 2, "ложка")],
-        Салат=[("мед", 3, "ложка")],
+        Суп=[("мед ", 2, "ложка")],
+        Салат=[("МЁД", 3, "ложка")],
     )
-    menu_id = await MenuRepository(session).save(generated)
-    assert await ingredient_names(session) == ["мед"]
-    # Нормализованное имя в БД совпадает с индексом lower(btrim(name)).
-    menu = await MenuRepository(session).load(menu_id)
+    repository = MenuRepository(session)
+    menu_id = await repository.save(generated)
+    # Показывается первое написание, ключ дедупликации — отдельная колонка.
+    assert await ingredient_names(session) == ["Мёд"]
+    assert await session.scalar(text("SELECT name_key FROM ingredient")) == "мед"
+    menu = await repository.load(menu_id)
     assert {
         link.recipe.recipe_ingredients[0].ingredient.name for link in menu.menu_recipes
-    } == {"мед"}
+    } == {"Мёд"}
 
 
-async def test_existing_ingredient_with_other_case_is_reused(session) -> None:
+async def test_later_menu_does_not_change_the_display_name(session) -> None:
+    repository = MenuRepository(session)
+    await repository.save(menu_data(["Каша", "Суп", "Салат"], Каша=[("Мёд", 1, "г")]))
+    second = await repository.save(
+        menu_data(["Пирог", "Блины", "Омлет"], Пирог=[("мёд", 1, "г")])
+    )
+    assert set(await ingredient_names(session)) == {"Мёд", "Молоко", "Мука"}
+    menu = await repository.load(second)
+    names = [i.ingredient.name for i in menu.menu_recipes[0].recipe.recipe_ingredients]
+    assert names == ["Мёд"]
+
+
+async def test_existing_ingredient_with_other_spelling_is_reused(session) -> None:
     await session.execute(
-        text("INSERT INTO ingredient VALUES (gen_random_uuid(), 'молоко')")
+        text("INSERT INTO ingredient VALUES (gen_random_uuid(), 'Молоко', 'молоко')")
     )
     await MenuRepository(session).save(menu_data())
-    assert await ingredient_names(session) == ["молоко", "мука"]
+    assert await ingredient_names(session) == ["Молоко", "Мука"]
+
+
+async def test_save_survives_manually_inserted_ingredients(session) -> None:
+    # Строка, вставленная в обход приложения, с произвольным name: ключ решает всё.
+    await session.execute(
+        text("INSERT INTO ingredient VALUES (gen_random_uuid(), 'MOLOKO!', 'молоко')")
+    )
+    await MenuRepository(session).save(menu_data())
+    assert await session.scalar(text("SELECT count(*) FROM ingredient")) == 2
 
 
 async def test_failed_save_leaves_nothing_behind(session_factory) -> None:

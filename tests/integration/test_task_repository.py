@@ -5,10 +5,11 @@ from datetime import timedelta
 from decimal import Decimal
 
 import pytest
-from seed import make_task, menu_data, parameters
+from seed import make_task, menu_data, parameters, start
 from sqlalchemy import text
 
 from receipes.domain import (
+    DomainError,
     GenerationParameters,
     GenerationTaskNotFound,
     InvalidTaskTransition,
@@ -17,6 +18,7 @@ from receipes.domain import (
 from receipes.models import PromptTemplate
 from receipes.repositories import (
     INTERRUPTED_ERROR,
+    INVALID_PARAMETERS_ERROR,
     QUEUE_TIMEOUT_ERROR,
     MenuRepository,
     PromptTemplateRepository,
@@ -119,9 +121,7 @@ async def test_concurrent_claims_skip_a_locked_task(session_factory) -> None:
 async def test_transition_is_conditional_on_the_expected_status(session) -> None:
     repository = TaskRepository(session)
     task = await make_task(session)
-    assert await repository.transition(
-        task.task_id, TaskStatus.PENDING, TaskStatus.IN_PROGRESS, prompt="p"
-    )
+    await start(session, task.task_id)
     # Чужой статус: задача уже не pending.
     assert not await repository.transition(
         task.task_id, TaskStatus.PENDING, TaskStatus.FAILED, error="late"
@@ -174,7 +174,6 @@ async def test_forbidden_transition_is_rejected_before_the_database(
 @pytest.mark.parametrize(
     ("expected", "target"),
     [
-        (TaskStatus.PENDING, TaskStatus.IN_PROGRESS),  # нет prompt
         (TaskStatus.IN_PROGRESS, TaskStatus.DONE),  # нет menu_id
         (TaskStatus.IN_PROGRESS, TaskStatus.FAILED),  # нет error
     ],
@@ -184,6 +183,13 @@ async def test_transition_requires_the_fields_of_the_target_status(
 ) -> None:
     with pytest.raises(ValueError):
         await TaskRepository(session).transition(uuid.uuid4(), expected, target)
+
+
+async def test_in_progress_is_reachable_only_through_claim_next(session) -> None:
+    with pytest.raises(ValueError, match="claim_next"):
+        await TaskRepository(session).transition(
+            uuid.uuid4(), TaskStatus.PENDING, TaskStatus.IN_PROGRESS
+        )
 
 
 async def test_lost_done_transition_leaves_no_menu(session_factory) -> None:
@@ -211,17 +217,8 @@ async def test_expire_stale_fails_old_pending_and_stuck_in_progress(session) -> 
     fresh_pending = await make_task(session, timedelta(minutes=1))
     stuck = await make_task(session, timedelta(minutes=30))
     fresh_running = await make_task(session, timedelta(minutes=2))
-    for task in (stuck, fresh_running):
-        await repository.transition(
-            task.task_id, TaskStatus.PENDING, TaskStatus.IN_PROGRESS, prompt="p"
-        )
-    await session.execute(
-        text(
-            "UPDATE generation_task SET started_at = now() - interval '20 minutes' "
-            "WHERE task_id = :id"
-        ),
-        {"id": stuck.task_id},
-    )
+    await start(session, stuck.task_id, timedelta(minutes=20))
+    await start(session, fresh_running.task_id, timedelta(minutes=1))
     expired = await repository.expire_stale(
         timedelta(minutes=15), timedelta(minutes=10)
     )
@@ -301,3 +298,117 @@ async def test_latest_prompt_template(session) -> None:
     assert (await repository.latest()).template == "old"
     await session.execute(text("DELETE FROM prompt_template WHERE template = 'old'"))
     assert (await repository.latest()).template == "tie-high"
+
+
+async def test_complete_saves_the_menu_and_finishes_the_task(session) -> None:
+    repository = TaskRepository(session)
+    task = await make_task(session)
+    await start(session, task.task_id)
+    assert await repository.complete(task.task_id, menu_data())
+    done = await repository.get(task.task_id)
+    assert done.status == TaskStatus.DONE and done.menu_id is not None
+    menu = await MenuRepository(session).load(done.menu_id)
+    assert len(menu.menu_recipes) == 3
+
+
+async def counts(session) -> dict[str, int]:
+    tables = (
+        "menu menu_recipes recipe nutrition instruction recipe_ingredients ingredient"
+    ).split()
+    return {
+        table: await session.scalar(text(f"SELECT count(*) FROM {table}"))
+        for table in tables
+    }
+
+
+async def test_lost_complete_leaves_no_menu_data_behind(session) -> None:
+    repository = TaskRepository(session)
+    existing = await make_task(session)
+    await start(session, existing.task_id)
+    # Справочник уже содержит «молоко»: оно переживает откат, новая «мука» — нет.
+    await session.execute(
+        text("INSERT INTO ingredient VALUES (gen_random_uuid(), 'Молоко', 'молоко')")
+    )
+    task = await make_task(session, timedelta(hours=1))
+    await start(session, task.task_id, timedelta(hours=1))
+    assert await repository.expire_stale(timedelta(days=1), timedelta(minutes=10)) == 1
+    before = await counts(session)
+    assert not await repository.complete(task.task_id, menu_data())
+    after = await counts(session)
+    assert after == before
+    assert after["ingredient"] == 1
+    assert (await repository.get(task.task_id)).status == TaskStatus.FAILED
+    # Внешняя транзакция жива: следующая завершённая задача сохраняется.
+    assert await repository.complete(existing.task_id, menu_data())
+    assert (await counts(session))["menu"] == 1
+
+
+async def test_complete_rolls_back_when_saving_fails(session) -> None:
+    repository = TaskRepository(session)
+    task = await make_task(session)
+    await start(session, task.task_id)
+    broken = menu_data()
+    broken.recipes[0].name = "я" * 300  # обходит «ворота», ловится колонкой
+    before = await counts(session)
+    with pytest.raises(Exception):  # noqa: B017  # DBAPIError драйвера
+        await repository.complete(task.task_id, broken)
+    assert await counts(session) == before
+    # Savepoint откатан, внешняя транзакция по-прежнему рабочая.
+    assert (await repository.get(task.task_id)).status == TaskStatus.IN_PROGRESS
+
+
+async def test_poison_task_fails_and_the_next_one_is_claimed(session) -> None:
+    repository = TaskRepository(session)
+    poison = await make_task(session, timedelta(minutes=5))
+    healthy = await make_task(session, timedelta(minutes=1))
+    calls: list[int] = []
+
+    def prompt(parameters: GenerationParameters) -> str:
+        calls.append(parameters.people_count)
+        if len(calls) == 1:
+            raise DomainError("cannot build the prompt")
+        return "prompt"
+
+    claimed = await repository.claim_next(prompt)
+    assert claimed.task_id == healthy.task_id
+    failed = await repository.get(poison.task_id)
+    assert (failed.status, failed.error) == (
+        TaskStatus.FAILED,
+        INVALID_PARAMETERS_ERROR,
+    )
+    assert failed.finished_at is not None and failed.started_at is None
+    assert await repository.count_pending() == 0
+
+
+async def test_only_poison_tasks_leave_the_queue_empty(session, monkeypatch) -> None:
+    import receipes.repositories as module
+
+    monkeypatch.setattr(module, "MAX_CLAIM_ATTEMPTS", 3)
+    repository = TaskRepository(session)
+    for age in range(5, 0, -1):
+        await make_task(session, timedelta(minutes=age))
+
+    def broken(parameters: GenerationParameters) -> str:
+        raise DomainError("no")
+
+    # Цикл ограничен: три итерации пропускают три задачи, две остаются в очереди.
+    assert await repository.claim_next(broken) is None
+    assert await repository.count_pending() == 2
+
+
+async def test_started_and_finished_use_the_real_clock_inside_a_transaction(
+    session,
+) -> None:
+    repository = TaskRepository(session)
+    task = await make_task(session)
+    # now() заморожен в начале транзакции, clock_timestamp() — нет.
+    await session.execute(text("SELECT pg_sleep(0.05)"))
+    claimed = await repository.claim_next(prompt_for)
+    assert claimed.started_at > claimed.created_at
+    await session.execute(text("SELECT pg_sleep(0.05)"))
+    menu_id = await MenuRepository(session).save(menu_data())
+    assert await repository.transition(
+        task.task_id, TaskStatus.IN_PROGRESS, TaskStatus.DONE, menu_id=menu_id
+    )
+    done = await repository.get(task.task_id)
+    assert done.finished_at > done.started_at

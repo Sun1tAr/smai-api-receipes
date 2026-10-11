@@ -48,6 +48,19 @@ async def make_task(session: AsyncSession, age: timedelta | None = None):
     return task
 
 
+# Задача в in_progress без claim_next: старт задаёт тест (возраст в минутах).
+async def start(
+    session: AsyncSession, task_id: uuid.UUID, age: timedelta | None = None
+):
+    await session.execute(
+        text(
+            "UPDATE generation_task SET status = 'in_progress', prompt = 'p', "
+            "started_at = now() - CAST(:age AS interval) WHERE task_id = :id"
+        ),
+        {"age": age or timedelta(0), "id": task_id},
+    )
+
+
 async def scalar(session: AsyncSession, sql: str, **params):
     return await session.scalar(text(sql), params)
 

@@ -2,20 +2,22 @@ import uuid
 from collections.abc import Callable
 from datetime import timedelta
 
+import structlog
 from sqlalchemy import func, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
 
 from receipes.domain import (
+    DomainError,
     GenerationParameters,
     GenerationTaskNotFound,
     InvalidTaskTransition,
+    MenuNotFound,
     TaskStatus,
 )
 from receipes.generated_menu import GeneratedMenu
 from receipes.models import (
-    INGREDIENT_NAME_KEY,
     GenerationParametersRecord,
     GenerationTask,
     Ingredient,
@@ -28,8 +30,19 @@ from receipes.models import (
     RecipeIngredient,
 )
 
+logger = structlog.get_logger()
+
+# Сколько подряд «ядовитых» задач claim_next готов пропустить за один вызов.
+MAX_CLAIM_ATTEMPTS = 20
+INVALID_PARAMETERS_ERROR = "Invalid generation parameters"
 QUEUE_TIMEOUT_ERROR = "Queue timeout"
 INTERRUPTED_ERROR = "Generation interrupted"
+
+
+# now() в PostgreSQL — начало транзакции; моменты старта и завершения берутся из
+# clock_timestamp(), иначе при захвате в той же транзакции started_at == created_at.
+def clock():
+    return func.clock_timestamp()
 
 
 # Репозитории не коммитят: границы транзакции задаёт вызывающий код.
@@ -57,76 +70,123 @@ class TaskRepository:
             raise GenerationTaskNotFound(task_id)
         return task
 
-    # Старейшая pending-задача переходит в in_progress; залоченные другой транзакцией
-    # пропускаются. Промпт собирается из параметров здесь же: CHECK требует его
-    # у любой задачи in_progress.
+    # Единственный путь в in_progress. Старейшая pending-задача переходит в
+    # in_progress; залоченные другой транзакцией пропускаются. Промпт собирается из
+    # параметров здесь же: CHECK требует его у любой задачи in_progress. Задача с
+    # невалидными параметрами или промптом, который не собрать, не должна блокировать
+    # очередь: она переводится в failed, и берётся следующая. Вызывающий коммитит
+    # транзакцию сразу после claim_next, чтобы не держать блокировку строки.
     async def claim_next(
         self, build_prompt: Callable[[GenerationParameters], str]
     ) -> GenerationTask | None:
-        row = (
-            await self.session.execute(
-                select(GenerationTask, GenerationParametersRecord)
-                .join(
-                    GenerationParametersRecord,
-                    GenerationParametersRecord.id == GenerationTask.parameters_id,
+        for _ in range(MAX_CLAIM_ATTEMPTS):
+            row = (
+                await self.session.execute(
+                    select(GenerationTask, GenerationParametersRecord)
+                    .join(
+                        GenerationParametersRecord,
+                        GenerationParametersRecord.id == GenerationTask.parameters_id,
+                    )
+                    .where(GenerationTask.status == TaskStatus.PENDING)
+                    .order_by(GenerationTask.created_at, GenerationTask.task_id)
+                    .limit(1)
+                    .with_for_update(of=GenerationTask, skip_locked=True)
+                    .execution_options(populate_existing=True)
                 )
-                .where(GenerationTask.status == TaskStatus.PENDING)
-                .order_by(GenerationTask.created_at, GenerationTask.task_id)
-                .limit(1)
-                .with_for_update(of=GenerationTask, skip_locked=True)
-                .execution_options(populate_existing=True)
+            ).first()
+            if row is None:
+                return None
+            task, record = row
+            try:
+                prompt = build_prompt(
+                    GenerationParameters(record.people_count, record.weekly_budget)
+                )
+            except DomainError as error:
+                logger.error(
+                    "invalid_task_parameters",
+                    task_id=str(task.task_id),
+                    error_type=type(error).__name__,
+                )
+                await self.session.execute(
+                    update(GenerationTask)
+                    .where(
+                        GenerationTask.task_id == task.task_id,
+                        GenerationTask.status == TaskStatus.PENDING,
+                    )
+                    .values(
+                        status=TaskStatus.FAILED,
+                        error=INVALID_PARAMETERS_ERROR,
+                        finished_at=clock(),
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                continue
+            await self.session.execute(
+                update(GenerationTask)
+                .where(GenerationTask.task_id == task.task_id)
+                .values(
+                    status=TaskStatus.IN_PROGRESS, prompt=prompt, started_at=clock()
+                )
+                .execution_options(synchronize_session=False)
             )
-        ).first()
-        if row is None:
-            return None
-        task, record = row
-        prompt = build_prompt(
-            GenerationParameters(record.people_count, record.weekly_budget)
-        )
-        await self.session.execute(
-            update(GenerationTask)
-            .where(GenerationTask.task_id == task.task_id)
-            .values(status=TaskStatus.IN_PROGRESS, prompt=prompt, started_at=func.now())
-            .execution_options(synchronize_session=False)
-        )
-        await self.session.refresh(task)
-        return task
+            await self.session.refresh(task)
+            return task
+        logger.error("claim_attempts_exhausted", attempts=MAX_CLAIM_ATTEMPTS)
+        return None
 
-    # Условный переход: False, если задача уже в другом статусе (её обработал
-    # другой воркер или она просрочена). Допустимость перехода проверяет домен.
+    # Условный переход в done или failed: False, если задача уже в другом статусе
+    # (её завершил expire_stale или другой воркер). Допустимость перехода проверяет
+    # домен. В in_progress ведёт только claim_next. Для done предпочтительнее
+    # complete(): он сохраняет меню и переводит задачу атомарно.
     async def transition(
         self,
         task_id: uuid.UUID,
         expected: TaskStatus,
         to: TaskStatus,
         *,
-        prompt: str | None = None,
         menu_id: uuid.UUID | None = None,
         error: str | None = None,
     ) -> bool:
         if not expected.can_transition_to(to):
             raise InvalidTaskTransition(expected, to)
-        values: dict[str, object] = {"status": to}
         if to is TaskStatus.IN_PROGRESS:
-            if prompt is None:
-                raise ValueError("prompt is required for in_progress")
-            values.update(prompt=prompt, started_at=func.now())
-        elif to is TaskStatus.DONE:
+            raise ValueError("in_progress is reached only through claim_next")
+        if to is TaskStatus.DONE:
             if menu_id is None:
                 raise ValueError("menu_id is required for done")
-            values.update(menu_id=menu_id, finished_at=func.now())
+            values: dict[str, object] = {"menu_id": menu_id}
         else:
             if error is None:
                 raise ValueError("error is required for failed")
-            values.update(error=error, finished_at=func.now())
+            values = {"error": error}
         result = await self.session.execute(
             update(GenerationTask)
             .where(GenerationTask.task_id == task_id, GenerationTask.status == expected)
-            .values(**values)
+            .values(status=to, finished_at=clock(), **values)
             .returning(GenerationTask.task_id)
             .execution_options(synchronize_session=False)
         )
         return result.first() is not None
+
+    # Сохраняет меню и переводит in_progress → done в savepoint. Если задача уже не
+    # in_progress (её просрочил expire_stale), savepoint откатывается: меню и
+    # добавленные им ингредиенты не остаются, возвращается False. Внешней
+    # транзакцией по-прежнему управляет вызывающий.
+    async def complete(self, task_id: uuid.UUID, generated: GeneratedMenu) -> bool:
+        savepoint = await self.session.begin_nested()
+        try:
+            menu_id = await MenuRepository(self.session).save(generated)
+            done = await self.transition(
+                task_id, TaskStatus.IN_PROGRESS, TaskStatus.DONE, menu_id=menu_id
+            )
+        except BaseException:
+            await savepoint.rollback()
+            raise
+        if done:
+            await savepoint.commit()
+        else:
+            await savepoint.rollback()
+        return done
 
     # Завершает просроченные задачи условными UPDATE; возвращает их число.
     async def expire_stale(self, pending_ttl: timedelta, stale_after: timedelta) -> int:
@@ -147,11 +207,8 @@ class TaskRepository:
         ):
             result = await self.session.execute(
                 update(GenerationTask)
-                .where(
-                    GenerationTask.status == status,
-                    age_column < func.now() - limit,
-                )
-                .values(status=TaskStatus.FAILED, error=message, finished_at=func.now())
+                .where(GenerationTask.status == status, age_column < clock() - limit)
+                .values(status=TaskStatus.FAILED, error=message, finished_at=clock())
                 .returning(GenerationTask.task_id)
                 .execution_options(synchronize_session=False)
             )
@@ -159,15 +216,16 @@ class TaskRepository:
         return expired
 
     async def count_pending(self) -> int:
-        return await self.session.scalar(
+        count = await self.session.scalar(
             select(func.count())
             .select_from(GenerationTask)
             .where(GenerationTask.status == TaskStatus.PENDING)
         )
+        return int(count or 0)
 
     async def oldest_pending_age(self) -> timedelta | None:
         return await self.session.scalar(
-            select(func.now() - func.min(GenerationTask.created_at)).where(
+            select(clock() - func.min(GenerationTask.created_at)).where(
                 GenerationTask.status == TaskStatus.PENDING
             )
         )
@@ -177,29 +235,29 @@ class MenuRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    # Сохраняет меню целиком и возвращает его id. Ингредиенты общие для всех
-    # рецептов: имена нормализуются, вставка идёт через ON CONFLICT по тому же
-    # выражению, что и уникальный индекс.
+    # Сохраняет меню целиком и возвращает его id. Ингредиенты общие для всех рецептов:
+    # ключ name_key считается в Python, вставка идёт через ON CONFLICT (name_key) DO
+    # NOTHING, а в name остаётся первое встреченное написание.
     async def save(self, generated: GeneratedMenu) -> uuid.UUID:
-        names = sorted(
-            {
-                ingredient.normalized_name
-                for recipe in generated.recipes
-                for ingredient in recipe.ingredients
-            }
-        )
+        display_names: dict[str, str] = {}
+        for recipe in generated.recipes:
+            for ingredient in recipe.ingredients:
+                display_names.setdefault(ingredient.name_key, ingredient.name)
         await self.session.execute(
             pg_insert(Ingredient)
-            .values([{"id": uuid.uuid4(), "name": name} for name in names])
-            .on_conflict_do_nothing(index_elements=[INGREDIENT_NAME_KEY])
+            .values(
+                [
+                    {"id": uuid.uuid4(), "name": name, "name_key": key}
+                    for key, name in display_names.items()
+                ]
+            )
+            .on_conflict_do_nothing(index_elements=[Ingredient.name_key])
         )
         ingredient_ids = dict(
             (
                 await self.session.execute(
-                    select(Ingredient.name, Ingredient.id).where(
-                        INGREDIENT_NAME_KEY.in_(
-                            [func.lower(func.btrim(name)) for name in names]
-                        )
+                    select(Ingredient.name_key, Ingredient.id).where(
+                        Ingredient.name_key.in_(list(display_names))
                     )
                 )
             ).all()
@@ -234,7 +292,7 @@ class MenuRepository:
                     {
                         "id": uuid.uuid4(),
                         "recipe_id": recipe_id,
-                        "ingredient_id": ingredient_ids[ingredient.normalized_name],
+                        "ingredient_id": ingredient_ids[ingredient.name_key],
                         "quantity": ingredient.quantity,
                         "unit": ingredient.unit,
                         "position": index,
@@ -259,7 +317,7 @@ class MenuRepository:
         return menu_id
 
     # Меню с рецептами, ингредиентами и шагами; всё отсортировано по position.
-    async def load(self, menu_id: uuid.UUID) -> Menu | None:
+    async def load(self, menu_id: uuid.UUID) -> Menu:
         recipe_loading = (
             selectinload(Menu.menu_recipes)
             .joinedload(MenuRecipe.recipe)
@@ -271,7 +329,7 @@ class MenuRepository:
                 selectinload(Recipe.instructions),
             )
         )
-        return (
+        menu = (
             await self.session.execute(
                 select(Menu)
                 .where(Menu.id == menu_id)
@@ -279,12 +337,16 @@ class MenuRepository:
                 .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
+        if menu is None:
+            raise MenuNotFound(menu_id)
+        return menu
 
 
 class PromptTemplateRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
+    # Шаблонов может не быть: первый создаётся сидом (SMAI-56).
     async def latest(self) -> PromptTemplate | None:
         return (
             await self.session.execute(
