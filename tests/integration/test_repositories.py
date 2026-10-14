@@ -286,15 +286,34 @@ async def test_existing_ingredient_is_reused_between_menus_but_recipes_are_new(
         assert await count(session, MenuRecipe) == 6
 
 
-async def test_ingredient_names_are_reused_after_normalization_but_case_differs(
+async def test_ingredient_is_found_by_name_key_and_stored_normalized(
     session_factory: Factory,
 ) -> None:
-    payload = menu_of(recipe("A", "Яйцо"), recipe("B", " Яйцо "), recipe("C", "яйцо"))
+    payload = menu_of(
+        recipe("A", "  Мёд   липовый "),
+        recipe("B", "мед\u00a0липовый"),
+        recipe("C", "«Мёд липовый»."),
+    )
     async with session_factory() as session, session.begin():
         await MenuRepository(session).save(payload)
     async with session_factory() as session:
         names = (await session.scalars(select(Ingredient.name))).all()
-    assert sorted(names) == ["Яйцо", "яйцо"]
+        links = await count(session, RecipeIngredient)
+    # Одна строка: имя первого вхождения, нормализованное (NFKC, пробелы, strip).
+    assert names == ["Мёд липовый"]
+    assert links == 3
+
+
+async def test_existing_row_with_other_case_is_reused(session_factory: Factory) -> None:
+    async with session_factory() as session, session.begin():
+        session.add(Ingredient(id=uuid4(), name="Яйцо"))
+    async with session_factory() as session, session.begin():
+        await MenuRepository(session).save(
+            menu_of(recipe("A", "яйцо"), recipe("B", "Соль"), recipe("C", "Рис"))
+        )
+    async with session_factory() as session:
+        names = (await session.scalars(select(Ingredient.name))).all()
+    assert sorted(names) == ["Рис", "Соль", "Яйцо"]
 
 
 async def test_duplicate_ingredient_names_in_db_do_not_break_save(
