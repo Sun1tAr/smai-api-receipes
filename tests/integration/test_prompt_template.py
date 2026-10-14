@@ -58,3 +58,26 @@ async def test_active_template_after_upgrade_is_the_seeded_one(
     assert active is not None
     prompt = render_prompt(active.template, 4, Decimal("5000"))
     assert "для 4 человек" in prompt and "5000 рублей" in prompt
+
+
+async def test_seed_is_idempotent_when_the_row_already_exists(
+    settings: Settings, alembic: Callable[..., None]
+) -> None:
+    from sqlalchemy import text
+
+    alembic("downgrade", "base")
+    alembic("upgrade", "0001_domain")
+    engine = create_engine(settings)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO prompt_template (id, template, created_at) VALUES "
+                    "('b42d2707-086d-4df0-96f2-37f77280e66b', 'manual', now())"
+                )
+            )
+        alembic("upgrade", "head")
+        rows = await templates(settings)
+    finally:
+        await engine.dispose()
+    assert len(rows) == 1 and rows[0].template == "manual"
