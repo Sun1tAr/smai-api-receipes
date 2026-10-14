@@ -6,8 +6,8 @@ Ollama. Инфраструктура (**SMAI-58**): каркас приложе�
 эндпоинты API-1/API-2 (SMAI-55) готовы; шаблон промпта, воркер генерации и
 клиент Ollama — в SMAI-56 и SMAI-54.
 миграции, health, метрики, трейсы и логи, Docker/Compose и CI. Домен (SMAI-57),
-шаблон промпта (SMAI-56), воркер генерации и клиент Ollama (SMAI-54) готовы;
-эндпоинты API-1/API-2 появятся в SMAI-55.
+шаблон промпта (SMAI-56), воркер генерации и клиент Ollama (SMAI-54) и
+эндпоинты API-1/API-2 (SMAI-55) готовы.
 
 ## Эндпоинты
 
@@ -207,7 +207,8 @@ docker compose -p receipes-tests -f docker-compose.test.yml down
 src/receipes/       приложение: config, database, main (create_app), health,
                     errors, observability, migration_diagnostics, __main__ (запуск uvicorn);
                     domain/ (статусы, проверка ответа модели), db/ (модели, репозитории),
-                    generation/ (промпт, клиент Ollama, воркер, метрики)
+                    api/ (API-1/API-2), generation/ (промпт, клиент Ollama, воркер,
+                    метрики)
 migrations/         Alembic (async env.py): 0001_domain, 0002_seed_prompt_template;
                     таблица версий alembic_version_receipes
                     domain/ (статусы, имена), db/ (модели, репозитории), api/ (API-1/API-2)
