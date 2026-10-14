@@ -35,7 +35,8 @@ async def post_and_process(settings, factory, handler):
             )
             task_id = created.json()["task_id"]
             before = (await client.get(f"/generate-menu/{task_id}")).json()
-            assert await app.state.worker.process_one() is True
+            # False при сбое стороны Ollama: следующая итерация начнётся с паузы.
+            await app.state.worker.process_one()
             after = await client.get(f"/generate-menu/{task_id}")
     return before, after
 
@@ -230,3 +231,71 @@ async def test_broken_template_keeps_every_task_pending_through_the_api(
             for _ in range(3):
                 assert await app.state.worker.process_one() is True
             assert await statuses(client, ids) == ["done"] * 3
+
+
+async def test_model_not_loaded_keeps_the_queue_until_it_appears(
+    settings: Settings, session_factory: Factory
+) -> None:
+    from receipes.main import create_app
+
+    loaded = {"models": ["other:1b"]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(
+                200, json={"models": [{"name": name} for name in loaded["models"]]}
+            )
+        if "qwen2.5:7b" in loaded["models"]:
+            return httpx.Response(200, json=ollama_reply(sample_menu()))
+        return httpx.Response(404, json={"error": "model not found"})
+
+    async with session_factory() as session, session.begin():
+        session.add(PromptTemplate(template="{people_count} {weekly_budget}"))
+    app = create_app(settings, ollama_transport=httpx.MockTransport(handler))
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            ids = await create_tasks(client, 4)
+            for _ in range(4):
+                await app.state.worker.process_one()
+            first = (await client.get(f"/generate-menu/{ids[0]}")).json()
+            assert first["error"] == "Neurocore model not found"
+            assert await statuses(client, ids) == ["failed"] + ["pending"] * 3
+            # /api/tags отвечает 200, но модели в списке всё ещё нет.
+            assert await app.state.worker.process_one() is False
+            loaded["models"].append("qwen2.5:7b")
+            for _ in range(3):
+                assert await app.state.worker.process_one() is True
+            assert await statuses(client, ids) == ["failed"] + ["done"] * 3
+
+
+async def test_ollama_500_loses_only_the_failing_task(
+    settings: Settings, session_factory: Factory
+) -> None:
+    from receipes.main import create_app
+
+    async with session_factory() as session, session.begin():
+        session.add(PromptTemplate(template="{people_count} {weekly_budget}"))
+    handler_state = {"healthy": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": []})
+        if handler_state["healthy"]:
+            return httpx.Response(200, json=ollama_reply(sample_menu()))
+        return httpx.Response(500, text="boom")
+
+    app = create_app(settings, ollama_transport=httpx.MockTransport(handler))
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            ids = await create_tasks(client, 4)
+            assert await app.state.worker.process_one() is False
+            handler_state["healthy"] = True
+            for _ in range(3):
+                assert await app.state.worker.process_one() is True
+            body = (await client.get(f"/generate-menu/{ids[0]}")).json()
+            assert (body["status"], body["error"]) == ("failed", "Neurocore error")
+            assert await statuses(client, ids) == ["failed"] + ["done"] * 3
