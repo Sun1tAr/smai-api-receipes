@@ -27,8 +27,6 @@ def clean_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "OLLAMA_KEEP_ALIVE",
         "GENERATION_WORKER_ENABLED",
         "GENERATION_WORKER_INTERVAL_SECONDS",
-        "GENERATION_PENDING_TTL_SECONDS",
-        "GENERATION_MAX_PENDING",
         "GENERATION_BAD_RESPONSE_RETRIES",
     ):
         monkeypatch.delenv(key, raising=False)

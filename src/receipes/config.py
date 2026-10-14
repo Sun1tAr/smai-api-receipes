@@ -1,8 +1,12 @@
 from typing import Literal
 
-from pydantic import AnyHttpUrl, Field, SecretStr, field_validator
+from pydantic import AnyHttpUrl, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import URL
+
+# Запас контекста сверх OLLAMA_NUM_PREDICT на сам промпт: ~820 токенов измерено
+# (SMAI-54) плюс запас на рост шаблона.
+CONTEXT_RESERVE_TOKENS = 1024
 
 
 class Settings(BaseSettings):
@@ -27,22 +31,20 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     otel_exporter_otlp_endpoint: AnyHttpUrl | None = None
 
-    # Ollama: клиент появится позже, пока задаётся только конфигурация.
     ollama_base_url: AnyHttpUrl
-    ollama_model: str = Field(default="qwen2.5:7b-instruct-q4_K_M", min_length=1)
+    ollama_model: str = Field(default="qwen2.5:7b", min_length=1)
     ollama_connect_timeout_seconds: float = Field(default=5, gt=0, le=60)
     ollama_timeout_seconds: float = Field(default=300, gt=0, le=3600)
-    ollama_num_ctx: int = Field(default=32768, ge=512, le=1_048_576)
+    # 8192 целиком в видеопамяти; 32768 — нет, и это в 2,6 раза медленнее.
+    ollama_num_ctx: int = Field(default=8192, ge=512, le=1_048_576)
     ollama_num_predict: int = Field(default=4096, ge=1, le=1_048_576)
     ollama_temperature: float = Field(default=0.3, ge=0, le=2)
     ollama_keep_alive: str = Field(default="30m", min_length=1)
 
-    # Фоновая генерация меню: воркер появится позже.
+    # Фоновая генерация меню.
     generation_worker_enabled: bool = True
     generation_worker_interval_seconds: float = Field(default=2, gt=0, le=3600)
-    generation_pending_ttl_seconds: int = Field(default=900, ge=1, le=86400)
-    # Не задан — очередь без лимита.
-    generation_max_pending: int | None = Field(default=None, ge=1)
+    # Повторы только при невалидном ответе модели (не при таймауте и обрезке).
     generation_bad_response_retries: int = Field(default=1, ge=0, le=10)
 
     # LOG_LEVEL=info допустим: регистр в окружении легко перепутать.
@@ -66,6 +68,17 @@ class Settings(BaseSettings):
         if not value.get_secret_value().strip():
             raise ValueError("must not be blank")
         return value
+
+    # Ответ модели должен помещаться в контекст вместе с промптом.
+    @model_validator(mode="after")
+    def check_context_fits_output(self) -> "Settings":
+        if self.ollama_num_predict + CONTEXT_RESERVE_TOKENS > self.ollama_num_ctx:
+            raise ValueError(
+                f"OLLAMA_NUM_PREDICT + {CONTEXT_RESERVE_TOKENS} must not exceed "
+                f"OLLAMA_NUM_CTX (got {self.ollama_num_predict} and "
+                f"{self.ollama_num_ctx})"
+            )
+        return self
 
     # Учётные данные в URL попали бы в логи, трейсы и сообщения об ошибках.
     @field_validator("ollama_base_url", "otel_exporter_otlp_endpoint", mode="after")

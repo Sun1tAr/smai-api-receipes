@@ -1,0 +1,219 @@
+import asyncio
+from collections.abc import Awaitable, Callable
+from time import perf_counter
+from uuid import UUID
+
+import structlog
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from receipes.config import Settings
+from receipes.db.repositories import (
+    MenuRepository,
+    PromptTemplateRepository,
+    TaskRepository,
+)
+from receipes.domain.errors import (
+    GENERATION_FAILED,
+    SERVICE_RESTARTED,
+    GenerationError,
+    InvalidNeurocoreResponse,
+    PromptTemplateError,
+    TaskStateConflict,
+)
+from receipes.generation.metrics import GenerationMetrics
+from receipes.generation.ollama import GeneratedMenu, OllamaClient
+from receipes.generation.prompt import render_prompt
+
+logger = structlog.get_logger()
+
+Sleep = Callable[[float], Awaitable[None]]
+
+
+# Воркер генерации: берёт pending-задачи по одной (Ollama однопоточна), вызывает
+# модель вне транзакций БД и записывает результат. Рассчитан на один процесс и одну
+# реплику; перекрытие старого и нового контейнера при деплое не допускается.
+class GenerationWorker:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        ollama: OllamaClient,
+        settings: Settings,
+        metrics: GenerationMetrics,
+        sleep: Sleep = asyncio.sleep,
+    ) -> None:
+        self._sessions = session_factory
+        self._ollama = ollama
+        self._settings = settings
+        self._metrics = metrics
+        self._sleep = sleep
+
+    # Задачи, оставшиеся in_progress после гибели процесса, закрываем как failed.
+    # Повторяем, пока БД не ответит: брать новые задачи до этого нельзя.
+    async def recover(self) -> None:
+        while True:
+            try:
+                async with self._sessions() as session, session.begin():
+                    count = await TaskRepository(session).fail_in_progress(
+                        SERVICE_RESTARTED
+                    )
+            except Exception:
+                logger.error("generation_recovery_failed", exc_info=True)
+                await self._sleep(self._settings.generation_worker_interval_seconds)
+                continue
+            if count:
+                logger.info("generation_recovered", failed_tasks=count)
+            return
+
+    async def run(self) -> None:
+        await self.recover()
+        while True:
+            try:
+                processed = await self.process_one()
+            except Exception:
+                logger.error("generation_iteration_failed", exc_info=True)
+                processed = False
+            # Пустая итерация ничего не пишет в лог: иначе шум каждые N секунд.
+            if not processed:
+                await self._sleep(self._settings.generation_worker_interval_seconds)
+
+    # Одна итерация: True, если задача была взята (даже закончившаяся ошибкой).
+    async def process_one(self) -> bool:
+        async with self._sessions() as session, session.begin():
+            task_id = await TaskRepository(session).claim_next()
+        if task_id is None:
+            return False
+        started = perf_counter()
+        logger.info("generation_task_claimed", task_id=str(task_id))
+        generated: GeneratedMenu | None = None
+        try:
+            prompt = await self._prepare_prompt(task_id)
+            generated = await self._generate(task_id, prompt)
+            await self._finish(task_id, generated)
+        except TaskStateConflict:
+            logger.warning("generation_task_conflict", task_id=str(task_id))
+            return True
+        except GenerationError as error:
+            await self._fail(task_id, error.message, started, generated)
+        except Exception:
+            logger.error("generation_task_error", task_id=str(task_id), exc_info=True)
+            await self._fail(task_id, GENERATION_FAILED, started, generated)
+        else:
+            self._record(task_id, "done", started, generated)
+        return True
+
+    # Транзакция 2: параметры и активный шаблон, промпт сохраняется в задаче.
+    async def _prepare_prompt(self, task_id: UUID) -> str:
+        async with self._sessions() as session, session.begin():
+            tasks = TaskRepository(session)
+            parameters = await tasks.get_parameters(task_id)
+            template = await PromptTemplateRepository(session).get_active()
+            if parameters is None or template is None:
+                raise PromptTemplateError
+            prompt = render_prompt(
+                template.template, parameters.people_count, parameters.weekly_budget
+            )
+            await tasks.set_prompt(task_id, prompt)
+        return prompt
+
+    # Вызов Ollama вне транзакций; повтор только для невалидного ответа.
+    async def _generate(self, task_id: UUID, prompt: str) -> GeneratedMenu:
+        attempts = 1 + self._settings.generation_bad_response_retries
+        for attempt in range(1, attempts + 1):
+            try:
+                generated = await self._ollama.generate_menu(prompt)
+            except InvalidNeurocoreResponse as error:
+                self._metrics.rejected.labels(error.reason).inc()
+                logger.warning(
+                    "generation_response_rejected",
+                    task_id=str(task_id),
+                    attempt=attempt,
+                    reason=error.reason,
+                )
+                if attempt == attempts:
+                    raise
+                continue
+            self._warn_if_context_is_tight(task_id, generated)
+            return generated
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _warn_if_context_is_tight(
+        self, task_id: UUID, generated: GeneratedMenu
+    ) -> None:
+        used = generated.prompt_eval_count
+        settings = self._settings
+        if (
+            used is not None
+            and used + settings.ollama_num_predict > settings.ollama_num_ctx
+        ):
+            logger.warning(
+                "ollama_context_tight",
+                task_id=str(task_id),
+                prompt_eval_count=used,
+                num_predict=settings.ollama_num_predict,
+                num_ctx=settings.ollama_num_ctx,
+            )
+
+    # Транзакция 3: меню и статус done вместе; иначе откат всего.
+    async def _finish(self, task_id: UUID, generated: GeneratedMenu) -> None:
+        async with self._sessions() as session, session.begin():
+            menu_id = await MenuRepository(session).save(generated.menu)
+            if await TaskRepository(session).mark_done(task_id, menu_id) != 1:
+                raise TaskStateConflict
+        mismatched = sum(
+            item.calories != item.nutrition.calories for item in generated.menu.recipes
+        )
+        if mismatched:
+            logger.warning(
+                "generation_calories_mismatch",
+                task_id=str(task_id),
+                recipes=len(generated.menu.recipes),
+                mismatched=mismatched,
+            )
+
+    async def _fail(
+        self,
+        task_id: UUID,
+        message: str,
+        started: float,
+        generated: GeneratedMenu | None,
+    ) -> None:
+        try:
+            async with self._sessions() as session, session.begin():
+                changed = await TaskRepository(session).mark_failed(task_id, message)
+        except Exception:
+            # Задачу подберёт восстановление при следующем старте.
+            logger.error(
+                "generation_task_fail_not_saved", task_id=str(task_id), exc_info=True
+            )
+            return
+        if changed:
+            self._record(task_id, "failed", started, generated, error=message)
+        else:
+            logger.warning("generation_task_conflict", task_id=str(task_id))
+
+    def _record(
+        self,
+        task_id: UUID,
+        status: str,
+        started: float,
+        generated: GeneratedMenu | None,
+        error: str | None = None,
+    ) -> None:
+        duration = perf_counter() - started
+        self._metrics.tasks.labels(status).inc()
+        self._metrics.duration.observe(duration)
+        fields: dict[str, object] = {
+            "task_id": str(task_id),
+            "status": status,
+            "duration_seconds": round(duration, 3),
+        }
+        if generated is not None:
+            fields.update(
+                recipes=len(generated.menu.recipes),
+                prompt_eval_count=generated.prompt_eval_count,
+                eval_count=generated.eval_count,
+            )
+        if error is not None:
+            fields["error"] = error
+        log = logger.info if status == "done" else logger.warning
+        log(f"generation_task_{status}", **fields)

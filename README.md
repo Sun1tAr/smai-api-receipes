@@ -1,10 +1,10 @@
 # smai-api-receipes
 
 MS-4 — сервис рецептов SmartMeal: ядро домена рецептов и генерация меню через
-Ollama. Сейчас готова только инфраструктура (**SMAI-58**): каркас приложения,
-подключение к PostgreSQL, миграции, health, метрики, трейсы и логи, Docker/Compose
-и CI. Доменный код (модели, таблицы, воркер генерации, клиент Ollama) и
-бизнес-эндпоинты API-1/API-2 появятся в задачах SMAI-57 и SMAI-55.
+Ollama. Инфраструктура (**SMAI-58**): каркас приложения, подключение к PostgreSQL,
+миграции, health, метрики, трейсы и логи, Docker/Compose и CI. Домен (SMAI-57),
+шаблон промпта (SMAI-56), воркер генерации и клиент Ollama (SMAI-54) готовы;
+эндпоинты API-1/API-2 появятся в SMAI-55.
 
 ## Эндпоинты
 
@@ -69,18 +69,16 @@ Compose-сети. При старте контейнер выполняет `ale
 | `LOG_LEVEL` | DEBUG / INFO / WARNING / ERROR | `INFO` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Базовый адрес OTLP HTTP, например `http://collector:4318` | Экспорт отключён |
 | `OLLAMA_BASE_URL` | Адрес Ollama (http/https) | Обязательна |
-| `OLLAMA_MODEL` | Модель | `qwen2.5:7b-instruct-q4_K_M` |
+| `OLLAMA_MODEL` | Модель (тег должен быть загружен в Ollama) | `qwen2.5:7b` |
 | `OLLAMA_CONNECT_TIMEOUT_SECONDS` | Таймаут соединения, (0, 60] | `5` |
 | `OLLAMA_TIMEOUT_SECONDS` | Таймаут ответа, (0, 3600] | `300` |
-| `OLLAMA_NUM_CTX` | Размер контекста, токенов | `32768` |
-| `OLLAMA_NUM_PREDICT` | Максимум токенов ответа | `4096` |
+| `OLLAMA_NUM_CTX` | Размер контекста, токенов; не меньше `OLLAMA_NUM_PREDICT + 1024`, иначе сервис не стартует | `8192` |
+| `OLLAMA_NUM_PREDICT` | Максимум токенов ответа (≈13 блюд; при большем числе ответ обрежется) | `4096` |
 | `OLLAMA_TEMPERATURE` | Температура, [0, 2] | `0.3` |
 | `OLLAMA_KEEP_ALIVE` | Сколько держать модель в памяти | `30m` |
 | `GENERATION_WORKER_ENABLED` | Включить фоновый воркер генерации | `true` |
 | `GENERATION_WORKER_INTERVAL_SECONDS` | Интервал опроса очереди, (0, 3600] | `2` |
-| `GENERATION_PENDING_TTL_SECONDS` | Время жизни ожидающей задачи, [1, 86400] | `900` |
-| `GENERATION_MAX_PENDING` | Лимит ожидающих задач | Не задан — без лимита |
-| `GENERATION_BAD_RESPONSE_RETRIES` | Повторы при некорректном ответе модели, [0, 10] | `1` |
+| `GENERATION_BAD_RESPONSE_RETRIES` | Повторы при невалидном ответе модели (таймаут, обрезка и недоступность не повторяются), [0, 10] | `1` |
 | `RECEIPES_HTTP_PORT` | Хостовой порт Compose (только Compose) | `8001` |
 
 Пустые и состоящие из пробелов `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`
@@ -89,12 +87,64 @@ Compose-сети. При старте контейнер выполняет `ale
 сервис пишет в лог только имена полей и типы ошибок (`invalid_configuration`)
 и завершается с кодом 1.
 
-Воркер и клиент Ollama пока не реализованы: переменные `OLLAMA_*` и
-`GENERATION_*` только валидируются и пробрасываются в контейнер.
+Переменные `GENERATION_PENDING_TTL_SECONDS` и `GENERATION_MAX_PENDING` удалены;
+если они остались в окружении, сервис их игнорирует.
 Compose требует `DB_NAME`, `DB_USER`, `DB_PASSWORD` и `OLLAMA_BASE_URL`
 (без них `docker compose` не запускается); `DB_HOST` и `DB_PORT` внутри Compose
 закреплены (`postgres:5432`). `.env` не попадает в Git и в образ; конфигурацию
 stage/prod задаёт DevOps через окружение.
+
+## Фоновая генерация меню
+
+Воркер — один asyncio-таск внутри процесса сервиса
+(`GENERATION_WORKER_ENABLED=true`). Он берёт `pending`-задачи по одной, самую
+старую первой (`FOR UPDATE SKIP LOCKED`), собирает промпт из активного шаблона
+(`prompt_template`), делает **один** запрос к Ollama «не менее 3 блюд» и в одной
+транзакции сохраняет меню и ставит `done`. Любая ошибка после захвата — `failed`
+с коротким текстом в `error`:
+
+| Текст ошибки | Причина |
+| --- | --- |
+| `Neurocore unavailable` | Ollama недоступна: нет соединения, обрыв, ответ 503 |
+| `Neurocore timeout` | ответ не пришёл за `OLLAMA_TIMEOUT_SECONDS` |
+| `Neurocore model not found` | Ollama ответила 404: модель не загружена |
+| `Neurocore error` | Ollama ответила 400, 500 или иным кодом |
+| `Invalid neurocore response` | не JSON, не по схеме или нарушены проверки (меньше 3 блюд, дубли, пустые строки, «200 г муки» в названии ингредиента); один повтор |
+| `Neurocore response truncated` | ответ оборван лимитом `OLLAMA_NUM_PREDICT` (`done_reason=length`) |
+| `Service restarted` | процесс остановился во время генерации; при старте такие задачи закрываются |
+| `Menu generation failed` | прочий сбой (нет шаблона, ошибка записи); подробности только в логе |
+
+Число блюд не фиксировано: промпт просит не менее 3, `format` дословно по API-3
+(`minItems: 3`, без максимума). Поле `photo` из ответа модели игнорируется
+(всегда `NULL`).
+
+**Условия эксплуатации.** Одна реплика и один процесс (образ запускается
+`python -m receipes`, флаг `--workers` не добавлять); старый и новый контейнер
+не должны работать одновременно (деплой stop-first): старт нового контейнера
+закрывает все `in_progress` как `Service restarted`. Очередь не ограничена и не
+имеет TTL.
+
+**Время.** Худший случай одной задачи — `(1 + GENERATION_BAD_RESPONSE_RETRIES) ×
+OLLAMA_TIMEOUT_SECONDS` (по умолчанию 600 с), всё это время очередь стоит. В норме
+генерация идёт секунды (≈63 токена/с, когда модель целиком в видеопамяти). На
+процессоре ответ до лимита токенов не уложится в таймаут: это сигнал проверить
+GPU у Ollama, а не повод менять код. При смене `OLLAMA_TIMEOUT_SECONDS` или числа
+повторов пересчитайте ожидания клиентов.
+
+**Контекст.** Запросу нужно `токены промпта (~820 измерено) + OLLAMA_NUM_PREDICT`
+(≈4,9 тыс. токенов), поэтому по умолчанию `OLLAMA_NUM_CTX=8192`: модель
+занимает 6 ГБ и целиком помещается в видеопамять, при 32768 — 9,4 ГБ, не
+помещается и работает в 2,6 раза медленнее. Правило старта: `OLLAMA_NUM_PREDICT + 1024
+≤ OLLAMA_NUM_CTX` (1024 — запас на промпт: ~820 измерено плюс ~200 на рост
+шаблона). Если фактический промпт (`prompt_eval_count`) не оставляет места под
+ответ, в лог пишется предупреждение `ollama_context_tight`.
+
+**Логи и метрики.** События `generation_task_claimed|done|failed` несут
+`task_id`, длительность, число рецептов и `prompt_eval_count`/`eval_count`;
+промпт, ответ модели и параметры в лог не попадают. `/metrics`:
+`menu_generation_tasks_total{status}`, `menu_generation_duration_seconds`,
+`ollama_request_duration_seconds`, `ollama_requests_total{outcome}`,
+`menu_generation_rejected_total{reason}`.
 
 ## Проверки
 
@@ -123,8 +173,11 @@ docker compose -p receipes-tests -f docker-compose.test.yml down
 
 ```text
 src/receipes/       приложение: config, database, main (create_app), health,
-                    errors, observability, migration_diagnostics, __main__ (запуск uvicorn)
-migrations/         Alembic (async env.py), ревизий пока нет
+                    errors, observability, migration_diagnostics, __main__ (запуск uvicorn);
+                    domain/ (статусы, проверка ответа модели), db/ (модели, репозитории),
+                    generation/ (промпт, клиент Ollama, воркер, метрики)
+migrations/         Alembic (async env.py): 0001_domain, 0002_seed_prompt_template;
+                    таблица версий alembic_version_receipes
 docker/             entrypoint.sh: alembic upgrade head, затем запуск сервера
 tests/unit/         unit-тесты (без БД)
 tests/integration/  интеграционные тесты (нужна PostgreSQL, TEST_DB_HOST)
