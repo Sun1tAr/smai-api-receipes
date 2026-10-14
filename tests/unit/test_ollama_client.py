@@ -257,3 +257,38 @@ async def test_cancelled_call_is_not_counted_as_an_error() -> None:
     ):
         assert outcome(registry, name) == 0
     assert registry.get_sample_value("ollama_request_duration_seconds_count") == 0
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [(httpx.Response(200, json={"models": []}), True), (httpx.Response(503), False)],
+)
+async def test_availability_probe_uses_tags_endpoint(
+    result: httpx.Response, expected: bool
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return result
+
+    client, registry = make_client(handler)
+    assert await client.is_available() is expected
+    assert (seen[0].method, seen[0].url.path) == ("GET", "/api/tags")
+    # Проба не считается запросом генерации.
+    assert registry.get_sample_value("ollama_request_duration_seconds_count") == 0
+
+
+async def test_availability_probe_survives_connection_errors_and_hangs() -> None:
+    def refused(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    client, _ = make_client(refused)
+    assert await client.is_available() is False
+
+    async def hang(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5)
+        return ok(request)
+
+    slow, _ = make_client(hang, ollama_connect_timeout_seconds=0.05)
+    assert await slow.is_available() is False

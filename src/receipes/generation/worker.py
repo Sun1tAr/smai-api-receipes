@@ -17,16 +17,22 @@ from receipes.domain.errors import (
     SERVICE_RESTARTED,
     GenerationError,
     InvalidNeurocoreResponse,
+    NeurocoreTimeout,
+    NeurocoreUnavailable,
     PromptTemplateError,
     TaskStateConflict,
 )
 from receipes.generation.metrics import GenerationMetrics
 from receipes.generation.ollama import GeneratedMenu, OllamaClient
-from receipes.generation.prompt import render_prompt
+from receipes.generation.prompt import render_prompt, validate_template
 
 logger = structlog.get_logger()
 
 Sleep = Callable[[float], Awaitable[None]]
+
+# Пауза после падения Ollama растёт 5 -> 10 -> 20 -> 40 -> 60 с, пока она не вернётся.
+OLLAMA_BACKOFF_START_SECONDS = 5.0
+OLLAMA_BACKOFF_MAX_SECONDS = 60.0
 
 
 # Воркер генерации: берёт pending-задачи по одной (Ollama однопоточна), вызывает
@@ -46,6 +52,9 @@ class GenerationWorker:
         self._settings = settings
         self._metrics = metrics
         self._sleep = sleep
+        self._ollama_down = False
+        self._backoff = 0.0
+        self._template_problem: str | None = None
 
     # Задачи, оставшиеся in_progress после гибели процесса, закрываем как failed.
     # Повторяем, пока БД не ответит: брать новые задачи до этого нельзя.
@@ -74,10 +83,54 @@ class GenerationWorker:
                 processed = False
             # Пустая итерация ничего не пишет в лог: иначе шум каждые N секунд.
             if not processed:
-                await self._sleep(self._settings.generation_worker_interval_seconds)
+                await self._sleep(self._idle_delay())
+
+    # Пока Ollama недоступна, ждём по нарастающей паузе, иначе обычный интервал.
+    def _idle_delay(self) -> float:
+        if self._ollama_down:
+            return self._backoff
+        return self._settings.generation_worker_interval_seconds
+
+    def _ollama_failed(self) -> None:
+        self._backoff = (
+            min(self._backoff * 2, OLLAMA_BACKOFF_MAX_SECONDS)
+            if self._ollama_down
+            else OLLAMA_BACKOFF_START_SECONDS
+        )
+        self._ollama_down = True
+
+    def _ollama_recovered(self) -> None:
+        self._ollama_down = False
+        self._backoff = 0.0
+
+    # Задачу нельзя брать, пока нечем её обработать: без годного шаблона она бы
+    # сгорела в failed. Причина пишется в лог один раз, пока она не изменится.
+    async def _template_usable(self) -> bool:
+        async with self._sessions() as session:
+            template = await PromptTemplateRepository(session).get_active()
+        problem: str | None = None
+        if template is None:
+            problem = "missing"
+        else:
+            try:
+                validate_template(template.template)
+            except PromptTemplateError:
+                problem = "invalid"
+        if problem != self._template_problem:
+            self._template_problem = problem
+            if problem is not None:
+                logger.error("prompt_template_unusable", reason=problem)
+        return problem is None
 
     # Одна итерация: True, если задача была взята (даже закончившаяся ошибкой).
     async def process_one(self) -> bool:
+        if not await self._template_usable():
+            return False
+        if self._ollama_down:
+            if not await self._ollama.is_available():
+                self._ollama_failed()
+                return False
+            self._ollama_recovered()
         async with self._sessions() as session, session.begin():
             task_id = await TaskRepository(session).claim_next()
         if task_id is None:
@@ -93,11 +146,14 @@ class GenerationWorker:
             logger.warning("generation_task_conflict", task_id=str(task_id))
             return True
         except GenerationError as error:
+            if isinstance(error, NeurocoreUnavailable | NeurocoreTimeout):
+                self._ollama_failed()
             await self._fail(task_id, error.message, started, generated, error)
         except Exception:
             logger.error("generation_task_error", task_id=str(task_id), exc_info=True)
             await self._fail(task_id, GENERATION_FAILED, started, generated)
         else:
+            self._ollama_recovered()
             self._record(task_id, "done", started, generated)
         return True
 

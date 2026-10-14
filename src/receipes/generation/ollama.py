@@ -209,5 +209,14 @@ class OllamaClient:
             raise InvalidNeurocoreResponse("schema") from None
         return parse_menu(data)
 
+    # Лёгкая проба перед взятием задачи: GET /api/tags (список моделей, без генерации).
+    async def is_available(self) -> bool:
+        try:
+            async with asyncio.timeout(self._settings.ollama_connect_timeout_seconds):
+                response = await self._http.get("/api/tags")
+        except (TimeoutError, httpx.HTTPError):
+            return False
+        return response.status_code == 200
+
     async def aclose(self) -> None:
         await self._http.aclose()
