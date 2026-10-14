@@ -28,8 +28,8 @@ Number = Annotated[
 
 
 class GenerateMenuRequest(BaseModel):
+    # Только camelCase из контракта: snake_case (`people_count`) не принимается.
     model_config = ConfigDict(
-        populate_by_name=True,
         json_schema_extra={"example": {"peopleCount": 4, "weeklyBudget": 5000}},
     )
 
