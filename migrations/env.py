@@ -8,13 +8,16 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from receipes.config import Settings
 from receipes.database import Base, create_migration_engine
+from receipes.db import models  # noqa: F401
 from receipes.migration_diagnostics import describe_migration_error
 from receipes.observability import configure_logging
 
 settings = Settings()
 configure_logging(settings.log_level)
-# Доменные модели появятся позже; их модуль нужно импортировать здесь.
+# Импорт моделей регистрирует таблицы домена в Base.metadata (для autogenerate).
 target_metadata = Base.metadata
+# Своя таблица версий: общий Postgres на stage не пересекается с другими сервисами.
+VERSION_TABLE = "alembic_version_receipes"
 # Ревизии для диагностики падения: с какой начали и какая применена последней.
 progress: dict[str, str | None] = {"from_revision": None, "last_applied": None}
 
@@ -27,6 +30,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        version_table=VERSION_TABLE,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -41,6 +45,7 @@ def migrate(connection: Connection) -> None:
         connection=connection,
         target_metadata=target_metadata,
         compare_type=True,
+        version_table=VERSION_TABLE,
         on_version_apply=record_applied,
     )
     progress["from_revision"] = context.get_context().get_current_revision()

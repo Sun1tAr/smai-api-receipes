@@ -9,6 +9,7 @@ import pytest
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(not os.getenv("TEST_DB_HOST"), reason="TEST_DB_HOST is not set"),
+    pytest.mark.usefixtures("empty_schema"),
 ]
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -30,7 +31,13 @@ def downgrade() -> None:
 
 # Временная ветка миграций с настоящим env.py проекта и одной ревизией.
 def run_alembic(tmp_path: Path, env: dict[str, str], statement: str):
-    shutil.copytree(ROOT / "migrations", tmp_path / "migrations")
+    # Реальные ревизии домена в копию не берём: временная ревизия идёт отдельной веткой.
+    shutil.copytree(
+        ROOT / "migrations",
+        tmp_path / "migrations",
+        ignore=shutil.ignore_patterns("versions"),
+    )
+    (tmp_path / "migrations" / "versions").mkdir()
     (tmp_path / "migrations" / "versions" / "tmp0001.py").write_text(
         REVISION.format(statement=statement)
     )

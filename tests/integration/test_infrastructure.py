@@ -112,3 +112,42 @@ async def test_http_and_database_traces_correlate_with_json_logs(
         assert request_log["level"] == "info"
         assert request_log["timestamp"]
         assert settings.db_password.get_secret_value() not in output
+
+
+async def test_domain_migration_uses_its_own_version_table_and_downgrades_cleanly(
+    settings: Settings, alembic_env: dict[str, str]
+) -> None:
+    from receipes.database import create_engine
+
+    def alembic(*arguments: str) -> None:
+        result = subprocess.run(
+            ["alembic", *arguments], env=alembic_env, capture_output=True, text=True
+        )
+        assert result.returncode == 0, result.stderr
+
+    engine = create_engine(settings)
+    try:
+        alembic("upgrade", "head")
+        async with engine.connect() as connection:
+            version = await connection.scalar(
+                text("SELECT version_num FROM alembic_version_receipes")
+            )
+            tables = set(
+                await connection.scalars(
+                    text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+                )
+            )
+        assert version == "0001_domain"
+        assert "alembic_version" not in tables
+        assert {"generation_task", "menu", "recipe", "instruction"} <= tables
+        alembic("downgrade", "base")
+        async with engine.connect() as connection:
+            tables = set(
+                await connection.scalars(
+                    text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+                )
+            )
+        assert tables == {"alembic_version_receipes"}
+    finally:
+        alembic("upgrade", "head")
+        await engine.dispose()
