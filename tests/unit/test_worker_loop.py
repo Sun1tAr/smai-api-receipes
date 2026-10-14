@@ -225,3 +225,32 @@ async def test_recovery_retries_until_the_database_answers(
     assert factory.attempts == 3
     assert sleeps == [7, 7]
     assert calls == ["Service restarted"]
+
+
+async def test_standby_waits_ten_seconds_between_lock_attempts_not_the_interval() -> (
+    None
+):
+    sleeps: list[float] = []
+    attempts = 0
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 3:
+            raise StopLoop
+
+    worker = make_worker(sleep)
+
+    async def busy() -> bool:
+        nonlocal attempts
+        attempts += 1
+        return False
+
+    async def never() -> bool:
+        raise AssertionError("tasks must not be taken without the lock")
+
+    worker._ensure_lock = busy  # type: ignore[method-assign]
+    worker.process_one = never  # type: ignore[method-assign]
+    with pytest.raises(StopLoop):
+        await worker.run()
+    # Интервал опроса в этом тесте 7 с: пауза standby от него не зависит.
+    assert sleeps == [10, 10, 10] and attempts == 3

@@ -292,3 +292,27 @@ async def test_availability_probe_survives_connection_errors_and_hangs() -> None
 
     slow, _ = make_client(hang, ollama_connect_timeout_seconds=0.05)
     assert await slow.is_available() is False
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"models": [{"name": "qwen2.5:7b"}]}, True),
+        ({"models": [{"name": "other:1b"}, {"name": "qwen2.5:7b"}]}, True),
+        ({"models": [{"name": "qwen2.5:7b:latest"}]}, True),
+        ({"models": [{"name": "qwen2.5:7b-instruct-q4_K_M"}]}, False),
+        ({"models": []}, False),
+        ({"unexpected": 1}, False),
+        ({"models": [{"model": "no-name"}]}, False),
+    ],
+)
+async def test_model_presence_is_checked_in_tags(payload: dict, expected: bool) -> None:
+    client, _ = make_client(lambda r: httpx.Response(200, json=payload))
+    assert await client.is_available(require_model=True) is expected
+    # Без require_model годится любой ответ 200.
+    assert await client.is_available() is True
+
+
+async def test_tags_that_are_not_json_do_not_pass_the_model_check() -> None:
+    client, _ = make_client(lambda r: httpx.Response(200, text="<html>"))
+    assert await client.is_available(require_model=True) is False

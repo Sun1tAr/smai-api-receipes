@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from receipes.api.menu import restore_example_nulls
 from receipes.api.menu import router as menu_router
 from receipes.config import Settings
-from receipes.database import create_engine
+from receipes.database import create_engine, create_lock_engine
 from receipes.errors import error_response, register_error_handlers
 from receipes.generation.metrics import GenerationMetrics
 from receipes.generation.ollama import OllamaClient
@@ -108,6 +108,7 @@ def create_app(
     settings = settings or Settings()
     configure_logging(settings.log_level)
     engine = create_engine(settings)
+    lock_engine = create_lock_engine(settings)
     provider = create_tracer_provider(settings)
     # Единый реестр: сюда же позже добавятся доменные метрики. Приватный реестр не
     # содержит метрик процесса по умолчанию, поэтому добавляем их явно.
@@ -124,7 +125,7 @@ def create_app(
     )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     worker = GenerationWorker(
-        session_factory, engine, ollama, settings, generation_metrics
+        session_factory, lock_engine, ollama, settings, generation_metrics
     )
 
     # Владение соединениями и экспортёром ограничено жизненным циклом приложения.
@@ -148,6 +149,7 @@ def create_app(
                 with suppress(asyncio.CancelledError):
                     await worker_task
             await ollama.aclose()
+            await lock_engine.dispose()
             await engine.dispose()
             instrumentor.uninstrument()
             provider.shutdown()

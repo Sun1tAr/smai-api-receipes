@@ -210,13 +210,25 @@ class OllamaClient:
         return parse_menu(data)
 
     # Лёгкая проба перед взятием задачи: GET /api/tags (список моделей, без генерации).
-    async def is_available(self) -> bool:
+    # require_model: после ответа 404 ждём, пока настроенная модель появится в списке
+    # (`models[].name`); ответ 200 без неё Ollama «готовой» не делает.
+    async def is_available(self, *, require_model: bool = False) -> bool:
         try:
             async with asyncio.timeout(self._settings.ollama_connect_timeout_seconds):
                 response = await self._http.get("/api/tags")
         except (TimeoutError, httpx.HTTPError):
             return False
-        return response.status_code == 200
+        if response.status_code != 200:
+            return False
+        if not require_model:
+            return True
+        try:
+            models = response.json()["models"]
+            names = {item["name"] for item in models}
+        except (ValueError, KeyError, TypeError):
+            return False
+        model = self._settings.ollama_model
+        return model in names or f"{model}:latest" in names
 
     async def aclose(self) -> None:
         await self._http.aclose()
