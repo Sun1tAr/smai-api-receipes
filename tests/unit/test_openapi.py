@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import jsonschema
 import pytest
@@ -33,7 +35,11 @@ async def test_health_is_fully_documented_and_metrics_is_hidden(app) -> None:
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         document = (await client.get("/openapi.json")).json()
-    assert set(document["paths"]) == {"/health"}
+    assert set(document["paths"]) == {
+        "/health",
+        "/generate-menu",
+        "/generate-menu/{task_id}",
+    }
     operation = document["paths"]["/health"]["get"]
     assert operation["summary"]
     assert operation["description"]
@@ -52,3 +58,69 @@ async def test_health_is_fully_documented_and_metrics_is_hidden(app) -> None:
     jsonschema.validate(
         error["example"], {**error_schema, "components": {"schemas": schemas}}
     )
+
+
+# Для каждого эндпоинта: summary, description, коды ответов и примеры по схемам.
+EXPECTED_CODES = {
+    ("/health", "get"): {"200", "503"},
+    ("/generate-menu", "post"): {"202", "400", "500"},
+    ("/generate-menu/{task_id}", "get"): {"200", "404", "500"},
+}
+
+
+async def test_every_operation_is_documented_with_exact_error_codes(app) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        document = (await client.get("/openapi.json")).json()
+    schemas = document["components"]["schemas"]
+    assert "422" not in json.dumps(document)
+    operations = {
+        (path, method): operation
+        for path, item in document["paths"].items()
+        for method, operation in item.items()
+    }
+    assert set(operations) == set(EXPECTED_CODES)
+    for key, operation in operations.items():
+        assert operation["summary"] and operation["description"], key
+        assert set(operation["responses"]) == EXPECTED_CODES[key], key
+        for code, response in operation["responses"].items():
+            assert response["description"], (key, code)
+            if code.startswith(("4", "5")):
+                content = response["content"]["application/json"]
+                assert content["schema"]["$ref"].endswith("/ErrorResponse")
+                example = content["example"]
+                jsonschema.validate(
+                    example,
+                    {**schemas["ErrorResponse"], "components": {"schemas": schemas}},
+                )
+
+
+async def test_request_example_and_fields_are_documented(app) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        document = (await client.get("/openapi.json")).json()
+    schema = document["components"]["schemas"]["GenerateMenuRequest"]
+    jsonschema.validate(schema["example"], schema)
+    assert set(schema["properties"]) == {"peopleCount", "weeklyBudget"}
+    assert all(item["description"] for item in schema["properties"].values())
+    operation = document["paths"]["/generate-menu"]["post"]
+    assert "habits" in operation["description"]
+    assert "игнорируются" in operation["description"]
+    result = document["paths"]["/generate-menu/{task_id}"]["get"]["description"]
+    assert "10 минут" in result and "порядок" in result
+    error = document["components"]["schemas"]["TaskResultResponse"]["properties"][
+        "error"
+    ]["description"]
+    for text in (
+        "Neurocore unavailable",
+        "Neurocore timeout",
+        "Neurocore model not found",
+        "Neurocore error",
+        "Invalid neurocore response",
+        "Neurocore response truncated",
+        "Service restarted",
+        "Menu generation failed",
+    ):
+        assert text in error
