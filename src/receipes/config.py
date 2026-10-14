@@ -1,6 +1,13 @@
 from typing import Literal
 
-from pydantic import AnyHttpUrl, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    AnyHttpUrl,
+    Field,
+    SecretStr,
+    ValidationInfo,
+    field_validator,
+)
+from pydantic_core import PydanticCustomError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import URL
 
@@ -69,16 +76,25 @@ class Settings(BaseSettings):
             raise ValueError("must not be blank")
         return value
 
-    # Ответ модели должен помещаться в контекст вместе с промптом.
-    @model_validator(mode="after")
-    def check_context_fits_output(self) -> "Settings":
-        if self.ollama_num_predict + CONTEXT_RESERVE_TOKENS > self.ollama_num_ctx:
-            raise ValueError(
-                f"OLLAMA_NUM_PREDICT + {CONTEXT_RESERVE_TOKENS} must not exceed "
-                f"OLLAMA_NUM_CTX (got {self.ollama_num_predict} and "
-                f"{self.ollama_num_ctx})"
+    # Ответ модели должен помещаться в контекст вместе с промптом. Проверка на поле
+    # num_predict (оно объявлено после num_ctx): так в лог invalid_configuration
+    # попадают имя поля и понятный тип ошибки.
+    @field_validator("ollama_num_predict", mode="after")
+    @classmethod
+    def check_output_fits_context(cls, value: int, info: ValidationInfo) -> int:
+        num_ctx = info.data.get("ollama_num_ctx")
+        if num_ctx is not None and value + CONTEXT_RESERVE_TOKENS > num_ctx:
+            raise PydanticCustomError(
+                "num_predict_exceeds_context",
+                "OLLAMA_NUM_PREDICT + {reserve} must not exceed OLLAMA_NUM_CTX "
+                "(got {num_predict} and {num_ctx})",
+                {
+                    "reserve": CONTEXT_RESERVE_TOKENS,
+                    "num_predict": value,
+                    "num_ctx": num_ctx,
+                },
             )
-        return self
+        return value
 
     # Учётные данные в URL попали бы в логи, трейсы и сообщения об ошибках.
     @field_validator("ollama_base_url", "otel_exporter_otlp_endpoint", mode="after")
