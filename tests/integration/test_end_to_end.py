@@ -163,3 +163,70 @@ async def test_worker_started_with_the_app_serves_a_posted_task(
             else:
                 raise AssertionError(f"task did not finish: {body}")
     assert len(body["menu"]["recipes"]) == 3
+
+
+async def create_tasks(client: httpx.AsyncClient, count: int) -> list[str]:
+    ids = []
+    for _ in range(count):
+        created = await client.post(
+            "/generate-menu", json={"peopleCount": 2, "weeklyBudget": 700}
+        )
+        ids.append(created.json()["task_id"])
+    return ids
+
+
+async def statuses(client: httpx.AsyncClient, ids: list[str]) -> list[str]:
+    return [
+        (await client.get(f"/generate-menu/{item}")).json()["status"] for item in ids
+    ]
+
+
+async def test_ollama_503_does_not_burn_the_rest_of_the_queue(
+    settings: Settings, session_factory: Factory
+) -> None:
+    from receipes.main import create_app
+
+    async with session_factory() as session, session.begin():
+        session.add(PromptTemplate(template="{people_count} {weekly_budget}"))
+    app = create_app(
+        settings, ollama_transport=httpx.MockTransport(lambda r: httpx.Response(503))
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            ids = await create_tasks(client, 5)
+            for _ in range(5):
+                await app.state.worker.process_one()
+            assert await statuses(client, ids) == ["failed"] + ["pending"] * 4
+            failed = (await client.get(f"/generate-menu/{ids[0]}")).json()
+    assert failed["error"] == "Neurocore unavailable"
+
+
+async def test_broken_template_keeps_every_task_pending_through_the_api(
+    settings: Settings, session_factory: Factory
+) -> None:
+    from receipes.main import create_app
+
+    async with session_factory() as session, session.begin():
+        session.add(PromptTemplate(template="шаблон без плейсхолдеров"))
+    app = create_app(
+        settings,
+        ollama_transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json=ollama_reply(sample_menu()))
+        ),
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            ids = await create_tasks(client, 3)
+            for _ in range(3):
+                assert await app.state.worker.process_one() is False
+            assert await statuses(client, ids) == ["pending"] * 3
+            # Шаблон исправлен новой записью: очередь разбирается без потерь.
+            async with session_factory() as session, session.begin():
+                session.add(PromptTemplate(template="{people_count} {weekly_budget}"))
+            for _ in range(3):
+                assert await app.state.worker.process_one() is True
+            assert await statuses(client, ids) == ["done"] * 3
