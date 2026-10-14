@@ -24,6 +24,8 @@ from receipes.domain.errors import (
     SERVICE_RESTARTED,
     GenerationError,
     InvalidNeurocoreResponse,
+    NeurocoreError,
+    NeurocoreModelNotFound,
     NeurocoreTimeout,
     NeurocoreUnavailable,
     PromptTemplateError,
@@ -42,6 +44,14 @@ ADVISORY_LOCK_KEY = 7_460_520_004
 
 # Пауза после сбоя итерации (обычно БД): 1 -> 2 -> 4 -> ... -> 30 с, сброс при успехе.
 ITERATION_BACKOFF_MAX_SECONDS = 30.0
+
+# Ошибки стороны Ollama: после них очередь не разбирается, пока Ollama не вернётся.
+OLLAMA_SIDE_ERRORS = (
+    NeurocoreUnavailable,
+    NeurocoreTimeout,
+    NeurocoreModelNotFound,
+    NeurocoreError,
+)
 
 # Пауза после падения Ollama растёт 5 -> 10 -> 20 -> 40 -> 60 с, пока она не вернётся.
 OLLAMA_BACKOFF_START_SECONDS = 5.0
@@ -70,6 +80,8 @@ class GenerationWorker:
         self._metrics = metrics
         self._sleep = sleep
         self._ollama_down = False
+        # После 404 пробой служит наличие модели в /api/tags, а не просто ответ 200.
+        self._model_missing = False
         self._backoff = 0.0
         self._iteration_failures = 0
         self._template_problem: str | None = None
@@ -182,7 +194,9 @@ class GenerationWorker:
             return self._backoff
         return self._settings.generation_worker_interval_seconds
 
-    def _ollama_failed(self) -> None:
+    def _ollama_failed(self, *, model_missing: bool | None = None) -> None:
+        if model_missing is not None:
+            self._model_missing = model_missing
         self._backoff = (
             min(self._backoff * 2, OLLAMA_BACKOFF_MAX_SECONDS)
             if self._ollama_down
@@ -192,6 +206,7 @@ class GenerationWorker:
 
     def _ollama_recovered(self) -> None:
         self._ollama_down = False
+        self._model_missing = False
         self._backoff = 0.0
 
     # Задачу нельзя брать, пока нечем её обработать: без годного шаблона она бы
@@ -218,7 +233,8 @@ class GenerationWorker:
         if not await self._template_usable():
             return False
         if self._ollama_down:
-            if not await self._ollama.is_available():
+            ready = await self._ollama.is_available(require_model=self._model_missing)
+            if not ready:
                 self._ollama_failed()
                 return False
             self._ollama_recovered()
@@ -237,9 +253,14 @@ class GenerationWorker:
             logger.warning("generation_task_conflict", task_id=str(task_id))
             return True
         except GenerationError as error:
-            if isinstance(error, NeurocoreUnavailable | NeurocoreTimeout):
-                self._ollama_failed()
             await self._fail(task_id, error.message, started, generated, error)
+            if isinstance(error, OLLAMA_SIDE_ERRORS):
+                # Упавшая задача остаётся failed (LE-6), остальные ждут в pending.
+                # False: следующая итерация начнётся с паузы, а не сразу с пробы.
+                self._ollama_failed(
+                    model_missing=isinstance(error, NeurocoreModelNotFound)
+                )
+                return False
         except Exception:
             logger.error("generation_task_error", task_id=str(task_id), exc_info=True)
             await self._fail(task_id, GENERATION_FAILED, started, generated)

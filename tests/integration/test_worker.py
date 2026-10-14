@@ -41,7 +41,13 @@ TEMPLATE = "Меню для {people_count} человек, бюджет {weekly_
 
 
 class Rig:
-    def __init__(self, factory: Factory, settings: Settings, handler: Handler) -> None:
+    def __init__(
+        self,
+        factory: Factory,
+        settings: Settings,
+        handler: Handler,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
         self.factory = factory
         self.requests: list[dict[str, Any]] = []
 
@@ -56,7 +62,7 @@ class Rig:
         http = OllamaClient.build_http_client(settings, httpx.MockTransport(recording))
         client = OllamaClient(settings, http, metrics, NoOpTracer())
         self.worker = GenerationWorker(
-            factory, factory.kw["bind"], client, settings, metrics
+            factory, factory.kw["bind"], client, settings, metrics, sleep=sleep
         )
 
     def sample(self, name: str, **labels: str) -> float:
@@ -93,8 +99,14 @@ async def ready(session_factory: Factory) -> Factory:
     return session_factory
 
 
-def rig(factory: Factory, settings: Settings, handler: Handler = good, **extra: Any):
-    return Rig(factory, settings.model_copy(update=extra), handler)
+def rig(
+    factory: Factory,
+    settings: Settings,
+    handler: Handler = good,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    **extra: Any,
+):
+    return Rig(factory, settings.model_copy(update=extra), handler, sleep)
 
 
 async def test_no_pending_task_means_nothing_to_do(
@@ -329,6 +341,112 @@ async def test_recipe_count_rules(
         assert harness.sample("menu_generation_rejected_total", reason="count") == 2
 
 
+def tags(*names: str) -> httpx.Response:
+    return httpx.Response(200, json={"models": [{"name": name} for name in names]})
+
+
+async def test_model_not_found_waits_until_the_model_is_listed(
+    ready: Factory, settings: Settings
+) -> None:
+    task_ids = [await add_task(ready) for _ in range(3)]
+    loaded: dict[str, tuple[str, ...]] = {"models": ("other:model",)}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return tags(*loaded["models"])
+        if loaded["models"] == ("qwen2.5:7b",):
+            return good(request)
+        return httpx.Response(404, json={"error": "model not found"})
+
+    harness = rig(ready, settings, handler)
+    worker = harness.worker
+    assert await worker.process_one() is False
+    first = await harness.task(task_ids[0])
+    assert (first.status, first.error) == (
+        TaskStatus.FAILED,
+        "Neurocore model not found",
+    )
+    assert worker._idle_delay() == 5
+    # Ollama отвечает 200, но нужной модели в списке нет: задачи не берутся.
+    for expected in (10, 20, 40):
+        assert await worker.process_one() is False
+        assert worker._idle_delay() == expected
+    for task_id in task_ids[1:]:
+        assert (await harness.task(task_id)).status == TaskStatus.PENDING
+    # Только когда модель появилась в списке, очередь разбирается дальше.
+    loaded["models"] = ("qwen2.5:7b",)
+    assert await worker.process_one() is True
+    assert (await harness.task(task_ids[1])).status == TaskStatus.DONE
+    assert worker._idle_delay() == settings.generation_worker_interval_seconds
+
+
+async def test_model_with_latest_suffix_counts_as_listed(
+    ready: Factory, settings: Settings
+) -> None:
+    await add_task(ready)
+    await add_task(ready)
+    answers = {"generate": httpx.Response(404, json={"error": "x"})}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return tags("qwen2.5:7b:latest")
+        return answers["generate"]
+
+    harness = rig(ready, settings, handler)
+    await harness.worker.process_one()
+    answers["generate"] = good(None)
+    assert await harness.worker.process_one() is True
+
+
+async def test_server_error_500_backs_off_and_keeps_the_queue(
+    ready: Factory, settings: Settings
+) -> None:
+    task_ids = [await add_task(ready) for _ in range(3)]
+    state = {"tags": 503, "generate_ok": False}
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/api/tags":
+            return httpx.Response(state["tags"], json={"models": []})
+        if state["generate_ok"]:
+            return good(request)
+        return httpx.Response(500, text="boom")
+
+    harness = rig(ready, settings, handler)
+    worker = harness.worker
+    assert await worker.process_one() is False
+    first = await harness.task(task_ids[0])
+    assert (first.status, first.error) == (TaskStatus.FAILED, "Neurocore error")
+    assert worker._idle_delay() == 5
+    assert await worker.process_one() is False
+    assert worker._idle_delay() == 10
+    # Для 500 достаточно, что Ollama отвечает (список моделей не проверяется).
+    state["tags"] = 200
+    state["generate_ok"] = True
+    assert await worker.process_one() is True
+    assert paths == ["/api/generate", "/api/tags", "/api/tags", "/api/generate"]
+    assert (await harness.task(task_ids[2])).status == TaskStatus.PENDING
+
+
+async def test_the_first_pause_after_a_failure_is_five_seconds(
+    ready: Factory, settings: Settings
+) -> None:
+    for _ in range(3):
+        await add_task(ready)
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 6:
+            raise asyncio.CancelledError
+
+    harness = rig(ready, settings, lambda request: httpx.Response(503), sleep=sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await harness.worker.run()
+    assert sleeps == [5, 10, 20, 40, 60, 60]
+
+
 async def test_missing_template_leaves_tasks_pending_and_logs_once(
     session_factory: Factory, settings: Settings, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -376,8 +494,9 @@ async def test_ollama_down_does_not_burn_the_queue(
         return httpx.Response(503)
 
     harness = rig(ready, settings, handler)
-    # Первая задача падает с unavailable, остальные не трогаются.
-    assert await harness.worker.process_one() is True
+    # Первая задача падает с unavailable, остальные не трогаются. False: следующая
+    # итерация начинается с паузы, а не сразу с пробы.
+    assert await harness.worker.process_one() is False
     assert (await harness.task(task_ids[0])).error == "Neurocore unavailable"
     for _ in range(3):
         assert await harness.worker.process_one() is False
@@ -402,7 +521,7 @@ async def test_backoff_grows_to_the_cap_and_resets_after_recovery(
     harness = rig(ready, settings, handler)
     worker = harness.worker
     delays = []
-    assert await worker.process_one() is True
+    assert await worker.process_one() is False
     delays.append(worker._idle_delay())
     for _ in range(6):
         assert await worker.process_one() is False
@@ -410,6 +529,7 @@ async def test_backoff_grows_to_the_cap_and_resets_after_recovery(
     assert delays == [5, 10, 20, 40, 60, 60, 60]
     online["up"] = True
     assert await worker.process_one() is True
+    assert not worker._ollama_down
     assert worker._idle_delay() == settings.generation_worker_interval_seconds
     assert harness.sample("menu_generation_tasks_total", status="done") == 1
 
