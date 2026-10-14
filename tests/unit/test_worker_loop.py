@@ -80,14 +80,16 @@ async def test_a_processed_task_is_followed_by_the_next_without_pause() -> None:
     assert sleeps == [7] and next(answers, None) is None
 
 
-async def test_an_exception_in_an_iteration_is_logged_and_the_loop_continues(
+async def test_iteration_failures_back_off_and_log_one_traceback_per_series(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     configure_logging("INFO")
+    sleeps: list[float] = []
     calls = 0
 
     async def sleep(seconds: float) -> None:
-        if calls >= 2:
+        sleeps.append(seconds)
+        if len(sleeps) == 9:
             raise StopLoop
 
     worker = make_worker(sleep)
@@ -95,7 +97,7 @@ async def test_an_exception_in_an_iteration_is_logged_and_the_loop_continues(
     async def process() -> bool:
         nonlocal calls
         calls += 1
-        if calls == 1:
+        if calls <= 7:
             raise ConnectionError("database is down")
         return False
 
@@ -103,11 +105,61 @@ async def test_an_exception_in_an_iteration_is_logged_and_the_loop_continues(
     worker.process_one = process  # type: ignore[method-assign]
     with pytest.raises(StopLoop):
         await worker.run()
-    assert calls == 2
-    errors = [
-        item for item in log_lines(capsys.readouterr().out) if item["level"] == "error"
-    ]
-    assert [item["message"] for item in errors] == ["generation_iteration_failed"]
+    # 1, 2, 4, 8, 16, 30 (потолок), 30; затем успех: сброс и обычный интервал 7.
+    assert sleeps == [1, 2, 4, 8, 16, 30, 30, 7, 7]
+    entries = log_lines(capsys.readouterr().out)
+    errors = [item for item in entries if item["level"] == "error"]
+    assert len(errors) == 7
+    assert all(item["message"] == "generation_iteration_failed" for item in errors)
+    assert "exception" in errors[0] or "exc_info" in errors[0]
+    assert all("exception" not in item for item in errors[1:])
+    assert errors[-1]["consecutive_failures"] == 7
+    assert errors[-1]["error_type"] == "ConnectionError"
+
+
+async def test_the_failure_series_restarts_after_a_good_iteration() -> None:
+    sleeps: list[float] = []
+    outcomes = iter([ConnectionError, False, ConnectionError, False])
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 4:
+            raise StopLoop
+
+    worker = make_worker(sleep)
+
+    async def process() -> bool:
+        outcome = next(outcomes)
+        if outcome is ConnectionError:
+            raise ConnectionError("down")
+        return outcome
+
+    worker._ensure_lock = held  # type: ignore[method-assign]
+    worker.process_one = process  # type: ignore[method-assign]
+    with pytest.raises(StopLoop):
+        await worker.run()
+    assert sleeps == [1, 7, 1, 7]
+
+
+async def test_waiting_for_ollama_uses_the_backoff_not_the_interval() -> None:
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        raise StopLoop
+
+    worker = make_worker(sleep)
+    worker._ollama_down = True
+    worker._backoff = 20
+
+    async def nothing() -> bool:
+        return False
+
+    worker._ensure_lock = held  # type: ignore[method-assign]
+    worker.process_one = nothing  # type: ignore[method-assign]
+    with pytest.raises(StopLoop):
+        await worker.run()
+    assert sleeps == [20]
 
 
 async def test_cancellation_ends_the_loop() -> None:

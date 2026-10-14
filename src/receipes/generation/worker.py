@@ -40,6 +40,9 @@ Sleep = Callable[[float], Awaitable[None]]
 # Ключ pg_try_advisory_lock (на уровне БД): один активный воркер на базу.
 ADVISORY_LOCK_KEY = 7_460_520_004
 
+# Пауза после сбоя итерации (обычно БД): 1 -> 2 -> 4 -> ... -> 30 с, сброс при успехе.
+ITERATION_BACKOFF_MAX_SECONDS = 30.0
+
 # Пауза после падения Ollama растёт 5 -> 10 -> 20 -> 40 -> 60 с, пока она не вернётся.
 OLLAMA_BACKOFF_START_SECONDS = 5.0
 OLLAMA_BACKOFF_MAX_SECONDS = 60.0
@@ -68,6 +71,7 @@ class GenerationWorker:
         self._sleep = sleep
         self._ollama_down = False
         self._backoff = 0.0
+        self._iteration_failures = 0
         self._template_problem: str | None = None
 
     # Задачи, оставшиеся in_progress после гибели процесса, закрываем как failed.
@@ -144,14 +148,33 @@ class GenerationWorker:
                 try:
                     held = await self._ensure_lock()
                     processed = await self.process_one() if held else False
-                except Exception:
-                    logger.error("generation_iteration_failed", exc_info=True)
-                    processed = False
+                except Exception as error:
+                    self._log_iteration_failure(error)
+                    await self._sleep(self._iteration_delay())
+                    continue
+                self._iteration_failures = 0
                 # Пустая итерация ничего не пишет в лог: иначе шум каждые N секунд.
                 if not processed:
                     await self._sleep(self._idle_delay())
         finally:
             await self._release_lock()
+
+    # Сбой итерации (например, БД недоступна) не должен крутиться раз в интервал:
+    # пауза растёт до 30 с, а полный traceback пишется только при первом сбое серии.
+    def _log_iteration_failure(self, error: Exception) -> None:
+        self._iteration_failures += 1
+        if self._iteration_failures == 1:
+            logger.error("generation_iteration_failed", exc_info=True)
+        else:
+            logger.error(
+                "generation_iteration_failed",
+                error_type=type(error).__name__,
+                consecutive_failures=self._iteration_failures,
+            )
+
+    def _iteration_delay(self) -> float:
+        delay = 2.0 ** (self._iteration_failures - 1)
+        return min(delay, ITERATION_BACKOFF_MAX_SECONDS)
 
     # Пока Ollama недоступна, ждём по нарастающей паузе, иначе обычный интервал.
     def _idle_delay(self) -> float:
