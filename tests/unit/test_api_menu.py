@@ -356,3 +356,21 @@ async def test_snake_case_fields_are_not_accepted(client, store) -> None:
     }
     assert locs == {("body", "peopleCount"), ("body", "weeklyBudget")}
     assert store.created == []
+
+
+@pytest.mark.parametrize("body", ["[" * 100_000, '{"a":' * 50_000])
+async def test_unparsable_deeply_nested_json_is_validation_error(
+    client, store, body: str
+) -> None:
+    response = await client.post(
+        "/generate-menu", content=body, headers={"Content-Type": "application/json"}
+    )
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "code": "VALIDATION_ERROR",
+            "message": "Request validation failed",
+            "details": {"fields": [{"loc": ["body"], "type": "body_invalid"}]},
+        }
+    }
+    assert store.created == []

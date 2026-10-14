@@ -83,6 +83,15 @@ async def validation_error_handler(request: Request, error: Exception) -> JSONRe
 
 async def http_error_handler(request: Request, error: Exception) -> JSONResponse:
     assert isinstance(error, StarletteHTTPException)
+    if error.status_code == 400:
+        # Starlette отвечает 400, когда не может разобрать тело (например, JSON
+        # вложен слишком глубоко): для клиента это та же ошибка валидации.
+        return error_response(
+            400,
+            "VALIDATION_ERROR",
+            "Request validation failed",
+            {"fields": [{"loc": ["body"], "type": "body_invalid"}]},
+        )
     code, message = HTTP_ERRORS.get(
         error.status_code,
         ("HTTP_ERROR", "Request failed")
