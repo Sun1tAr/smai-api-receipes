@@ -299,3 +299,34 @@ async def test_ollama_500_loses_only_the_failing_task(
             body = (await client.get(f"/generate-menu/{ids[0]}")).json()
             assert (body["status"], body["error"]) == ("failed", "Neurocore error")
             assert await statuses(client, ids) == ["failed"] + ["done"] * 3
+
+
+async def test_permanently_failing_generation_with_live_tags_keeps_the_queue(
+    settings: Settings, session_factory: Factory
+) -> None:
+    from receipes.main import create_app
+
+    async with session_factory() as session, session.begin():
+        session.add(PromptTemplate(template="{people_count} {weekly_budget}"))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "qwen2.5:7b"}]})
+        return httpx.Response(500, text="boom")
+
+    app = create_app(settings, ollama_transport=httpx.MockTransport(handler))
+    async with app.router.lifespan_context(app):
+        worker = app.state.worker
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            ids = await create_tasks(client, 8)
+            delays = []
+            # Итерация: проба 200 и одна попытка генерации (пауз в тесте нет).
+            for _ in range(5):
+                assert await worker.process_one() is False
+                delays.append(worker._idle_delay())
+            states = await statuses(client, ids)
+    assert delays == [5, 10, 20, 40, 60]
+    # Один сбой — одна failed; остальная очередь цела.
+    assert states == ["failed"] * 5 + ["pending"] * 3
