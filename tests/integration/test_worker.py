@@ -55,7 +55,9 @@ class Rig:
         metrics = GenerationMetrics(self.registry)
         http = OllamaClient.build_http_client(settings, httpx.MockTransport(recording))
         client = OllamaClient(settings, http, metrics, NoOpTracer())
-        self.worker = GenerationWorker(factory, client, settings, metrics)
+        self.worker = GenerationWorker(
+            factory, factory.kw["bind"], client, settings, metrics
+        )
 
     def sample(self, name: str, **labels: str) -> float:
         return self.registry.get_sample_value(name, labels) or 0.0

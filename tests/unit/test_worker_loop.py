@@ -17,10 +17,15 @@ class StopLoop(BaseException):
     pass
 
 
+async def held() -> bool:
+    return True
+
+
 def make_worker(sleep: Callable[..., Any], factory: Any = None) -> GenerationWorker:
     return GenerationWorker(
         factory,
-        None,
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
         unavailable_db_settings(generation_worker_interval_seconds=7),
         GenerationMetrics(CollectorRegistry()),
         sleep=sleep,
@@ -47,7 +52,7 @@ async def test_empty_iterations_sleep_and_write_nothing_to_the_log(
     async def nothing() -> bool:
         return False
 
-    worker.recover = lambda: asyncio.sleep(0)  # type: ignore[method-assign]
+    worker._ensure_lock = held  # type: ignore[method-assign]
     worker.process_one = nothing  # type: ignore[method-assign]
     with pytest.raises(StopLoop):
         await worker.run()
@@ -68,7 +73,7 @@ async def test_a_processed_task_is_followed_by_the_next_without_pause() -> None:
     async def process() -> bool:
         return next(answers)
 
-    worker.recover = lambda: asyncio.sleep(0)  # type: ignore[method-assign]
+    worker._ensure_lock = held  # type: ignore[method-assign]
     worker.process_one = process  # type: ignore[method-assign]
     with pytest.raises(StopLoop):
         await worker.run()
@@ -94,7 +99,7 @@ async def test_an_exception_in_an_iteration_is_logged_and_the_loop_continues(
             raise ConnectionError("database is down")
         return False
 
-    worker.recover = lambda: asyncio.sleep(0)  # type: ignore[method-assign]
+    worker._ensure_lock = held  # type: ignore[method-assign]
     worker.process_one = process  # type: ignore[method-assign]
     with pytest.raises(StopLoop):
         await worker.run()
@@ -117,7 +122,7 @@ async def test_cancellation_ends_the_loop() -> None:
     async def nothing() -> bool:
         return False
 
-    worker.recover = lambda: asyncio.sleep(0)  # type: ignore[method-assign]
+    worker._ensure_lock = held  # type: ignore[method-assign]
     worker.process_one = nothing  # type: ignore[method-assign]
     task = asyncio.create_task(worker.run())
     await started.wait()
