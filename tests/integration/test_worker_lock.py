@@ -13,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from receipes.config import Settings
+from receipes.database import create_lock_engine
 from receipes.db.models import PromptTemplate
 from receipes.db.repositories import TaskRepository
 from receipes.domain.status import TaskStatus
@@ -45,7 +46,12 @@ def make_worker(factory: Factory, settings: Settings) -> GenerationWorker:
         await asyncio.sleep(0.01)
 
     return GenerationWorker(
-        factory, factory.kw["bind"], client, settings, metrics, sleep=quick_sleep
+        factory,
+        create_lock_engine(settings),
+        client,
+        settings,
+        metrics,
+        sleep=quick_sleep,
     )
 
 
@@ -165,3 +171,50 @@ async def test_lost_lock_connection_is_reacquired(
     )
     assert "generation_lock_lost" in capsys.readouterr().out
     await stop(running)
+
+
+async def test_lock_connection_has_tcp_keepalive_on_both_ends(
+    session_factory: Factory, settings: Settings
+) -> None:
+    import socket
+
+    worker = make_worker(session_factory, settings)
+    assert await worker._ensure_lock() is True
+    try:
+        connection = worker._lock
+        # Серверная сторона: GUC сессии (освободит замок, если клиент пропал).
+        for name, expected in (
+            ("tcp_keepalives_idle", "30"),
+            ("tcp_keepalives_interval", "10"),
+            ("tcp_keepalives_count", "3"),
+        ):
+            assert await connection.scalar(text(f"SHOW {name}")) == expected
+        # Клиентская сторона: опции сокета asyncpg-соединения.
+        raw = await connection.get_raw_connection()
+        sock = raw.driver_connection._transport.get_extra_info("socket")
+        assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) != 0
+        idle = getattr(socket, "TCP_KEEPIDLE", getattr(socket, "TCP_KEEPALIVE", None))
+        if idle is not None:
+            assert sock.getsockopt(socket.IPPROTO_TCP, idle) == 30
+        interval = getattr(socket, "TCP_KEEPINTVL", None)
+        if interval is not None:
+            assert sock.getsockopt(socket.IPPROTO_TCP, interval) == 10
+        count = getattr(socket, "TCP_KEEPCNT", None)
+        if count is not None:
+            assert sock.getsockopt(socket.IPPROTO_TCP, count) == 3
+    finally:
+        await worker._release_lock()
+
+
+async def test_application_worker_uses_the_keepalive_engine(
+    settings: Settings, session_factory: Factory
+) -> None:
+    from receipes.main import create_app
+
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        worker = app.state.worker
+        assert await worker._ensure_lock() is True
+        idle = await worker._lock.scalar(text("SHOW tcp_keepalives_idle"))
+        await worker._release_lock()
+    assert idle == "30"
