@@ -2,7 +2,7 @@ from decimal import Decimal
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Path
 
 from receipes.api.dependencies import TaskStore, get_task_store
 from receipes.api.schemas import (
@@ -233,7 +233,19 @@ def _menu_response(task: GenerationTask) -> MenuResponse:
         500: INTERNAL_ERROR_DOC,
     },
 )
-async def get_generation_result(task_id: str, store: Store) -> Any:
+async def get_generation_result(
+    task_id: Annotated[
+        str,
+        Path(
+            description=(
+                "Идентификатор задачи из ответа API-1 (UUID). Неизвестный или "
+                "не UUID даёт 404."
+            ),
+            examples=["b1e2c3d4-5678-90ab-cdef-1234567890ab"],
+        ),
+    ],
+    store: Store,
+) -> Any:
     try:
         identifier = UUID(task_id)
     except ValueError:

@@ -374,3 +374,10 @@ async def test_unparsable_deeply_nested_json_is_validation_error(
         }
     }
     assert store.created == []
+
+
+async def test_task_id_path_parameter_is_documented(client) -> None:
+    document = (await client.get("/openapi.json")).json()
+    (parameter,) = document["paths"]["/generate-menu/{task_id}"]["get"]["parameters"]
+    assert parameter["name"] == "task_id" and parameter["in"] == "path"
+    assert "UUID" in parameter["description"]
