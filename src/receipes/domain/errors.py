@@ -9,6 +9,9 @@ class GenerationError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
+        # Счётчики токенов из ответа Ollama (если он дошёл): для логов отказов.
+        self.prompt_eval_count: int | None = None
+        self.eval_count: int | None = None
 
 
 # Шаблон промпта отсутствует или повреждён: сбой конфигурации, а не модели.

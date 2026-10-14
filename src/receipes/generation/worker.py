@@ -93,7 +93,7 @@ class GenerationWorker:
             logger.warning("generation_task_conflict", task_id=str(task_id))
             return True
         except GenerationError as error:
-            await self._fail(task_id, error.message, started, generated)
+            await self._fail(task_id, error.message, started, generated, error)
         except Exception:
             logger.error("generation_task_error", task_id=str(task_id), exc_info=True)
             await self._fail(task_id, GENERATION_FAILED, started, generated)
@@ -176,6 +176,7 @@ class GenerationWorker:
         message: str,
         started: float,
         generated: GeneratedMenu | None,
+        error: GenerationError | None = None,
     ) -> None:
         try:
             async with self._sessions() as session, session.begin():
@@ -187,7 +188,14 @@ class GenerationWorker:
             )
             return
         if changed:
-            self._record(task_id, "failed", started, generated, error=message)
+            self._record(
+                task_id,
+                "failed",
+                started,
+                generated,
+                error=message,
+                counts=error,
+            )
         else:
             logger.warning("generation_task_conflict", task_id=str(task_id))
 
@@ -198,6 +206,7 @@ class GenerationWorker:
         started: float,
         generated: GeneratedMenu | None,
         error: str | None = None,
+        counts: GenerationError | None = None,
     ) -> None:
         duration = perf_counter() - started
         self._metrics.tasks.labels(status).inc()
@@ -212,6 +221,11 @@ class GenerationWorker:
                 recipes=len(generated.menu.recipes),
                 prompt_eval_count=generated.prompt_eval_count,
                 eval_count=generated.eval_count,
+            )
+        if counts is not None and counts.eval_count is not None:
+            fields.update(
+                prompt_eval_count=counts.prompt_eval_count,
+                eval_count=counts.eval_count,
             )
         if error is not None:
             fields["error"] = error

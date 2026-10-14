@@ -227,16 +227,30 @@ async def test_timeout_fails_with_timeout_and_is_not_retried(
     assert len(harness.requests) == 1
 
 
-async def test_truncated_answer_fails_without_retry(
-    ready: Factory, settings: Settings
+async def test_truncated_answer_fails_without_retry_and_logs_token_counts(
+    ready: Factory, settings: Settings, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    reply = ollama_reply('{"recipes": [{"na', done_reason="length")
+    configure_logging("INFO")
+    reply = ollama_reply(
+        '{"recipes": [{"na',
+        done_reason="length",
+        prompt_eval_count=810,
+        eval_count=4096,
+    )
     task_id = await add_task(ready)
     harness = rig(ready, settings, lambda r: httpx.Response(200, json=reply))
     await harness.worker.process_one()
     task = await harness.task(task_id)
     assert task.error == "Neurocore response truncated"
     assert len(harness.requests) == 1
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("{")]
+    failed = next(
+        item
+        for item in map(json.loads, lines)
+        if item["message"] == "generation_task_failed"
+    )
+    assert (failed["prompt_eval_count"], failed["eval_count"]) == (810, 4096)
+    assert "recipes" not in failed and failed["error"] == task.error
 
 
 async def test_invalid_answer_is_retried_once_then_fails(

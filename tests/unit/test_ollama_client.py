@@ -162,11 +162,18 @@ async def test_truncated_response_is_not_parsed_and_counted(
             raise AssertionError("json.loads must not be called")
 
     monkeypatch.setattr(ollama_module, "json", ForbiddenJson)
-    reply = ollama_reply('{"recipes": [{"name": "Суп', done_reason="length")
+    reply = ollama_reply(
+        '{"recipes": [{"name": "Суп',
+        done_reason="length",
+        prompt_eval_count=810,
+        eval_count=4096,
+    )
     client, registry = make_client(lambda r: httpx.Response(200, json=reply))
     with pytest.raises(NeurocoreTruncated) as raised:
         await client.generate_menu("x")
     assert raised.value.message == "Neurocore response truncated"
+    # Счётчики токенов доходят до логов отказа: при обрезке eval_count == лимит.
+    assert (raised.value.prompt_eval_count, raised.value.eval_count) == (810, 4096)
     assert outcome(registry, "truncated") == 1
     assert outcome(registry, "invalid_response") == 0
 
@@ -200,6 +207,7 @@ async def test_rejection_carries_a_reason_for_metrics() -> None:
     with pytest.raises(InvalidNeurocoreResponse) as raised:
         await client.generate_menu("x")
     assert raised.value.reason == "count"
+    assert (raised.value.prompt_eval_count, raised.value.eval_count) == (820, 900)
 
 
 async def test_missing_token_counters_are_none() -> None:
