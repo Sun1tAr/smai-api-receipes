@@ -1,6 +1,6 @@
 import os
 import subprocess
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 import pytest
 import pytest_asyncio
@@ -45,6 +45,12 @@ def run_alembic(env: dict[str, str], *arguments: str) -> None:
         ["alembic", *arguments], env=env, capture_output=True, text=True, check=False
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# Запуск alembic с окружением тестовой БД: alembic("upgrade", "head").
+@pytest.fixture
+def alembic(alembic_env: dict[str, str]) -> Callable[..., None]:
+    return lambda *arguments: run_alembic(alembic_env, *arguments)
 
 
 # Схема на уровне head; тест с временной ревизией перед собой откатывает её до base.
