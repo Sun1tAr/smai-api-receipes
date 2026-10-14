@@ -205,14 +205,20 @@ class GenerationWorker:
             self._model_missing = model_missing
         self._backoff = (
             min(self._backoff * 2, OLLAMA_BACKOFF_MAX_SECONDS)
-            if self._ollama_down
+            if self._backoff > 0
             else OLLAMA_BACKOFF_START_SECONDS
         )
         self._ollama_down = True
 
-    def _ollama_recovered(self) -> None:
+    # Проба прошла: можно брать задачу, но серия сбоев и пауза не обнуляются. Иначе
+    # при «проба 200, генерация 500» очередь горела бы по задаче в 5 секунд.
+    def _ollama_probe_passed(self) -> None:
         self._ollama_down = False
         self._model_missing = False
+
+    # Сбросить серию и паузу может только успешная генерация.
+    def _ollama_recovered(self) -> None:
+        self._ollama_probe_passed()
         self._backoff = 0.0
 
     # Задачу нельзя брать, пока нечем её обработать: без годного шаблона она бы
@@ -243,7 +249,7 @@ class GenerationWorker:
             if not ready:
                 self._ollama_failed()
                 return False
-            self._ollama_recovered()
+            self._ollama_probe_passed()
         async with self._sessions() as session, session.begin():
             task_id = await TaskRepository(session).claim_next()
         if task_id is None:
