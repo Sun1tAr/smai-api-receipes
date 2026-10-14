@@ -42,6 +42,9 @@ Sleep = Callable[[float], Awaitable[None]]
 # Ключ pg_try_advisory_lock (на уровне БД): один активный воркер на базу.
 ADVISORY_LOCK_KEY = 7_460_520_004
 
+# Пауза между попытками взять занятый замок (режим standby), не интервал опроса.
+LOCK_RETRY_SECONDS = 10.0
+
 # Пауза после сбоя итерации (обычно БД): 1 -> 2 -> 4 -> ... -> 30 с, сброс при успехе.
 ITERATION_BACKOFF_MAX_SECONDS = 30.0
 
@@ -158,8 +161,11 @@ class GenerationWorker:
         try:
             while True:
                 try:
-                    held = await self._ensure_lock()
-                    processed = await self.process_one() if held else False
+                    if not await self._ensure_lock():
+                        self._iteration_failures = 0
+                        await self._sleep(LOCK_RETRY_SECONDS)
+                        continue
+                    processed = await self.process_one()
                 except Exception as error:
                     self._log_iteration_failure(error)
                     await self._sleep(self._iteration_delay())
