@@ -1,10 +1,10 @@
 # smai-api-receipes
 
 MS-4 — сервис рецептов SmartMeal: ядро домена рецептов и генерация меню через
-Ollama. Сейчас готова только инфраструктура (**SMAI-58**): каркас приложения,
-подключение к PostgreSQL, миграции, health, метрики, трейсы и логи, Docker/Compose
-и CI. Доменный код (модели, таблицы, воркер генерации, клиент Ollama) и
-бизнес-эндпоинты API-1/API-2 появятся в задачах SMAI-57 и SMAI-55.
+Ollama. Инфраструктура (**SMAI-58**): каркас приложения, подключение к PostgreSQL,
+миграции, health, метрики, трейсы и логи, Docker/Compose и CI. Домен (SMAI-57) и
+эндпоинты API-1/API-2 (SMAI-55) готовы; шаблон промпта, воркер генерации и
+клиент Ollama — в SMAI-56 и SMAI-54.
 
 ## Эндпоинты
 
@@ -13,6 +13,8 @@ Ollama. Сейчас готова только инфраструктура (**S
 | Метод и путь | Назначение | Ответы | Статус |
 | --- | --- | --- | --- |
 | `GET /health` | Готовность: `SELECT 1` к PostgreSQL (Ollama не проверяется); не пишет спаны, лог запроса на уровне DEBUG | 200 `{"status":"ok"}`, 503 `INTERNAL_ERROR` | служебный |
+| `POST /generate-menu` | API-1: создать задачу генерации меню (`peopleCount` 1–20, `weeklyBudget` > 0, ≤ 1 000 000, до 2 знаков). Поля v2 (`habits`, `diet`, `allergies`, `kitchenTools`) пока не поддерживаются и игнорируются | 202 `{"task_id"}`, 400 `VALIDATION_ERROR`, 500 `INTERNAL_ERROR` | бизнес |
+| `GET /generate-menu/{task_id}` | API-2: статус задачи; всегда `status`, `menu`, `error` (`menu` только при `done`, `error` только при `failed`). Порядок рецептов и ингредиентов не гарантируется | 200, 404 `NOT_FOUND` (неизвестный или не-UUID `task_id`), 500 `INTERNAL_ERROR` | бизнес |
 | `GET /metrics` | Метрики Prometheus: HTTP, Python, GC и процесс (вне схемы OpenAPI) | 200 `text/plain` | служебный |
 | `GET /docs` | Swagger UI | 200 `text/html` | служебный |
 | `GET /openapi.json` | Схема OpenAPI | 200 `application/json` | служебный |
@@ -24,7 +26,8 @@ Ollama. Сейчас готова только инфраструктура (**S
 {"error": {"code": "NOT_FOUND", "message": "Resource not found", "details": {}}}
 ```
 
-Коды: `VALIDATION_ERROR` (400, ошибка валидации запроса), `NOT_FOUND` (404),
+Коды: `VALIDATION_ERROR` (400, ошибка валидации запроса), `NOT_FOUND` (404; для
+API-2 — `Generation task not found`),
 `METHOD_NOT_ALLOWED` (405), `INTERNAL_ERROR` (500 и 503). Каждый ответ, включая
 500 на необработанное исключение, содержит заголовок `X-Request-ID`: входящее
 значение принимается, если это до 128 символов `A-Za-z0-9._-`, иначе
@@ -123,8 +126,10 @@ docker compose -p receipes-tests -f docker-compose.test.yml down
 
 ```text
 src/receipes/       приложение: config, database, main (create_app), health,
-                    errors, observability, migration_diagnostics, __main__ (запуск uvicorn)
-migrations/         Alembic (async env.py), ревизий пока нет
+                    errors, observability, migration_diagnostics, __main__ (запуск uvicorn);
+                    domain/ (статусы, имена), db/ (модели, репозитории), api/ (API-1/API-2)
+migrations/         Alembic (async env.py): 0001_domain; таблица версий
+                    alembic_version_receipes
 docker/             entrypoint.sh: alembic upgrade head, затем запуск сервера
 tests/unit/         unit-тесты (без БД)
 tests/integration/  интеграционные тесты (нужна PostgreSQL, TEST_DB_HOST)
