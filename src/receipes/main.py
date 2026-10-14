@@ -21,6 +21,8 @@ from prometheus_client import (
 from prometheus_fastapi_instrumentator import Instrumentator
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from receipes.api.menu import restore_example_nulls
+from receipes.api.menu import router as menu_router
 from receipes.config import Settings
 from receipes.database import create_engine
 from receipes.errors import error_response, register_error_handlers
@@ -75,6 +77,7 @@ def build_openapi(app: FastAPI) -> dict[str, Any]:
         for path in schema["paths"].values():
             for operation in path.values():
                 operation["responses"].pop("422", None)
+        restore_example_nulls(schema)
         for name in ("HTTPValidationError", "ValidationError"):
             schema.get("components", {}).get("schemas", {}).pop(name, None)
         app.openapi_schema = schema
@@ -164,6 +167,7 @@ def create_app(
     app.state.tracer_provider = provider
     app.state.metrics_registry = metrics_registry
     app.include_router(router)
+    app.include_router(menu_router)
     app.openapi = lambda: build_openapi(app)
 
     # Request ID относится к текущему HTTP-вызову; query и тела не логируются.
