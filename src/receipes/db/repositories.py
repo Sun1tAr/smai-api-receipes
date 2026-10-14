@@ -18,7 +18,7 @@ from receipes.db.models import (
     RecipeIngredient,
 )
 from receipes.domain.menu import MenuPayload
-from receipes.domain.names import normalize_name
+from receipes.domain.names import name_key, normalize_name
 from receipes.domain.status import TaskStatus
 
 # Репозитории работают в транзакции вызывающего кода и сами не делают commit.
@@ -134,11 +134,12 @@ class MenuRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    # Сохраняет меню целиком; рецепты каждый раз новые, ингредиенты — по точному имени.
+    # Сохраняет меню целиком; рецепты каждый раз новые, ингредиенты переиспользуются
+    # по ключу имени (name_key: регистр, ё/е, кавычки, пробелы, конечная пунктуация).
     async def save(self, payload: MenuPayload) -> UUID:
         menu = Menu(id=uuid4())
         entities: list[object] = [menu]
-        ingredient_ids: dict[str, UUID] = {}
+        known = await self._known_ingredients()
         for item in payload.recipes:
             nutrition = Nutrition(id=uuid4(), **item.nutrition.model_dump())
             recipe = Recipe(
@@ -156,13 +157,16 @@ class MenuRepository:
             ]
             for part in item.ingredients:
                 name = normalize_name(part.name)
-                if name not in ingredient_ids:
-                    ingredient_ids[name] = await self._ingredient_id(name, entities)
+                key = name_key(name)
+                if key not in known:
+                    ingredient = Ingredient(id=uuid4(), name=name)
+                    entities.append(ingredient)
+                    known[key] = ingredient.id
                 entities.append(
                     RecipeIngredient(
                         id=uuid4(),
                         recipe_id=recipe.id,
-                        ingredient_id=ingredient_ids[name],
+                        ingredient_id=known[key],
                         quantity=part.quantity,
                         unit=normalize_name(part.unit),
                     )
@@ -177,19 +181,16 @@ class MenuRepository:
         await self._session.flush()
         return menu.id
 
-    # Существующий ингредиент с таким именем (при дублях — с меньшим id) либо новый.
-    async def _ingredient_id(self, name: str, pending: list[object]) -> UUID:
-        existing = await self._session.scalar(
-            select(Ingredient.id)
-            .where(Ingredient.name == name)
-            .order_by(Ingredient.id)
-            .limit(1)
+    # Ключ имени -> id существующего ингредиента (при дублях побеждает меньший id).
+    # Справочник продуктов мал, поэтому читается одним запросом на сохранение.
+    async def _known_ingredients(self) -> dict[str, UUID]:
+        rows = await self._session.execute(
+            select(Ingredient.id, Ingredient.name).order_by(Ingredient.id)
         )
-        if existing is not None:
-            return existing
-        ingredient = Ingredient(id=uuid4(), name=name)
-        pending.append(ingredient)
-        return ingredient.id
+        known: dict[str, UUID] = {}
+        for ingredient_id, name in rows:
+            known.setdefault(name_key(name), ingredient_id)
+        return known
 
 
 class PromptTemplateRepository:
