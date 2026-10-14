@@ -49,7 +49,8 @@ def upgrade() -> None:
     op.execute(
         sa.text(
             "INSERT INTO prompt_template (id, template, created_at) "
-            "VALUES (CAST(:id AS uuid), :template, now())"
+            "VALUES (CAST(:id AS uuid), :template, now()) "
+            "ON CONFLICT (id) DO NOTHING"
         ).bindparams(id=TEMPLATE_ID, template=TEMPLATE)
     )
 
