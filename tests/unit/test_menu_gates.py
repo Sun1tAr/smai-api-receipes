@@ -250,3 +250,19 @@ def test_photo_from_the_model_is_dropped() -> None:
     data = menu_with(photo="https://example.com/x.jpg")
     menu = parse_menu(copy.deepcopy(data))
     assert not hasattr(menu.recipes[0], "photo")
+
+
+@pytest.mark.parametrize("value", [1e30, 10**40, -(10**40), 1e308])
+@pytest.mark.parametrize("field", ["calories", "cookingTime"])
+def test_numbers_beyond_decimal_precision_are_bounds_not_a_crash(
+    field: str, value: float
+) -> None:
+    assert rejected_reason(menu_with(**{field: value})) == "bounds"
+
+
+def test_huge_quantity_is_bounds() -> None:
+    data = menu_with()
+    data["recipes"][0]["ingredients"][0]["quantity"] = 10**40
+    assert rejected_reason(data) == "bounds"
+    data["recipes"][0]["ingredients"][0]["quantity"] = 1e30
+    assert rejected_reason(data) == "bounds"

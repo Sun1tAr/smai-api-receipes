@@ -1,10 +1,17 @@
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from time import perf_counter
 from uuid import UUID
 
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+)
 
 from receipes.config import Settings
 from receipes.db.repositories import (
@@ -17,16 +24,28 @@ from receipes.domain.errors import (
     SERVICE_RESTARTED,
     GenerationError,
     InvalidNeurocoreResponse,
+    NeurocoreTimeout,
+    NeurocoreUnavailable,
     PromptTemplateError,
     TaskStateConflict,
 )
 from receipes.generation.metrics import GenerationMetrics
 from receipes.generation.ollama import GeneratedMenu, OllamaClient
-from receipes.generation.prompt import render_prompt
+from receipes.generation.prompt import render_prompt, validate_template
 
 logger = structlog.get_logger()
 
 Sleep = Callable[[float], Awaitable[None]]
+
+# Ключ pg_try_advisory_lock (на уровне БД): один активный воркер на базу.
+ADVISORY_LOCK_KEY = 7_460_520_004
+
+# Пауза после сбоя итерации (обычно БД): 1 -> 2 -> 4 -> ... -> 30 с, сброс при успехе.
+ITERATION_BACKOFF_MAX_SECONDS = 30.0
+
+# Пауза после падения Ollama растёт 5 -> 10 -> 20 -> 40 -> 60 с, пока она не вернётся.
+OLLAMA_BACKOFF_START_SECONDS = 5.0
+OLLAMA_BACKOFF_MAX_SECONDS = 60.0
 
 
 # Воркер генерации: берёт pending-задачи по одной (Ollama однопоточна), вызывает
@@ -36,16 +55,24 @@ class GenerationWorker:
     def __init__(
         self,
         session_factory: async_sessionmaker[AsyncSession],
+        engine: AsyncEngine,
         ollama: OllamaClient,
         settings: Settings,
         metrics: GenerationMetrics,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
         self._sessions = session_factory
+        self._engine = engine
+        self._lock: AsyncConnection | None = None
+        self._lock_busy_reported = False
         self._ollama = ollama
         self._settings = settings
         self._metrics = metrics
         self._sleep = sleep
+        self._ollama_down = False
+        self._backoff = 0.0
+        self._iteration_failures = 0
+        self._template_problem: str | None = None
 
     # Задачи, оставшиеся in_progress после гибели процесса, закрываем как failed.
     # Повторяем, пока БД не ответит: брать новые задачи до этого нельзя.
@@ -64,20 +91,137 @@ class GenerationWorker:
                 logger.info("generation_recovered", failed_tasks=count)
             return
 
-    async def run(self) -> None:
-        await self.recover()
-        while True:
+    # Замок живёт на отдельном соединении всё время работы воркера (сессионный
+    # advisory lock). True, если замок наш; при свежем захвате сначала recover().
+    async def _ensure_lock(self) -> bool:
+        if self._lock is not None:
             try:
-                processed = await self.process_one()
+                await self._lock.execute(text("SELECT 1"))
+                return True
             except Exception:
-                logger.error("generation_iteration_failed", exc_info=True)
-                processed = False
-            # Пустая итерация ничего не пишет в лог: иначе шум каждые N секунд.
-            if not processed:
-                await self._sleep(self._settings.generation_worker_interval_seconds)
+                # Соединение потеряно, а с ним и замок: берём заново.
+                logger.warning("generation_lock_lost")
+                await self._release_lock()
+        connection = await self._engine.connect()
+        try:
+            connection = await connection.execution_options(
+                isolation_level="AUTOCOMMIT"
+            )
+            got = await connection.scalar(
+                text("SELECT pg_try_advisory_lock(:key)"), {"key": ADVISORY_LOCK_KEY}
+            )
+        except BaseException:
+            await connection.close()
+            raise
+        if not got:
+            await connection.close()
+            if not self._lock_busy_reported:
+                self._lock_busy_reported = True
+                logger.warning("generation_lock_busy")
+            return False
+        self._lock = connection
+        self._lock_busy_reported = False
+        logger.info("generation_lock_acquired")
+        await self.recover()
+        return True
+
+    async def _release_lock(self) -> None:
+        connection, self._lock = self._lock, None
+        if connection is None:
+            return
+        # Соединение вернётся в пул вместе с сессионным замком, поэтому снимаем замок
+        # явно; если не вышло, соединение выбрасывается и сервер освободит замок.
+        try:
+            await connection.execute(
+                text("SELECT pg_advisory_unlock(:key)"), {"key": ADVISORY_LOCK_KEY}
+            )
+        except Exception:
+            with suppress(Exception):
+                await connection.invalidate()
+        with suppress(Exception):
+            await connection.close()
+
+    # Замок берётся до recover(): иначе второй экземпляр оборвал бы чужие задачи.
+    async def run(self) -> None:
+        try:
+            while True:
+                try:
+                    held = await self._ensure_lock()
+                    processed = await self.process_one() if held else False
+                except Exception as error:
+                    self._log_iteration_failure(error)
+                    await self._sleep(self._iteration_delay())
+                    continue
+                self._iteration_failures = 0
+                # Пустая итерация ничего не пишет в лог: иначе шум каждые N секунд.
+                if not processed:
+                    await self._sleep(self._idle_delay())
+        finally:
+            await self._release_lock()
+
+    # Сбой итерации (например, БД недоступна) не должен крутиться раз в интервал:
+    # пауза растёт до 30 с, а полный traceback пишется только при первом сбое серии.
+    def _log_iteration_failure(self, error: Exception) -> None:
+        self._iteration_failures += 1
+        if self._iteration_failures == 1:
+            logger.error("generation_iteration_failed", exc_info=True)
+        else:
+            logger.error(
+                "generation_iteration_failed",
+                error_type=type(error).__name__,
+                consecutive_failures=self._iteration_failures,
+            )
+
+    def _iteration_delay(self) -> float:
+        delay = 2.0 ** (self._iteration_failures - 1)
+        return min(delay, ITERATION_BACKOFF_MAX_SECONDS)
+
+    # Пока Ollama недоступна, ждём по нарастающей паузе, иначе обычный интервал.
+    def _idle_delay(self) -> float:
+        if self._ollama_down:
+            return self._backoff
+        return self._settings.generation_worker_interval_seconds
+
+    def _ollama_failed(self) -> None:
+        self._backoff = (
+            min(self._backoff * 2, OLLAMA_BACKOFF_MAX_SECONDS)
+            if self._ollama_down
+            else OLLAMA_BACKOFF_START_SECONDS
+        )
+        self._ollama_down = True
+
+    def _ollama_recovered(self) -> None:
+        self._ollama_down = False
+        self._backoff = 0.0
+
+    # Задачу нельзя брать, пока нечем её обработать: без годного шаблона она бы
+    # сгорела в failed. Причина пишется в лог один раз, пока она не изменится.
+    async def _template_usable(self) -> bool:
+        async with self._sessions() as session:
+            template = await PromptTemplateRepository(session).get_active()
+        problem: str | None = None
+        if template is None:
+            problem = "missing"
+        else:
+            try:
+                validate_template(template.template)
+            except PromptTemplateError:
+                problem = "invalid"
+        if problem != self._template_problem:
+            self._template_problem = problem
+            if problem is not None:
+                logger.error("prompt_template_unusable", reason=problem)
+        return problem is None
 
     # Одна итерация: True, если задача была взята (даже закончившаяся ошибкой).
     async def process_one(self) -> bool:
+        if not await self._template_usable():
+            return False
+        if self._ollama_down:
+            if not await self._ollama.is_available():
+                self._ollama_failed()
+                return False
+            self._ollama_recovered()
         async with self._sessions() as session, session.begin():
             task_id = await TaskRepository(session).claim_next()
         if task_id is None:
@@ -93,11 +237,14 @@ class GenerationWorker:
             logger.warning("generation_task_conflict", task_id=str(task_id))
             return True
         except GenerationError as error:
+            if isinstance(error, NeurocoreUnavailable | NeurocoreTimeout):
+                self._ollama_failed()
             await self._fail(task_id, error.message, started, generated, error)
         except Exception:
             logger.error("generation_task_error", task_id=str(task_id), exc_info=True)
             await self._fail(task_id, GENERATION_FAILED, started, generated)
         else:
+            self._ollama_recovered()
             self._record(task_id, "done", started, generated)
         return True
 

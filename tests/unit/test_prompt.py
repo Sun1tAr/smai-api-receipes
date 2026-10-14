@@ -68,6 +68,13 @@ def test_render_is_a_single_pass_and_values_cannot_inject_placeholders() -> None
         "{people_count} {weekly_budget} {extra}",
         "{people_count} {weekly_budget} {}",
         "без плейсхолдеров",
+        "{{people_count}} {weekly_budget}",
+        "{people_count} {weekly_budget}}}",
+        "{people_count} {weekly_budget} {",
+        "{people_count} {weekly_budget} }",
+        "{people_count} {weekly_budget} {{literal}}",
+        "{people_count} {weekly_budget} {{",
+        "{{ {people_count} {weekly_budget}",
     ],
 )
 def test_template_with_missing_or_foreign_placeholder_is_rejected(

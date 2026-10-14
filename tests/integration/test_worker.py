@@ -46,7 +46,8 @@ class Rig:
         self.requests: list[dict[str, Any]] = []
 
         async def recording(request: httpx.Request) -> httpx.Response:
-            self.requests.append(json.loads(request.content))
+            if request.content:
+                self.requests.append(json.loads(request.content))
             result = handler(request)
             return await result if asyncio.iscoroutine(result) else result
 
@@ -54,7 +55,9 @@ class Rig:
         metrics = GenerationMetrics(self.registry)
         http = OllamaClient.build_http_client(settings, httpx.MockTransport(recording))
         client = OllamaClient(settings, http, metrics, NoOpTracer())
-        self.worker = GenerationWorker(factory, client, settings, metrics)
+        self.worker = GenerationWorker(
+            factory, factory.kw["bind"], client, settings, metrics
+        )
 
     def sample(self, name: str, **labels: str) -> float:
         return self.registry.get_sample_value(name, labels) or 0.0
@@ -326,15 +329,112 @@ async def test_recipe_count_rules(
         assert harness.sample("menu_generation_rejected_total", reason="count") == 2
 
 
-async def test_missing_template_fails_without_calling_ollama(
-    session_factory: Factory, settings: Settings
+async def test_missing_template_leaves_tasks_pending_and_logs_once(
+    session_factory: Factory, settings: Settings, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    task_id = await add_task(session_factory)
+    configure_logging("INFO")
+    task_ids = [await add_task(session_factory) for _ in range(3)]
     harness = rig(session_factory, settings)
-    await harness.worker.process_one()
-    task = await harness.task(task_id)
-    assert (task.status, task.error) == (TaskStatus.FAILED, "Menu generation failed")
+    for _ in range(3):
+        assert await harness.worker.process_one() is False
+    for task_id in task_ids:
+        task = await harness.task(task_id)
+        assert (task.status, task.error) == (TaskStatus.PENDING, None)
     assert harness.requests == []
+    assert harness.sample("menu_generation_tasks_total", status="failed") == 0
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("{")]
+    entries = [item for item in map(json.loads, lines) if item["level"] == "error"]
+    assert [(item["message"], item["reason"]) for item in entries] == [
+        ("prompt_template_unusable", "missing")
+    ]
+
+
+@pytest.mark.parametrize("broken", ["нет плейсхолдеров", "{people_count} {other}"])
+async def test_broken_template_leaves_tasks_pending_and_resumes_when_fixed(
+    session_factory: Factory, settings: Settings, broken: str
+) -> None:
+    await add_template(session_factory, broken)
+    task_ids = [await add_task(session_factory) for _ in range(2)]
+    harness = rig(session_factory, settings)
+    assert await harness.worker.process_one() is False
+    for task_id in task_ids:
+        assert (await harness.task(task_id)).status == TaskStatus.PENDING
+    assert harness.requests == []
+    await add_template(session_factory)
+    assert await harness.worker.process_one() is True
+    assert (await harness.task(task_ids[0])).status == TaskStatus.DONE
+
+
+async def test_ollama_down_does_not_burn_the_queue(
+    ready: Factory, settings: Settings
+) -> None:
+    task_ids = [await add_task(ready) for _ in range(4)]
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(503)
+
+    harness = rig(ready, settings, handler)
+    # Первая задача падает с unavailable, остальные не трогаются.
+    assert await harness.worker.process_one() is True
+    assert (await harness.task(task_ids[0])).error == "Neurocore unavailable"
+    for _ in range(3):
+        assert await harness.worker.process_one() is False
+    for task_id in task_ids[1:]:
+        assert (await harness.task(task_id)).status == TaskStatus.PENDING
+    assert calls == ["/api/generate", "/api/tags", "/api/tags", "/api/tags"]
+    assert harness.sample("menu_generation_tasks_total", status="failed") == 1
+
+
+async def test_backoff_grows_to_the_cap_and_resets_after_recovery(
+    ready: Factory, settings: Settings
+) -> None:
+    for _ in range(3):
+        await add_task(ready)
+    online = {"up": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if not online["up"]:
+            raise httpx.ConnectError("refused")
+        return good(request)
+
+    harness = rig(ready, settings, handler)
+    worker = harness.worker
+    delays = []
+    assert await worker.process_one() is True
+    delays.append(worker._idle_delay())
+    for _ in range(6):
+        assert await worker.process_one() is False
+        delays.append(worker._idle_delay())
+    assert delays == [5, 10, 20, 40, 60, 60, 60]
+    online["up"] = True
+    assert await worker.process_one() is True
+    assert worker._idle_delay() == settings.generation_worker_interval_seconds
+    assert harness.sample("menu_generation_tasks_total", status="done") == 1
+
+
+async def test_timeout_also_starts_the_backoff(
+    ready: Factory, settings: Settings
+) -> None:
+    await add_task(ready)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow")
+
+    harness = rig(ready, settings, handler)
+    await harness.worker.process_one()
+    assert harness.worker._idle_delay() == 5
+
+
+async def test_other_failures_do_not_start_the_backoff(
+    ready: Factory, settings: Settings
+) -> None:
+    await add_task(ready)
+    reply = ollama_reply("не json")
+    harness = rig(ready, settings, lambda r: httpx.Response(200, json=reply))
+    await harness.worker.process_one()
+    assert harness.worker._idle_delay() == settings.generation_worker_interval_seconds
 
 
 async def test_unexpected_exception_in_progress_fails_the_task_and_rolls_back_menu(

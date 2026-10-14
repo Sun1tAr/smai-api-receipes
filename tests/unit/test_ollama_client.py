@@ -220,3 +220,75 @@ async def test_missing_token_counters_are_none() -> None:
 async def test_client_can_be_closed() -> None:
     client, _ = make_client(ok)
     await client.aclose()
+
+
+async def test_huge_number_is_invalid_response_with_bounds_reason() -> None:
+    menu = sample_menu()
+    menu["recipes"][0]["calories"] = 10**40
+    reply = ollama_reply(json.dumps(menu))
+    client, registry = make_client(lambda r: httpx.Response(200, json=reply))
+    with pytest.raises(InvalidNeurocoreResponse) as raised:
+        await client.generate_menu("x")
+    assert raised.value.reason == "bounds"
+    assert outcome(registry, "invalid_response") == 1
+
+
+async def test_cancelled_call_is_not_counted_as_an_error() -> None:
+    entered = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        await asyncio.Event().wait()
+        return ok(request)
+
+    client, registry = make_client(handler)
+    running = asyncio.create_task(client.generate_menu("x"))
+    await entered.wait()
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    for name in (
+        "success",
+        "timeout",
+        "unavailable",
+        "invalid_response",
+        "truncated",
+        "error",
+    ):
+        assert outcome(registry, name) == 0
+    assert registry.get_sample_value("ollama_request_duration_seconds_count") == 0
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [(httpx.Response(200, json={"models": []}), True), (httpx.Response(503), False)],
+)
+async def test_availability_probe_uses_tags_endpoint(
+    result: httpx.Response, expected: bool
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return result
+
+    client, registry = make_client(handler)
+    assert await client.is_available() is expected
+    assert (seen[0].method, seen[0].url.path) == ("GET", "/api/tags")
+    # Проба не считается запросом генерации.
+    assert registry.get_sample_value("ollama_request_duration_seconds_count") == 0
+
+
+async def test_availability_probe_survives_connection_errors_and_hangs() -> None:
+    def refused(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    client, _ = make_client(refused)
+    assert await client.is_available() is False
+
+    async def hang(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5)
+        return ok(request)
+
+    slow, _ = make_client(hang, ollama_connect_timeout_seconds=0.05)
+    assert await slow.is_available() is False

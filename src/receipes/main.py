@@ -123,7 +123,9 @@ def create_app(
         provider.get_tracer("receipes.ollama"),
     )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    worker = GenerationWorker(session_factory, ollama, settings, generation_metrics)
+    worker = GenerationWorker(
+        session_factory, engine, ollama, settings, generation_metrics
+    )
 
     # Владение соединениями и экспортёром ограничено жизненным циклом приложения.
     @asynccontextmanager
