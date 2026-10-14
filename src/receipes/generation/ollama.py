@@ -160,7 +160,8 @@ class OllamaClient:
     # Один вызов: сначала done_reason (обрезка без разбора), затем JSON и «ворота».
     async def generate_menu(self, prompt: str) -> GeneratedMenu:
         started = perf_counter()
-        outcome = "error"
+        # None — вызов отменён (остановка сервиса): это не исход запроса.
+        outcome: str | None = "error"
         with self._tracer.start_as_current_span("ollama.generate"):
             try:
                 body = await self._post(prompt)
@@ -184,9 +185,13 @@ class OllamaClient:
             except InvalidNeurocoreResponse:
                 outcome = "invalid_response"
                 raise
+            except asyncio.CancelledError:
+                outcome = None
+                raise
             finally:
-                self._metrics.ollama_requests.labels(outcome).inc()
-                self._metrics.ollama_duration.observe(perf_counter() - started)
+                if outcome is not None:
+                    self._metrics.ollama_requests.labels(outcome).inc()
+                    self._metrics.ollama_duration.observe(perf_counter() - started)
         return GeneratedMenu(
             menu=menu,
             prompt_eval_count=_count(body, "prompt_eval_count"),

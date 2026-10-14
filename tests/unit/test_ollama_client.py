@@ -231,3 +231,29 @@ async def test_huge_number_is_invalid_response_with_bounds_reason() -> None:
         await client.generate_menu("x")
     assert raised.value.reason == "bounds"
     assert outcome(registry, "invalid_response") == 1
+
+
+async def test_cancelled_call_is_not_counted_as_an_error() -> None:
+    entered = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        await asyncio.Event().wait()
+        return ok(request)
+
+    client, registry = make_client(handler)
+    running = asyncio.create_task(client.generate_menu("x"))
+    await entered.wait()
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    for name in (
+        "success",
+        "timeout",
+        "unavailable",
+        "invalid_response",
+        "truncated",
+        "error",
+    ):
+        assert outcome(registry, name) == 0
+    assert registry.get_sample_value("ollama_request_duration_seconds_count") == 0
