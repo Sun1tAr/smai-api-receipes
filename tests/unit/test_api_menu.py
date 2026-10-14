@@ -344,3 +344,40 @@ async def test_openapi_examples_match_the_response_schema(client) -> None:
     assert len(done["menu"]["recipes"]) >= 3
     assert all(recipe["photo"] is None for recipe in done["menu"]["recipes"])
     assert json.dumps(done)  # сериализуется без Decimal
+
+
+async def test_snake_case_fields_are_not_accepted(client, store) -> None:
+    response = await client.post(
+        "/generate-menu", json={"people_count": 4, "weekly_budget": 5000}
+    )
+    assert response.status_code == 400
+    locs = {
+        tuple(field["loc"]) for field in response.json()["error"]["details"]["fields"]
+    }
+    assert locs == {("body", "peopleCount"), ("body", "weeklyBudget")}
+    assert store.created == []
+
+
+@pytest.mark.parametrize("body", ["[" * 100_000, '{"a":' * 50_000])
+async def test_unparsable_deeply_nested_json_is_validation_error(
+    client, store, body: str
+) -> None:
+    response = await client.post(
+        "/generate-menu", content=body, headers={"Content-Type": "application/json"}
+    )
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "code": "VALIDATION_ERROR",
+            "message": "Request validation failed",
+            "details": {"fields": [{"loc": ["body"], "type": "body_invalid"}]},
+        }
+    }
+    assert store.created == []
+
+
+async def test_task_id_path_parameter_is_documented(client) -> None:
+    document = (await client.get("/openapi.json")).json()
+    (parameter,) = document["paths"]["/generate-menu/{task_id}"]["get"]["parameters"]
+    assert parameter["name"] == "task_id" and parameter["in"] == "path"
+    assert "UUID" in parameter["description"]
