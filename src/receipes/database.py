@@ -1,6 +1,7 @@
 import socket
 from typing import Any
 
+import structlog
 from sqlalchemy import MetaData, event
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
@@ -47,7 +48,24 @@ KEEPALIVE_INTERVAL_SECONDS = 10
 KEEPALIVE_COUNT = 3
 
 
+_keepalive_warned = False
+
+
+# Клиентские опции сокета — необязательное усиление: сбой (OSError, смена внутренностей
+# asyncpg) не должен лишать воркер замка, поэтому пишется одно предупреждение.
 def _enable_client_keepalive(dbapi_connection: Any, _record: Any) -> None:
+    global _keepalive_warned
+    try:
+        _set_keepalive(dbapi_connection)
+    except Exception as error:
+        if not _keepalive_warned:
+            _keepalive_warned = True
+            structlog.get_logger().warning(
+                "client_keepalive_not_applied", error_type=type(error).__name__
+            )
+
+
+def _set_keepalive(dbapi_connection: Any) -> None:
     transport = getattr(dbapi_connection.driver_connection, "_transport", None)
     sock = transport.get_extra_info("socket") if transport is not None else None
     if sock is None:

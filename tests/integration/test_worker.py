@@ -447,6 +447,65 @@ async def test_the_first_pause_after_a_failure_is_five_seconds(
     assert sleeps == [5, 10, 20, 40, 60, 60]
 
 
+@pytest.mark.parametrize("status", [500, 404])
+async def test_failing_generation_with_a_healthy_probe_keeps_growing_the_pause(
+    ready: Factory, settings: Settings, status: int
+) -> None:
+    task_ids = [await add_task(ready) for _ in range(8)]
+    generate_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal generate_calls
+        if request.url.path == "/api/tags":
+            # Проба всегда успешна (и модель в списке есть), а генерация падает.
+            return tags("qwen2.5:7b")
+        generate_calls += 1
+        return httpx.Response(status, text="boom")
+
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 6:
+            raise asyncio.CancelledError
+
+    harness = rig(ready, settings, handler, sleep=sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await harness.worker.run()
+    # Успешная проба не обнуляет серию: паузы растут, на сбой ровно одна failed.
+    assert sleeps == [5, 10, 20, 40, 60, 60]
+    assert generate_calls == 6
+    states = [(await harness.task(task_id)).status for task_id in task_ids]
+    assert states == [TaskStatus.FAILED] * 6 + [TaskStatus.PENDING] * 2
+
+
+async def test_only_a_successful_generation_resets_the_series(
+    ready: Factory, settings: Settings
+) -> None:
+    for _ in range(4):
+        await add_task(ready)
+    healthy = {"generate": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return tags("qwen2.5:7b")
+        return good(request) if healthy["generate"] else httpx.Response(500)
+
+    harness = rig(ready, settings, handler)
+    worker = harness.worker
+    await worker.process_one()
+    assert worker._idle_delay() == 5
+    await worker.process_one()
+    assert worker._idle_delay() == 10
+    healthy["generate"] = True
+    assert await worker.process_one() is True
+    assert worker._backoff == 0 and not worker._ollama_down
+    # После успеха серия начинается заново с 5 с.
+    healthy["generate"] = False
+    await worker.process_one()
+    assert worker._idle_delay() == 5
+
+
 async def test_missing_template_leaves_tasks_pending_and_logs_once(
     session_factory: Factory, settings: Settings, capsys: pytest.CaptureFixture[str]
 ) -> None:
