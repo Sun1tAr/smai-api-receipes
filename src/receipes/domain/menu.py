@@ -1,7 +1,7 @@
 import math
 import re
 import unicodedata
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Annotated, Any
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
@@ -38,7 +38,12 @@ def _number(value: Any) -> Decimal:
     number = Decimal(str(value)) if isinstance(value, float) else Decimal(value)
     if not number.is_finite():
         raise ValueError("must be finite")
-    return number.quantize(_CENT, rounding=ROUND_HALF_UP)
+    try:
+        return number.quantize(_CENT, rounding=ROUND_HALF_UP)
+    except InvalidOperation:
+        # Число не помещается в точность Decimal (1e30, 10**40): это выход за границы,
+        # а не сбой схемы; исключение уходит мимо pydantic как есть.
+        raise InvalidNeurocoreResponse("bounds") from None
 
 
 Number = Annotated[Decimal, BeforeValidator(_number)]

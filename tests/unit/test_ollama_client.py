@@ -220,3 +220,14 @@ async def test_missing_token_counters_are_none() -> None:
 async def test_client_can_be_closed() -> None:
     client, _ = make_client(ok)
     await client.aclose()
+
+
+async def test_huge_number_is_invalid_response_with_bounds_reason() -> None:
+    menu = sample_menu()
+    menu["recipes"][0]["calories"] = 10**40
+    reply = ollama_reply(json.dumps(menu))
+    client, registry = make_client(lambda r: httpx.Response(200, json=reply))
+    with pytest.raises(InvalidNeurocoreResponse) as raised:
+        await client.generate_menu("x")
+    assert raised.value.reason == "bounds"
+    assert outcome(registry, "invalid_response") == 1
