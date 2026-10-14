@@ -13,10 +13,12 @@ def format_number(value: Decimal | int) -> str:
     return format(Decimal(value).normalize(), "f")
 
 
-# В шаблоне должны быть оба плейсхолдера и никаких других {…}.
+# В шаблоне должны быть оба плейсхолдера и никаких других скобок: ни других {…},
+# ни «{{», «}}» (экранирование здесь не поддерживается), ни непарных { и }.
 def validate_template(template: str) -> None:
     found = set(_ANY_BRACES.findall(template))
-    if found != PLACEHOLDERS:
+    leftover = _ANY_BRACES.sub("", template)
+    if found != PLACEHOLDERS or "{" in leftover or "}" in leftover:
         raise PromptTemplateError
 
 
