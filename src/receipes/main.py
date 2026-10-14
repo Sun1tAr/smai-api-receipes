@@ -1,10 +1,12 @@
+import asyncio
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
+import httpx
 import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.openapi.utils import get_openapi
@@ -22,8 +24,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from receipes.api.menu import restore_example_nulls
 from receipes.api.menu import router as menu_router
 from receipes.config import Settings
-from receipes.database import create_engine
+from receipes.database import create_engine, create_lock_engine
 from receipes.errors import error_response, register_error_handlers
+from receipes.generation.metrics import GenerationMetrics
+from receipes.generation.ollama import OllamaClient
+from receipes.generation.worker import GenerationWorker
 from receipes.health import dependencies_ready, router
 from receipes.observability import configure_logging, create_tracer_provider
 
@@ -94,10 +99,16 @@ def resolve_request_id(incoming: str | None) -> str:
 
 
 # Фабрика позволяет задавать отдельное окружение при интеграционном тестировании.
-def create_app(settings: Settings | None = None) -> FastAPI:
+# ollama_transport подменяет сеть в тестах (httpx.MockTransport).
+def create_app(
+    settings: Settings | None = None,
+    *,
+    ollama_transport: httpx.AsyncBaseTransport | None = None,
+) -> FastAPI:
     settings = settings or Settings()
     configure_logging(settings.log_level)
     engine = create_engine(settings)
+    lock_engine = create_lock_engine(settings)
     provider = create_tracer_provider(settings)
     # Единый реестр: сюда же позже добавятся доменные метрики. Приватный реестр не
     # содержит метрик процесса по умолчанию, поэтому добавляем их явно.
@@ -105,18 +116,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ProcessCollector(registry=metrics_registry)
     PlatformCollector(registry=metrics_registry)
     GCCollector(registry=metrics_registry)
+    generation_metrics = GenerationMetrics(metrics_registry)
+    ollama = OllamaClient(
+        settings,
+        OllamaClient.build_http_client(settings, ollama_transport),
+        generation_metrics,
+        provider.get_tracer("receipes.ollama"),
+    )
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    worker = GenerationWorker(
+        session_factory, lock_engine, ollama, settings, generation_metrics
+    )
 
     # Владение соединениями и экспортёром ограничено жизненным циклом приложения.
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        worker_task: asyncio.Task[None] | None = None
         instrumentor = SQLAlchemyInstrumentor()
         instrumentor.instrument(engine=engine.sync_engine, tracer_provider=provider)
         try:
             if not await dependencies_ready(engine, settings):
                 raise RuntimeError("Service dependencies are unavailable")
+            if settings.generation_worker_enabled:
+                worker_task = asyncio.create_task(worker.run(), name="generation")
             logger.info("service_started")
             yield
         finally:
+            if worker_task is not None:
+                # CancelledError воркера не глотается им самим; прерванная задача
+                # остаётся in_progress до следующего старта.
+                worker_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await worker_task
+            await ollama.aclose()
+            await lock_engine.dispose()
             await engine.dispose()
             instrumentor.uninstrument()
             provider.shutdown()
@@ -131,7 +164,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_error_handlers(app)
     app.state.settings = settings
     app.state.engine = engine
-    app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    app.state.session_factory = session_factory
+    app.state.ollama = ollama
+    app.state.generation_metrics = generation_metrics
+    app.state.worker = worker
     app.state.tracer_provider = provider
     app.state.metrics_registry = metrics_registry
     app.include_router(router)

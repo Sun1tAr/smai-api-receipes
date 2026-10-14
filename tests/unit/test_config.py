@@ -47,17 +47,15 @@ def test_defaults() -> None:
     assert settings.db_timeout_seconds == 5
     assert settings.log_level == "INFO"
     assert settings.otel_exporter_otlp_endpoint is None
-    assert settings.ollama_model == "qwen2.5:7b-instruct-q4_K_M"
+    assert settings.ollama_model == "qwen2.5:7b"
     assert settings.ollama_connect_timeout_seconds == 5
     assert settings.ollama_timeout_seconds == 300
-    assert settings.ollama_num_ctx == 32768
+    assert settings.ollama_num_ctx == 8192
     assert settings.ollama_num_predict == 4096
     assert settings.ollama_temperature == 0.3
     assert settings.ollama_keep_alive == "30m"
     assert settings.generation_worker_enabled is True
     assert settings.generation_worker_interval_seconds == 2
-    assert settings.generation_pending_ttl_seconds == 900
-    assert settings.generation_max_pending is None
     assert settings.generation_bad_response_retries == 1
 
 
@@ -93,7 +91,7 @@ def test_empty_values_in_dotenv_mean_unset() -> None:
         "DB_PASSWORD=local-only\nOLLAMA_BASE_URL=http://ollama.test:11434\n"
         "DB_PORT=\nDB_TIMEOUT_SECONDS=\nLOG_LEVEL=\nOTEL_EXPORTER_OTLP_ENDPOINT=\n"
         "OLLAMA_MODEL=\nOLLAMA_NUM_CTX=\nOLLAMA_KEEP_ALIVE=\n"
-        "GENERATION_WORKER_ENABLED=\nGENERATION_MAX_PENDING=\n"
+        "GENERATION_WORKER_ENABLED=\n"
         "GENERATION_BAD_RESPONSE_RETRIES=\n"
     )
     settings = Settings()
@@ -101,11 +99,10 @@ def test_empty_values_in_dotenv_mean_unset() -> None:
     assert settings.db_timeout_seconds == 5
     assert settings.log_level == "INFO"
     assert settings.otel_exporter_otlp_endpoint is None
-    assert settings.ollama_model == "qwen2.5:7b-instruct-q4_K_M"
-    assert settings.ollama_num_ctx == 32768
+    assert settings.ollama_model == "qwen2.5:7b"
+    assert settings.ollama_num_ctx == 8192
     assert settings.ollama_keep_alive == "30m"
     assert settings.generation_worker_enabled is True
-    assert settings.generation_max_pending is None
     assert settings.generation_bad_response_retries == 1
 
 
@@ -135,7 +132,6 @@ def test_values_are_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> No
         "OLLAMA_MODEL": "other:model",
         "OLLAMA_TEMPERATURE": "0.7",
         "GENERATION_WORKER_ENABLED": "false",
-        "GENERATION_MAX_PENDING": "10",
         "GENERATION_BAD_RESPONSE_RETRIES": "0",
     }.items():
         monkeypatch.setenv(key, value)
@@ -143,7 +139,6 @@ def test_values_are_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> No
     assert settings.ollama_model == "other:model"
     assert settings.ollama_temperature == 0.7
     assert settings.generation_worker_enabled is False
-    assert settings.generation_max_pending == 10
     assert settings.generation_bad_response_retries == 0
 
 
@@ -171,8 +166,6 @@ def test_log_level_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
         {"ollama_temperature": -0.1},
         {"ollama_temperature": 2.1},
         {"generation_worker_interval_seconds": 0},
-        {"generation_pending_ttl_seconds": 0},
-        {"generation_max_pending": 0},
         {"generation_bad_response_retries": -1},
         {"generation_bad_response_retries": 11},
     ],
@@ -180,6 +173,44 @@ def test_log_level_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_out_of_range_values_are_rejected(override: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         make(**override)
+
+
+@pytest.mark.parametrize(
+    ("num_predict", "num_ctx", "valid"),
+    [
+        (4096, 4096, False),
+        (4096, 5119, False),
+        (4096, 5120, True),
+        (4096, 8192, True),
+        (16384, 8192, False),
+        (16384, 32768, True),
+    ],
+)
+def test_output_limit_must_fit_into_context_with_reserve(
+    num_predict: int, num_ctx: int, valid: bool
+) -> None:
+    overrides = {"ollama_num_predict": num_predict, "ollama_num_ctx": num_ctx}
+    if valid:
+        assert make(**overrides).ollama_num_ctx == num_ctx
+        return
+    with pytest.raises(ValidationError) as error:
+        make(**overrides)
+    assert "OLLAMA_NUM_PREDICT" in str(error.value)
+    assert "OLLAMA_NUM_CTX" in str(error.value)
+    # В лог invalid_configuration уходят только поле и тип: они должны быть говорящими.
+    (item,) = error.value.errors()
+    assert item["loc"] == ("ollama_num_predict",)
+    assert item["type"] == "num_predict_exceeds_context"
+
+
+def test_removed_queue_variables_are_ignored_not_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GENERATION_PENDING_TTL_SECONDS", "900")
+    monkeypatch.setenv("GENERATION_MAX_PENDING", "10")
+    settings = make()
+    assert not hasattr(settings, "generation_pending_ttl_seconds")
+    assert not hasattr(settings, "generation_max_pending")
 
 
 def test_database_url_preserves_special_characters_without_exposing_password() -> None:
