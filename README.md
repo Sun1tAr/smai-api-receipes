@@ -154,10 +154,23 @@ Alembic ждёт подключения не дольше `DB_TIMEOUT_SECONDS`, 
 
 ## CI
 
-Джобы: `lint`, `unit`, `integration`, `compose-smoke` (`docker compose up --build
---wait`, затем `/health` и `/docs`), `docker-build`; у каждой джобы задан `timeout-minutes`. Права workflow —
-`contents: read`; устаревшие запуски PR отменяются. Публикация образа и деплой
-(stage/prod) в CI не описаны: это решение Ivan и DevOps.
+Workflow `.github/workflows/ci.yml` (запуск на PR в `develop`/`main` и на push в
+них). Джобы:
+
+- `lint` — `ruff check` и `ruff format --check` (проверка типов `mypy`
+  отключена);
+- `unit` — `pytest tests/unit`;
+- `integration` — полный прогон через `docker-compose.test.yml` (PostgreSQL на
+  tmpfs, Ollama замокана);
+- `build-and-stage` — только при push в `develop`, после `lint`, `unit` и
+  `integration`: собирает образ (цель `production`), публикует его в GHCR
+  (`ghcr.io/sun1tar/smai-recipes:sha-<8 символов>`) и отправляет событие
+  `stage-service` в репозиторий `Sun1tAr/smai-infra`; env сервиса передаётся
+  блоком секрета `RECIPES_ENV`;
+- `build-and-prod` — то же при push в `main`, окружение `prod`.
+
+Деплой выполняет `smai-infra` (stop-first, одна реплика); значения env задаёт
+DevOps.
 
 ## Известные ограничения
 
