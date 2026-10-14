@@ -197,6 +197,10 @@ def test_output_limit_must_fit_into_context_with_reserve(
         make(**overrides)
     assert "OLLAMA_NUM_PREDICT" in str(error.value)
     assert "OLLAMA_NUM_CTX" in str(error.value)
+    # В лог invalid_configuration уходят только поле и тип: они должны быть говорящими.
+    (item,) = error.value.errors()
+    assert item["loc"] == ("ollama_num_predict",)
+    assert item["type"] == "num_predict_exceeds_context"
 
 
 def test_removed_queue_variables_are_ignored_not_fatal(

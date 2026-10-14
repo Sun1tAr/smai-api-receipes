@@ -9,6 +9,7 @@ from opentelemetry.trace import Tracer
 
 from receipes.config import Settings
 from receipes.domain.errors import (
+    GenerationError,
     InvalidNeurocoreResponse,
     NeurocoreError,
     NeurocoreModelNotFound,
@@ -163,10 +164,16 @@ class OllamaClient:
         with self._tracer.start_as_current_span("ollama.generate"):
             try:
                 body = await self._post(prompt)
-                if body.get("done_reason") == "length":
-                    outcome = "truncated"
-                    raise NeurocoreTruncated
-                menu = self._parse(body)
+                try:
+                    if body.get("done_reason") == "length":
+                        outcome = "truncated"
+                        raise NeurocoreTruncated
+                    menu = self._parse(body)
+                except GenerationError as error:
+                    # Счётчики нужны и при отказе (при обрезке eval_count == лимит).
+                    error.prompt_eval_count = _count(body, "prompt_eval_count")
+                    error.eval_count = _count(body, "eval_count")
+                    raise
                 outcome = "success"
             except NeurocoreTimeout:
                 outcome = "timeout"
