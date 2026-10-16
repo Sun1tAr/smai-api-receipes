@@ -202,3 +202,31 @@ def test_negative_duration_from_clock_skew_is_clamped_to_zero() -> None:
     duration = "recipes_generation_task_duration_seconds"
     assert sample(registry, f"{duration}_sum", status="done") == 0
     assert sample(registry, f"{duration}_count", status="done") == 1
+
+
+async def test_a_hanging_first_refresh_does_not_block_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fakes import unavailable_db_settings
+
+    from receipes.main import create_app
+
+    async def ready(*args: Any, **kwargs: Any) -> bool:
+        return True
+
+    async def hang(self: QueueMetricsRefresher) -> dict[str, tuple[int, float]]:
+        await asyncio.sleep(3600)
+        return {}
+
+    monkeypatch.setattr("receipes.main.dependencies_ready", ready)
+    monkeypatch.setattr(QueueMetricsRefresher, "_fetch", hang)
+    app = create_app(unavailable_db_settings(generation_worker_enabled=False))
+    try:
+        context = app.router.lifespan_context(app)
+        await asyncio.wait_for(context.__aenter__(), 1)
+        registry = app.state.metrics_registry
+        stamp = "recipes_generation_tasks_refresh_timestamp_seconds"
+        assert sample(registry, stamp) == 0
+        await asyncio.wait_for(context.__aexit__(None, None, None), 5)
+    finally:
+        app.state.tracer_provider.shutdown()

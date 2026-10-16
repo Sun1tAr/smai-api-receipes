@@ -6,7 +6,7 @@ from uuid import UUID
 import httpx
 import pytest
 from sqlalchemy import text
-from test_worker import (  # noqa: F401
+from test_worker import (
     Factory,
     Rig,
     add_task,
@@ -83,6 +83,9 @@ async def test_migration_fills_existing_rows_with_created_at(
     engine = create_engine(settings)
     try:
         alembic("downgrade", "0002_seed_prompt_template")
+        async with engine.connect() as connection:
+            assert await connection.scalar(text(SQL_NULLABLE)) is None
+            assert await connection.scalar(text(SQL_INDEX)) is None
         old = SQL_TASK.format(
             task_id=OLD_ID, status="done", created="'2026-01-02 03:04:05+00'"
         )
@@ -264,29 +267,37 @@ async def test_metrics_endpoint_answers_when_the_database_goes_away(
 ) -> None:
     from receipes.main import create_app
 
+    interval = 0.2
     await add_task(ready)
-    config = settings.model_copy(update={"generation_metrics_refresh_seconds": 0.05})
+    config = settings.model_copy(
+        update={"generation_metrics_refresh_seconds": interval}
+    )
     app = create_app(config, ollama_transport=httpx.MockTransport(good))
     original = QueueMetricsRefresher._fetch
 
-    async def broken(self: QueueMetricsRefresher):
+    async def broken(self: QueueMetricsRefresher) -> dict[str, tuple[int, float]]:
         raise ConnectionError("database is down")
 
+    stamp = "recipes_generation_tasks_refresh_timestamp_seconds"
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
-            await asyncio.sleep(0.3)
-            before = (await client.get("/metrics")).text
+            for _ in range(50):
+                before = (await client.get("/metrics")).text
+                if _value(before, stamp) > 0:
+                    break
+                await asyncio.sleep(0.1)
             monkeypatch.setattr(QueueMetricsRefresher, "_fetch", broken)
-            await asyncio.sleep(0.3)
+            # Тик, начатый до подмены, успевает закончиться: интервал + таймаут.
+            await asyncio.sleep(2 * interval + 0.2)
+            first = _value((await client.get("/metrics")).text, stamp)
+            await asyncio.sleep(3 * interval)
             after = await client.get("/metrics")
             monkeypatch.setattr(QueueMetricsRefresher, "_fetch", original)
     assert 'recipes_generation_tasks{status="pending"} 1.0' in before
     assert after.status_code == 200
-    stamp = "recipes_generation_tasks_refresh_timestamp_seconds"
-    assert _value(before, stamp) > 0
-    assert _value(before, stamp) == _value(after.text, stamp)
+    assert first > 0 and _value(after.text, stamp) == first
 
 
 def _value(text_: str, name: str) -> float:

@@ -58,7 +58,6 @@ def test_defaults() -> None:
     assert settings.generation_worker_interval_seconds == 2
     assert settings.generation_metrics_refresh_seconds == 15
     assert settings.generation_bad_response_retries == 1
-    assert settings.generation_metrics_refresh_seconds == 15
 
 
 def test_environment_overrides_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -107,6 +106,7 @@ def test_empty_values_in_dotenv_mean_unset() -> None:
     assert settings.ollama_keep_alive == "30m"
     assert settings.generation_worker_enabled is True
     assert settings.generation_bad_response_retries == 1
+    assert settings.generation_metrics_refresh_seconds == 15
 
 
 def test_empty_required_environment_value_is_missing(

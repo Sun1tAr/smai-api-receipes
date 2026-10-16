@@ -130,8 +130,8 @@ class GenerationTask(Base):
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), default=utcnow
     )
-    # Время последней смены статуса (при создании равно created_at); меняется
-    # только запросами репозитория, значение берётся из now() БД.
+    # Время последней смены статуса: при создании равно created_at, переходы
+    # пишут now() БД (только запросами репозитория).
     status_changed_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=func.now()
     )
