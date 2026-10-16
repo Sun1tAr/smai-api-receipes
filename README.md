@@ -87,6 +87,7 @@ Compose-сети. При старте контейнер выполняет `ale
 | `GENERATION_WORKER_ENABLED` | Включить фоновый воркер генерации | `true` |
 | `GENERATION_WORKER_INTERVAL_SECONDS` | Интервал опроса очереди, (0, 3600] | `2` |
 | `GENERATION_BAD_RESPONSE_RETRIES` | Повторы при невалидном ответе модели (таймаут, обрезка и недоступность не повторяются), [0, 10] | `1` |
+| `GENERATION_METRICS_REFRESH_SECONDS` | Как часто обновляются gauge очереди генерации в `/metrics`, (0, 300]; меньше ~1 с не рекомендуется | `15` |
 | `RECEIPES_HTTP_PORT` | Хостовой порт Compose (только Compose) | `8001` |
 
 Пустые и состоящие из пробелов `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`
@@ -185,6 +186,43 @@ GPU у Ollama, а не повод менять код. При смене `OLLAMA
 `ollama_request_duration_seconds`, `ollama_requests_total{outcome}`,
 `menu_generation_rejected_total{reason}`.
 
+### Метрики очереди генерации
+
+Gauge считаются из БД фоновой задачей раз в `GENERATION_METRICS_REFRESH_SECONDS`
+одним запросом с группировкой по статусу, а не на каждый scrape; гистограммы
+пишет воркер в момент завершения задачи (после commit, один раз на задачу).
+Единственная метка — `status`.
+
+| Метрика | Тип | Метки | Значение |
+| --- | --- | --- | --- |
+| `recipes_generation_tasks` | Gauge | `status` ∈ `pending`, `in_progress`, `done`, `failed` | Число задач в статусе (нули тоже выгружаются) |
+| `recipes_generation_task_oldest_age_seconds` | Gauge | `status` ∈ `pending`, `in_progress` | Возраст самой старой задачи в статусе (`now() − min(status_changed_at)`); 0, если задач нет |
+| `recipes_generation_task_duration_seconds` | Histogram | `status` ∈ `done`, `failed` | Полное время задачи: от создания до терминального статуса, с ожиданием в очереди |
+| `recipes_generation_task_processing_seconds` | Histogram | `status` ∈ `done`, `failed` | Время в `in_progress` |
+| `recipes_generation_tasks_refresh_timestamp_seconds` | Gauge | — | Unix-время последнего успешного обновления gauge |
+
+Разница `duration − processing` — время ожидания в очереди. Бакеты гистограмм:
+`5, 10, 20, 30, 60, 90, 120, 180, 240, 300, 360, 480, 600, 900, 1200, 1800, 3600`.
+
+- Пока `refresh_timestamp` равен 0, gauge ещё не обновлялись: нули в них не
+  значат «очередь пуста». Значения достоверны, пока
+  `time() - recipes_generation_tasks_refresh_timestamp_seconds` не больше
+  `3 × GENERATION_METRICS_REFRESH_SECONDS`; это же условие годится для алерта.
+- При ошибке БД (или обновлении дольше `min(5, интервал)` с) gauge сохраняют
+  последние значения, `refresh_timestamp` не растёт, `/metrics` отвечает 200.
+  В лог один раз за сбой пишется WARNING `generation_metrics_refresh_failed`
+  (только тип ошибки), при восстановлении — INFO
+  `generation_metrics_refresh_recovered`.
+- Возраст в gauge «заморожен» между обновлениями (до одного интервала).
+- Задачи, которые при старте закрыла `recover()` (`Service restarted`), попадают
+  только в `duration{status="failed"}`: начало их обработки неизвестно. Поэтому
+  `_count` у `duration{failed}` может быть больше, чем у `processing{failed}`.
+- Несколько реплик: gauge агрегируются через `max` (`refresh_timestamp` — через
+  `min`, чтобы устаревшая реплика не пряталась), гистограммы — через `sum`.
+- Метрики — в базе: `generation_task.status_changed_at` (время последней смены
+  статуса, миграция `0003_task_status_changed_at`), индекс
+  `(status, status_changed_at)`.
+
 ## Проверки
 
 Python 3.12, зависимости фиксируются в `uv.lock`:
@@ -216,7 +254,8 @@ src/receipes/       приложение: config, database, main (create_app), h
                     domain/ (статусы, проверка ответа модели), db/ (модели, репозитории),
                     api/ (API-1/API-2), generation/ (промпт, клиент Ollama, воркер,
                     метрики)
-migrations/         Alembic (async env.py): 0001_domain, 0002_seed_prompt_template;
+migrations/         Alembic (async env.py): 0001_domain, 0002_seed_prompt_template,
+                    0003_task_status_changed_at;
                     таблица версий alembic_version_receipes
                     domain/ (статусы, имена), db/ (модели, репозитории), api/ (API-1/API-2)
 migrations/         Alembic (async env.py): 0001_domain; таблица версий

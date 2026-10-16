@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     # Фоновая генерация меню.
     generation_worker_enabled: bool = True
     generation_worker_interval_seconds: float = Field(default=2, gt=0, le=3600)
+    # Как часто обновляются gauge очереди генерации в /metrics.
+    generation_metrics_refresh_seconds: float = Field(default=15, gt=0, le=300)
     # Повторы только при невалидном ответе модели (не при таймауте и обрезке).
     generation_bad_response_retries: int = Field(default=1, ge=0, le=10)
 

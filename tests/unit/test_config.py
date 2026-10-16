@@ -56,6 +56,7 @@ def test_defaults() -> None:
     assert settings.ollama_keep_alive == "30m"
     assert settings.generation_worker_enabled is True
     assert settings.generation_worker_interval_seconds == 2
+    assert settings.generation_metrics_refresh_seconds == 15
     assert settings.generation_bad_response_retries == 1
 
 
@@ -93,6 +94,7 @@ def test_empty_values_in_dotenv_mean_unset() -> None:
         "OLLAMA_MODEL=\nOLLAMA_NUM_CTX=\nOLLAMA_KEEP_ALIVE=\n"
         "GENERATION_WORKER_ENABLED=\n"
         "GENERATION_BAD_RESPONSE_RETRIES=\n"
+        "GENERATION_METRICS_REFRESH_SECONDS=\n"
     )
     settings = Settings()
     assert settings.db_port == 5432
@@ -104,6 +106,7 @@ def test_empty_values_in_dotenv_mean_unset() -> None:
     assert settings.ollama_keep_alive == "30m"
     assert settings.generation_worker_enabled is True
     assert settings.generation_bad_response_retries == 1
+    assert settings.generation_metrics_refresh_seconds == 15
 
 
 def test_empty_required_environment_value_is_missing(
@@ -166,6 +169,9 @@ def test_log_level_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
         {"ollama_temperature": -0.1},
         {"ollama_temperature": 2.1},
         {"generation_worker_interval_seconds": 0},
+        {"generation_metrics_refresh_seconds": 0},
+        {"generation_metrics_refresh_seconds": -1},
+        {"generation_metrics_refresh_seconds": 300.01},
         {"generation_bad_response_retries": -1},
         {"generation_bad_response_retries": 11},
     ],
@@ -173,6 +179,11 @@ def test_log_level_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_out_of_range_values_are_rejected(override: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         make(**override)
+
+
+@pytest.mark.parametrize("seconds", [0.5, 15, 300])
+def test_metrics_refresh_interval_accepts_the_allowed_range(seconds: float) -> None:
+    assert make(generation_metrics_refresh_seconds=seconds)
 
 
 @pytest.mark.parametrize(

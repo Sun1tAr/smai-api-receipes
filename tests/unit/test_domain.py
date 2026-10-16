@@ -15,6 +15,7 @@ ERD_COLUMNS = {
         "parameters_id",
         "menu_id",
         "created_at",
+        "status_changed_at",
         "error",
     },
     "generation_parameters": {"id", "people_count", "weekly_budget"},
@@ -76,6 +77,7 @@ def test_ids_are_uuid_and_dates_have_time_zone() -> None:
             assert column.type.__class__.__name__ == "Uuid"
     for table, column in (
         ("generation_task", "created_at"),
+        ("generation_task", "status_changed_at"),
         ("prompt_template", "created_at"),
     ):
         assert tables[table].c[column].type.timezone is True

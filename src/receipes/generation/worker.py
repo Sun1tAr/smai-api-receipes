@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from datetime import datetime
 from time import perf_counter
 from uuid import UUID
 
@@ -15,6 +16,7 @@ from sqlalchemy.ext.asyncio import (
 
 from receipes.config import Settings
 from receipes.db.repositories import (
+    FinishedTask,
     MenuRepository,
     PromptTemplateRepository,
     TaskRepository,
@@ -95,15 +97,20 @@ class GenerationWorker:
         while True:
             try:
                 async with self._sessions() as session, session.begin():
-                    count = await TaskRepository(session).fail_in_progress(
+                    recovered = await TaskRepository(session).fail_in_progress(
                         SERVICE_RESTARTED
                     )
             except Exception:
                 logger.error("generation_recovery_failed", exc_info=True)
                 await self._sleep(self._settings.generation_worker_interval_seconds)
                 continue
-            if count:
-                logger.info("generation_recovered", failed_tasks=count)
+            # Начало обработки неизвестно: пишем только полное время задачи.
+            for task in recovered:
+                self._metrics.observe_finished(
+                    "failed", task.created_at, task.finished_at
+                )
+            if recovered:
+                logger.info("generation_recovered", failed_tasks=len(recovered))
             return
 
     # Замок живёт на отдельном соединении всё время работы воркера (сессионный
@@ -251,21 +258,24 @@ class GenerationWorker:
                 return False
             self._ollama_probe_passed()
         async with self._sessions() as session, session.begin():
-            task_id = await TaskRepository(session).claim_next()
-        if task_id is None:
+            claim = await TaskRepository(session).claim_next()
+        if claim is None:
             return False
+        task_id, claimed_at = claim
         started = perf_counter()
         logger.info("generation_task_claimed", task_id=str(task_id))
         generated: GeneratedMenu | None = None
         try:
             prompt = await self._prepare_prompt(task_id)
             generated = await self._generate(task_id, prompt)
-            await self._finish(task_id, generated)
+            finished = await self._finish(task_id, generated)
         except TaskStateConflict:
             logger.warning("generation_task_conflict", task_id=str(task_id))
             return True
         except GenerationError as error:
-            await self._fail(task_id, error.message, started, generated, error)
+            await self._fail(
+                task_id, error.message, started, generated, claimed_at, error
+            )
             if isinstance(error, OLLAMA_SIDE_ERRORS):
                 # Упавшая задача остаётся failed (LE-6), остальные ждут в pending.
                 # False: следующая итерация начнётся с паузы, а не сразу с пробы.
@@ -275,9 +285,12 @@ class GenerationWorker:
                 return False
         except Exception:
             logger.error("generation_task_error", task_id=str(task_id), exc_info=True)
-            await self._fail(task_id, GENERATION_FAILED, started, generated)
+            await self._fail(task_id, GENERATION_FAILED, started, generated, claimed_at)
         else:
             self._ollama_recovered()
+            self._metrics.observe_finished(
+                "done", finished.created_at, finished.finished_at, claimed_at
+            )
             self._record(task_id, "done", started, generated)
         return True
 
@@ -339,10 +352,11 @@ class GenerationWorker:
             )
 
     # Транзакция 3: меню и статус done вместе; иначе откат всего.
-    async def _finish(self, task_id: UUID, generated: GeneratedMenu) -> None:
+    async def _finish(self, task_id: UUID, generated: GeneratedMenu) -> FinishedTask:
         async with self._sessions() as session, session.begin():
             menu_id = await MenuRepository(session).save(generated.menu)
-            if await TaskRepository(session).mark_done(task_id, menu_id) != 1:
+            finished = await TaskRepository(session).mark_done(task_id, menu_id)
+            if finished is None:
                 raise TaskStateConflict
         mismatched = sum(
             item.calories != item.nutrition.calories for item in generated.menu.recipes
@@ -354,6 +368,7 @@ class GenerationWorker:
                 recipes=len(generated.menu.recipes),
                 mismatched=mismatched,
             )
+        return finished
 
     async def _fail(
         self,
@@ -361,18 +376,22 @@ class GenerationWorker:
         message: str,
         started: float,
         generated: GeneratedMenu | None,
+        claimed_at: datetime,
         error: GenerationError | None = None,
     ) -> None:
         try:
             async with self._sessions() as session, session.begin():
-                changed = await TaskRepository(session).mark_failed(task_id, message)
+                finished = await TaskRepository(session).mark_failed(task_id, message)
         except Exception:
             # Задачу подберёт восстановление при следующем старте.
             logger.error(
                 "generation_task_fail_not_saved", task_id=str(task_id), exc_info=True
             )
             return
-        if changed:
+        if finished is not None:
+            self._metrics.observe_finished(
+                "failed", finished.created_at, finished.finished_at, claimed_at
+            )
             self._record(
                 task_id,
                 "failed",

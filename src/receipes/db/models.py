@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import ForeignKey, Index, Integer, Numeric, String, Text
+from sqlalchemy import ForeignKey, Index, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -115,6 +115,11 @@ class GenerationTask(Base):
     __tablename__ = "generation_task"
     __table_args__ = (
         Index("ix_generation_task_status_created_at", "status", "created_at"),
+        Index(
+            "ix_generation_task_status_status_changed_at",
+            "status",
+            "status_changed_at",
+        ),
     )
 
     task_id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -124,6 +129,11 @@ class GenerationTask(Base):
     menu_id: Mapped[UUID | None] = mapped_column(ForeignKey("menu.id"))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), default=utcnow
+    )
+    # Время последней смены статуса: при создании равно created_at, переходы
+    # пишут now() БД (только запросами репозитория).
+    status_changed_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now()
     )
     error: Mapped[str | None] = mapped_column(Text)
 

@@ -135,9 +135,10 @@ async def test_get_done_task_returns_the_saved_menu(
     )
     task_id = UUID(created.json()["task_id"])
     async with session_factory() as session, session.begin():
-        assert await TaskRepository(session).claim_next() == task_id
+        claim = await TaskRepository(session).claim_next()
+        assert claim is not None and claim.task_id == task_id
         menu_id = await MenuRepository(session).save(stored_menu())
-        assert await TaskRepository(session).mark_done(task_id, menu_id) == 1
+        assert await TaskRepository(session).mark_done(task_id, menu_id) is not None
     response = await api.get(f"/generate-menu/{task_id}")
     assert response.status_code == 200
     body = response.json()
