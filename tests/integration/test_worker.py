@@ -24,7 +24,7 @@ from receipes.db.models import (
     PromptTemplate,
     Recipe,
 )
-from receipes.db.repositories import TaskRepository
+from receipes.db.repositories import FinishedTask, TaskRepository
 from receipes.domain.status import TaskStatus
 from receipes.generation.metrics import GenerationMetrics
 from receipes.generation.ollama import OllamaClient
@@ -622,7 +622,9 @@ async def test_other_failures_do_not_start_the_backoff(
 async def test_unexpected_exception_in_progress_fails_the_task_and_rolls_back_menu(
     ready: Factory, settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def broken(self: TaskRepository, task_id: UUID, menu_id: UUID) -> int:
+    async def broken(
+        self: TaskRepository, task_id: UUID, menu_id: UUID
+    ) -> FinishedTask | None:
         raise RuntimeError("write failed: secret SQL")
 
     monkeypatch.setattr(TaskRepository, "mark_done", broken)

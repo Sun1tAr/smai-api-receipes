@@ -1,7 +1,9 @@
+from datetime import datetime
 from decimal import Decimal
+from typing import NamedTuple
 from uuid import UUID, uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -16,12 +18,25 @@ from receipes.db.models import (
     PromptTemplate,
     Recipe,
     RecipeIngredient,
+    utcnow,
 )
 from receipes.domain.menu import MenuPayload
 from receipes.domain.names import name_key, normalize_name
 from receipes.domain.status import TaskStatus
 
 # Репозитории работают в транзакции вызывающего кода и сами не делают commit.
+
+
+# Захваченная задача и время её перехода в in_progress (now() БД).
+class ClaimedTask(NamedTuple):
+    task_id: UUID
+    claimed_at: datetime
+
+
+# Времена завершённой задачи: created_at и время терминального перехода (now() БД).
+class FinishedTask(NamedTuple):
+    created_at: datetime
+    finished_at: datetime
 
 
 class TaskRepository:
@@ -36,11 +51,14 @@ class TaskRepository:
         parameters = GenerationParameters(
             id=uuid4(), people_count=people_count, weekly_budget=weekly_budget
         )
+        created_at = utcnow()
         task = GenerationTask(
             task_id=uuid4(),
             status=TaskStatus.PENDING,
             prompt=prompt,
             parameters_id=parameters.id,
+            created_at=created_at,
+            status_changed_at=created_at,
         )
         self._session.add_all([parameters, task])
         await self._session.flush()
@@ -65,7 +83,8 @@ class TaskRepository:
         return await self._session.scalar(query)
 
     # Атомарный захват самой старой pending: pending -> in_progress.
-    async def claim_next(self) -> UUID | None:
+    # Возвращает задачу и status_changed_at, записанный этим же UPDATE.
+    async def claim_next(self) -> ClaimedTask | None:
         query = (
             select(GenerationTask.task_id)
             .where(GenerationTask.status == TaskStatus.PENDING)
@@ -76,12 +95,14 @@ class TaskRepository:
         task_id = await self._session.scalar(query)
         if task_id is None:
             return None
-        await self._session.execute(
+        claimed_at = await self._session.scalar(
             update(GenerationTask)
             .where(GenerationTask.task_id == task_id)
-            .values(status=TaskStatus.IN_PROGRESS)
+            .values(status=TaskStatus.IN_PROGRESS, status_changed_at=func.now())
+            .returning(GenerationTask.status_changed_at)
         )
-        return task_id
+        assert claimed_at is not None
+        return ClaimedTask(task_id, claimed_at)
 
     async def get_parameters(self, task_id: UUID) -> GenerationParameters | None:
         query = (
@@ -104,38 +125,56 @@ class TaskRepository:
             .values(prompt=prompt)
         )
 
-    # in_progress -> done; возвращает число изменённых строк (0 — статус уже иной).
-    async def mark_done(self, task_id: UUID, menu_id: UUID) -> int:
+    # in_progress -> done; None, если строка не изменилась (статус уже иной).
+    async def mark_done(self, task_id: UUID, menu_id: UUID) -> FinishedTask | None:
         result = await self._session.execute(
             update(GenerationTask)
             .where(
                 GenerationTask.task_id == task_id,
                 GenerationTask.status == TaskStatus.IN_PROGRESS,
             )
-            .values(status=TaskStatus.DONE, menu_id=menu_id, error=None)
+            .values(
+                status=TaskStatus.DONE,
+                menu_id=menu_id,
+                error=None,
+                status_changed_at=func.now(),
+            )
+            .returning(GenerationTask.created_at, GenerationTask.status_changed_at)
         )
-        return result.rowcount
+        row = result.one_or_none()
+        return None if row is None else FinishedTask(*row)
 
-    # in_progress -> failed; возвращает число изменённых строк.
-    async def mark_failed(self, task_id: UUID, error: str) -> int:
+    # in_progress -> failed; None, если строка не изменилась.
+    async def mark_failed(self, task_id: UUID, error: str) -> FinishedTask | None:
         result = await self._session.execute(
             update(GenerationTask)
             .where(
                 GenerationTask.task_id == task_id,
                 GenerationTask.status == TaskStatus.IN_PROGRESS,
             )
-            .values(status=TaskStatus.FAILED, error=error)
+            .values(
+                status=TaskStatus.FAILED,
+                error=error,
+                status_changed_at=func.now(),
+            )
+            .returning(GenerationTask.created_at, GenerationTask.status_changed_at)
         )
-        return result.rowcount
+        row = result.one_or_none()
+        return None if row is None else FinishedTask(*row)
 
-    # Восстановление при старте: все in_progress -> failed. Возвращает их число.
-    async def fail_in_progress(self, error: str) -> int:
+    # Восстановление при старте: все in_progress -> failed. Возвращает их времена.
+    async def fail_in_progress(self, error: str) -> list[FinishedTask]:
         result = await self._session.execute(
             update(GenerationTask)
             .where(GenerationTask.status == TaskStatus.IN_PROGRESS)
-            .values(status=TaskStatus.FAILED, error=error)
+            .values(
+                status=TaskStatus.FAILED,
+                error=error,
+                status_changed_at=func.now(),
+            )
+            .returning(GenerationTask.created_at, GenerationTask.status_changed_at)
         )
-        return result.rowcount
+        return [FinishedTask(*row) for row in result.all()]
 
 
 class MenuRepository:

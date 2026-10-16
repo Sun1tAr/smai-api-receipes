@@ -2,15 +2,19 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 from fakes import unavailable_db_settings
 from prometheus_client import CollectorRegistry
 
+from receipes.db.repositories import FinishedTask
 from receipes.generation.metrics import GenerationMetrics
 from receipes.generation.worker import GenerationWorker
 from receipes.observability import configure_logging
+
+CREATED = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
 
 
 class StopLoop(BaseException):
@@ -21,13 +25,17 @@ async def held() -> bool:
     return True
 
 
-def make_worker(sleep: Callable[..., Any], factory: Any = None) -> GenerationWorker:
+def make_worker(
+    sleep: Callable[..., Any],
+    factory: Any = None,
+    registry: CollectorRegistry | None = None,
+) -> GenerationWorker:
     return GenerationWorker(
         factory,
         None,  # type: ignore[arg-type]
         None,  # type: ignore[arg-type]
         unavailable_db_settings(generation_worker_interval_seconds=7),
-        GenerationMetrics(CollectorRegistry()),
+        GenerationMetrics(registry or CollectorRegistry()),
         sleep=sleep,
     )
 
@@ -214,17 +222,24 @@ async def test_recovery_retries_until_the_database_answers(
         def __init__(self, session: object) -> None:
             pass
 
-        async def fail_in_progress(self, error: str) -> int:
+        async def fail_in_progress(self, error: str) -> list[FinishedTask]:
             calls.append(error)
-            return 2
+            return [FinishedTask(CREATED, CREATED + timedelta(seconds=40))] * 2
 
     monkeypatch.setattr("receipes.generation.worker.TaskRepository", Repository)
     factory = FailingThenWorkingSession(failures=2)
-    worker = make_worker(sleep, factory)
+    registry = CollectorRegistry()
+    worker = make_worker(sleep, factory, registry)
     await worker.recover()
     assert factory.attempts == 3
     assert sleeps == [7, 7]
     assert calls == ["Service restarted"]
+    # Восстановленные задачи попадают только в полное время задачи.
+    name = "recipes_generation_task_duration_seconds"
+    assert registry.get_sample_value(f"{name}_count", {"status": "failed"}) == 2
+    assert registry.get_sample_value(f"{name}_sum", {"status": "failed"}) == 80
+    processing = "recipes_generation_task_processing_seconds_count"
+    assert registry.get_sample_value(processing, {"status": "failed"}) == 0
 
 
 async def test_standby_waits_ten_seconds_between_lock_attempts_not_the_interval() -> (

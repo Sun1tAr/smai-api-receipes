@@ -1,8 +1,36 @@
-from prometheus_client import CollectorRegistry, Counter, Histogram
+from datetime import datetime, timedelta
+
+import structlog
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+
+logger = structlog.get_logger()
 
 # Генерация идёт от секунд до десятков минут в худшем случае: свои границы.
 DURATION_BUCKETS = (5, 10, 20, 30, 60, 120, 300, 600)
+# Очередь Ollama последовательна, таймаут вызова 360 с (SMAI-95).
+TASK_BUCKETS = (
+    5,
+    10,
+    20,
+    30,
+    60,
+    90,
+    120,
+    180,
+    240,
+    300,
+    360,
+    480,
+    600,
+    900,
+    1200,
+    1800,
+    3600,
+)
 TASK_STATUSES = ("done", "failed")
+# Все статусы LE-6; возраст самой старой задачи имеет смысл только у незавершённых.
+QUEUE_STATUSES = ("pending", "in_progress", "done", "failed")
+AGE_STATUSES = ("pending", "in_progress")
 OLLAMA_OUTCOMES = (
     "success",
     "timeout",
@@ -55,9 +83,75 @@ class GenerationMetrics:
             ["reason"],
             registry=registry,
         )
+        self.queue_tasks = Gauge(
+            "recipes_generation_tasks",
+            "Generation tasks by status, refreshed in the background.",
+            ["status"],
+            registry=registry,
+        )
+        self.oldest_age = Gauge(
+            "recipes_generation_task_oldest_age_seconds",
+            "Age of the oldest task in the status, 0 if there are none.",
+            ["status"],
+            registry=registry,
+        )
+        self.task_duration = Histogram(
+            "recipes_generation_task_duration_seconds",
+            "Task creation to its terminal status, including the queue wait.",
+            ["status"],
+            buckets=TASK_BUCKETS,
+            registry=registry,
+        )
+        self.task_processing = Histogram(
+            "recipes_generation_task_processing_seconds",
+            "Time the task spent in in_progress.",
+            ["status"],
+            buckets=TASK_BUCKETS,
+            registry=registry,
+        )
+        self.refresh_timestamp = Gauge(
+            "recipes_generation_tasks_refresh_timestamp_seconds",
+            "Unix time of the last successful refresh of the queue gauges.",
+            registry=registry,
+        )
+        for status in QUEUE_STATUSES:
+            self.queue_tasks.labels(status).set(0)
+        for status in AGE_STATUSES:
+            self.oldest_age.labels(status).set(0)
+        self.refresh_timestamp.set(0)
+        for status in TASK_STATUSES:
+            self.task_duration.labels(status)
+            self.task_processing.labels(status)
         for status in TASK_STATUSES:
             self.tasks.labels(status)
         for outcome in OLLAMA_OUTCOMES:
             self.ollama_requests.labels(outcome)
         for reason in REJECT_REASONS:
             self.rejected.labels(reason)
+
+    # Вызывать только после commit терминального перехода: ровно один раз на задачу.
+    # processing не пишется, если начало обработки неизвестно (восстановление).
+    def observe_finished(
+        self,
+        status: str,
+        created_at: datetime,
+        finished_at: datetime,
+        claimed_at: datetime | None = None,
+    ) -> None:
+        self.task_duration.labels(status).observe(
+            self._seconds(finished_at - created_at)
+        )
+        if claimed_at is not None:
+            self.task_processing.labels(status).observe(
+                self._seconds(finished_at - claimed_at)
+            )
+
+    # created_at пишет приложение, остальное БД: расхождение часов не должно давать
+    # отрицательных наблюдений, но и теряться молча не должно.
+    @staticmethod
+    def _seconds(delta: timedelta) -> float:
+        seconds = delta.total_seconds()
+        if seconds < 0:
+            logger.debug("generation_metrics_negative_duration", seconds=seconds)
+            return 0.0
+        return seconds

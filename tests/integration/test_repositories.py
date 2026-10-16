@@ -19,6 +19,7 @@ from receipes.db.models import (
     RecipeIngredient,
 )
 from receipes.db.repositories import (
+    ClaimedTask,
     MenuRepository,
     PromptTemplateRepository,
     TaskRepository,
@@ -90,7 +91,8 @@ async def test_claim_takes_oldest_pending_and_marks_in_progress(
     first = await create_task(session_factory)
     second = await create_task(session_factory)
     async with session_factory() as session, session.begin():
-        assert await TaskRepository(session).claim_next() == first
+        claim = await TaskRepository(session).claim_next()
+        assert claim is not None and claim.task_id == first
     async with session_factory() as session:
         claimed = await TaskRepository(session).get(first)
         waiting = await TaskRepository(session).get(second)
@@ -110,7 +112,7 @@ async def test_concurrent_claims_never_take_the_same_task(
     held = asyncio.Event()
     release = asyncio.Event()
 
-    async def holder() -> UUID | None:
+    async def holder() -> ClaimedTask | None:
         async with session_factory() as session, session.begin():
             claimed = await TaskRepository(session).claim_next()
             held.set()
@@ -123,7 +125,8 @@ async def test_concurrent_claims_never_take_the_same_task(
     async with session_factory() as session, session.begin():
         assert await TaskRepository(session).claim_next() is None
     release.set()
-    assert await first == only
+    held_claim = await first
+    assert held_claim is not None and held_claim.task_id == only
 
 
 async def test_two_pending_tasks_are_claimed_by_different_workers(
@@ -133,7 +136,7 @@ async def test_two_pending_tasks_are_claimed_by_different_workers(
     held = asyncio.Event()
     release = asyncio.Event()
 
-    async def holder() -> UUID | None:
+    async def holder() -> ClaimedTask | None:
         async with session_factory() as session, session.begin():
             claimed = await TaskRepository(session).claim_next()
             held.set()
@@ -145,7 +148,8 @@ async def test_two_pending_tasks_are_claimed_by_different_workers(
     async with session_factory() as session, session.begin():
         second = await TaskRepository(session).claim_next()
     release.set()
-    assert {await first, second} == created
+    claims = [await first, second]
+    assert {claim.task_id for claim in claims if claim} == created
 
 
 async def test_prompt_and_parameters_are_stored_and_read(
@@ -166,9 +170,9 @@ async def test_prompt_and_parameters_are_stored_and_read(
 async def claimed_task(factory: Factory) -> UUID:
     await create_task(factory)
     async with factory() as session, session.begin():
-        task_id = await TaskRepository(session).claim_next()
-    assert task_id is not None
-    return task_id
+        claim = await TaskRepository(session).claim_next()
+    assert claim is not None
+    return claim.task_id
 
 
 async def test_mark_failed_is_conditional_on_in_progress(
@@ -176,12 +180,12 @@ async def test_mark_failed_is_conditional_on_in_progress(
 ) -> None:
     pending = await create_task(session_factory)
     async with session_factory() as session, session.begin():
-        assert await TaskRepository(session).mark_failed(pending, "x") == 0
+        assert await TaskRepository(session).mark_failed(pending, "x") is None
     task_id = await claimed_task(session_factory)
     async with session_factory() as session, session.begin():
         repository = TaskRepository(session)
-        assert await repository.mark_failed(task_id, "Neurocore timeout") == 1
-        assert await repository.mark_failed(task_id, "second") == 0
+        assert await repository.mark_failed(task_id, "Neurocore timeout") is not None
+        assert await repository.mark_failed(task_id, "second") is None
     async with session_factory() as session:
         task = await TaskRepository(session).get(task_id)
     assert task is not None
@@ -197,9 +201,9 @@ async def test_mark_done_is_conditional_and_needs_in_progress(
             menu_of(recipe("A", "Соль"), recipe("B", "Соль"), recipe("C", "Соль"))
         )
         repository = TaskRepository(session)
-        assert await repository.mark_done(task_id, menu_id) == 1
-        assert await repository.mark_done(task_id, menu_id) == 0
-        assert await repository.mark_failed(task_id, "late") == 0
+        assert await repository.mark_done(task_id, menu_id) is not None
+        assert await repository.mark_done(task_id, menu_id) is None
+        assert await repository.mark_failed(task_id, "late") is None
     async with session_factory() as session:
         task = await TaskRepository(session).get(task_id)
     assert task is not None
@@ -212,7 +216,8 @@ async def test_fail_in_progress_only_touches_in_progress(
     stuck = await claimed_task(session_factory)
     waiting = await create_task(session_factory)
     async with session_factory() as session, session.begin():
-        assert await TaskRepository(session).fail_in_progress("Service restarted") == 1
+        recovered = await TaskRepository(session).fail_in_progress("Service restarted")
+        assert len(recovered) == 1
     async with session_factory() as session:
         repository = TaskRepository(session)
         failed = await repository.get(stuck)

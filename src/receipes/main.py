@@ -27,6 +27,7 @@ from receipes.config import Settings
 from receipes.database import create_engine, create_lock_engine
 from receipes.errors import error_response, register_error_handlers
 from receipes.generation.metrics import GenerationMetrics
+from receipes.generation.metrics_refresh import QueueMetricsRefresher
 from receipes.generation.ollama import OllamaClient
 from receipes.generation.worker import GenerationWorker
 from receipes.health import dependencies_ready, router
@@ -128,10 +129,17 @@ def create_app(
         session_factory, lock_engine, ollama, settings, generation_metrics
     )
 
+    refresher = QueueMetricsRefresher(
+        session_factory,
+        generation_metrics,
+        settings.generation_metrics_refresh_seconds,
+    )
+
     # Владение соединениями и экспортёром ограничено жизненным циклом приложения.
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         worker_task: asyncio.Task[None] | None = None
+        refresh_task: asyncio.Task[None] | None = None
         instrumentor = SQLAlchemyInstrumentor()
         instrumentor.instrument(engine=engine.sync_engine, tracer_provider=provider)
         try:
@@ -139,9 +147,15 @@ def create_app(
                 raise RuntimeError("Service dependencies are unavailable")
             if settings.generation_worker_enabled:
                 worker_task = asyncio.create_task(worker.run(), name="generation")
+            # Фоном и без ожидания первого тика: недоступная БД не мешает старту.
+            refresh_task = asyncio.create_task(refresher.run(), name="queue-metrics")
             logger.info("service_started")
             yield
         finally:
+            if refresh_task is not None:
+                refresh_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await refresh_task
             if worker_task is not None:
                 # CancelledError воркера не глотается им самим; прерванная задача
                 # остаётся in_progress до следующего старта.
