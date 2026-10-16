@@ -14,6 +14,7 @@ from prometheus_client import CollectorRegistry
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from receipes.api.dependencies import SqlTaskStore
 from receipes.config import Settings
 from receipes.db.models import (
     GenerationTask,
@@ -130,7 +131,8 @@ async def test_successful_cycle_saves_menu_and_marks_done(
     assert harness.sample("menu_generation_tasks_total", status="failed") == 0
 
 
-async def test_prompt_is_rendered_from_the_active_template_and_sent_once(
+# Фолбэк: задача без сохранённого промпта (создана до SMAI-94 или без шаблона).
+async def test_task_without_saved_prompt_gets_it_rendered_by_the_worker(
     ready: Factory, settings: Settings
 ) -> None:
     task_id = await add_task(ready, 4, "5000.50")
@@ -143,7 +145,8 @@ async def test_prompt_is_rendered_from_the_active_template_and_sent_once(
     assert harness.requests[0]["prompt"] == expected
 
 
-async def test_newest_template_is_used(
+# Фолбэк для задачи без сохранённого промпта: берётся самый новый шаблон.
+async def test_worker_fallback_uses_the_newest_template(
     session_factory: Factory, settings: Settings
 ) -> None:
     await add_template(session_factory, "старый {people_count} {weekly_budget}")
@@ -794,3 +797,58 @@ async def test_started_application_runs_the_worker_and_stops_it_cleanly(
             await asyncio.sleep(0.05)
         else:
             raise AssertionError("worker did not finish the task")
+
+
+# SMAI-94: промпт сохраняется при создании задачи, а не только при захвате воркером.
+async def test_prompt_is_saved_when_the_task_is_created(ready: Factory) -> None:
+    task_id = await SqlTaskStore(ready).create(4, Decimal("5000.50"))
+    async with ready() as session:
+        assert await TaskRepository(session).get_prompt(task_id) == (
+            "Меню для 4 человек, бюджет 5000.5 рублей."
+        )
+
+
+async def test_worker_uses_the_prompt_saved_at_creation(
+    ready: Factory, settings: Settings
+) -> None:
+    task_id = await SqlTaskStore(ready).create(4, Decimal("5000.50"))
+    await add_template(ready, "новый {people_count} {weekly_budget}")
+    harness = rig(ready, settings)
+    await harness.worker.process_one()
+    expected = "Меню для 4 человек, бюджет 5000.5 рублей."
+    assert (await harness.task(task_id)).prompt == expected
+    assert harness.requests[0]["prompt"] == expected
+
+
+@pytest.mark.parametrize(
+    ("template", "reason"),
+    [(None, "missing"), ("нет плейсхолдеров", "invalid")],
+)
+async def test_task_is_created_without_prompt_when_template_is_unusable(
+    session_factory: Factory,
+    settings: Settings,
+    capsys: pytest.CaptureFixture[str],
+    template: str | None,
+    reason: str,
+) -> None:
+    configure_logging("INFO")
+    if template is not None:
+        template += " СЕКРЕТНЫЙ-ТЕКСТ-ШАБЛОНА"
+        await add_template(session_factory, template)
+    task_id = await SqlTaskStore(session_factory).create(4, Decimal("5000.50"))
+    async with session_factory() as session:
+        assert await TaskRepository(session).get_prompt(task_id) is None
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("{")]
+    entries = [item for item in map(json.loads, lines) if item["level"] == "warning"]
+    assert [(item["message"], item["reason"], item["task_id"]) for item in entries] == [
+        ("task_prompt_not_saved", reason, str(task_id))
+    ]
+    assert "5000" not in "".join(lines)
+    assert "СЕКРЕТНЫЙ" not in "".join(lines)
+    # Шаблон появился позже: воркер соберёт промпт сам.
+    await add_template(session_factory)
+    harness = rig(session_factory, settings)
+    await harness.worker.process_one()
+    done = await harness.task(task_id)
+    assert done.status == TaskStatus.DONE
+    assert done.prompt == "Меню для 4 человек, бюджет 5000.5 рублей."

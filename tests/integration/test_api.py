@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from receipes.config import Settings
-from receipes.db.models import GenerationParameters, GenerationTask
+from receipes.db.models import GenerationParameters, GenerationTask, PromptTemplate
 from receipes.db.repositories import MenuRepository, TaskRepository
 from receipes.domain.menu import (
     IngredientPayload,
@@ -73,6 +73,10 @@ def stored_menu() -> MenuPayload:
 async def test_post_creates_pending_task_with_parameters_in_the_database(
     api: httpx.AsyncClient, session_factory: Factory
 ) -> None:
+    async with session_factory() as session, session.begin():
+        session.add(
+            PromptTemplate(template="{people_count} чел., {weekly_budget} руб.")
+        )
     response = await api.post(
         "/generate-menu", json={"peopleCount": 3, "weeklyBudget": 1234.5}
     )
@@ -84,7 +88,7 @@ async def test_post_creates_pending_task_with_parameters_in_the_database(
         assert (task.status, task.menu_id, task.prompt, task.error) == (
             TaskStatus.PENDING,
             None,
-            None,
+            "3 чел., 1234.5 руб.",
             None,
         )
         parameters = await session.get(GenerationParameters, task.parameters_id)

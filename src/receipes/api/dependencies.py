@@ -2,11 +2,16 @@ from decimal import Decimal
 from typing import Protocol
 from uuid import UUID
 
+import structlog
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from receipes.db.models import GenerationTask
-from receipes.db.repositories import TaskRepository
+from receipes.db.repositories import PromptTemplateRepository, TaskRepository
+from receipes.domain.errors import PromptTemplateError
+from receipes.generation.prompt import render_prompt
+
+logger = structlog.get_logger()
 
 
 # Порт хранилища задач для API: каждая операция идёт в своей транзакции.
@@ -22,7 +27,32 @@ class SqlTaskStore:
 
     async def create(self, people_count: int, weekly_budget: Decimal) -> UUID:
         async with self._sessions() as session, session.begin():
-            return await TaskRepository(session).create(people_count, weekly_budget)
+            prompt, problem = await self._render_prompt(
+                session, people_count, weekly_budget
+            )
+            task_id = await TaskRepository(session).create(
+                people_count, weekly_budget, prompt
+            )
+        if problem is not None:
+            logger.warning(
+                "task_prompt_not_saved", task_id=str(task_id), reason=problem
+            )
+        return task_id
+
+    # Промпт фиксируется на момент создания задачи. Нет годного шаблона: задача всё
+    # равно принимается, промпт соберёт воркер. Второе значение — причина (для лога
+    # после коммита); текст промпта и параметры в лог не попадают.
+    @staticmethod
+    async def _render_prompt(
+        session: AsyncSession, people_count: int, weekly_budget: Decimal
+    ) -> tuple[str | None, str | None]:
+        template = await PromptTemplateRepository(session).get_active()
+        if template is None:
+            return None, "missing"
+        try:
+            return render_prompt(template.template, people_count, weekly_budget), None
+        except PromptTemplateError:
+            return None, "invalid"
 
     async def get(self, task_id: UUID) -> GenerationTask | None:
         async with self._sessions() as session:
