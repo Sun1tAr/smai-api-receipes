@@ -32,6 +32,57 @@ class GenerationParameters(Base):
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     people_count: Mapped[int] = mapped_column(Integer)
     weekly_budget: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    # Идентификаторы справочников MS-2 хранятся числами без FK (другая БД).
+    diet_id: Mapped[int | None] = mapped_column(Integer)
+
+    habits: Mapped[list["GenerationParameterHabit"]] = relationship(lazy="raise")
+    allergies: Mapped[list["GenerationParameterAllergen"]] = relationship(lazy="raise")
+    kitchen_tools: Mapped[list["GenerationParameterKitchenTool"]] = relationship(
+        lazy="raise"
+    )
+
+
+class GenerationParameterHabit(Base):
+    __tablename__ = "generation_parameter_habits"
+    __table_args__ = (
+        Index("ix_generation_parameter_habits_parameters_id", "parameters_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    parameters_id: Mapped[UUID] = mapped_column(
+        ForeignKey("generation_parameters.id", name="fk_gen_param_habits_parameters_id")
+    )
+    habit_id: Mapped[int] = mapped_column(Integer)
+
+
+class GenerationParameterAllergen(Base):
+    __tablename__ = "generation_parameter_allergies"
+    __table_args__ = (
+        Index("ix_generation_parameter_allergies_parameters_id", "parameters_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    parameters_id: Mapped[UUID] = mapped_column(
+        ForeignKey(
+            "generation_parameters.id", name="fk_gen_param_allergies_parameters_id"
+        )
+    )
+    allergen_id: Mapped[int] = mapped_column(Integer)
+
+
+class GenerationParameterKitchenTool(Base):
+    __tablename__ = "generation_parameter_kitchen_tools"
+    __table_args__ = (
+        Index("ix_generation_parameter_kitchen_tools_parameters_id", "parameters_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    parameters_id: Mapped[UUID] = mapped_column(
+        ForeignKey(
+            "generation_parameters.id", name="fk_gen_param_kitchen_tools_parameters_id"
+        )
+    )
+    kitchen_tool_id: Mapped[int] = mapped_column(Integer)
 
 
 class Nutrition(Base):

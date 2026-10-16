@@ -1,4 +1,3 @@
-from decimal import Decimal
 from typing import Protocol
 from uuid import UUID
 
@@ -9,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from receipes.db.models import GenerationTask
 from receipes.db.repositories import PromptTemplateRepository, TaskRepository
 from receipes.domain.errors import PromptTemplateError
+from receipes.domain.params import GenerationParams
 from receipes.generation.prompt import render_prompt
 
 logger = structlog.get_logger()
@@ -16,7 +16,7 @@ logger = structlog.get_logger()
 
 # Порт хранилища задач для API: каждая операция идёт в своей транзакции.
 class TaskStore(Protocol):
-    async def create(self, people_count: int, weekly_budget: Decimal) -> UUID: ...
+    async def create(self, params: GenerationParams) -> UUID: ...
 
     async def get(self, task_id: UUID) -> GenerationTask | None: ...
 
@@ -25,14 +25,10 @@ class SqlTaskStore:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = session_factory
 
-    async def create(self, people_count: int, weekly_budget: Decimal) -> UUID:
+    async def create(self, params: GenerationParams) -> UUID:
         async with self._sessions() as session, session.begin():
-            prompt, problem = await self._render_prompt(
-                session, people_count, weekly_budget
-            )
-            task_id = await TaskRepository(session).create(
-                people_count, weekly_budget, prompt
-            )
+            prompt, problem = await self._render_prompt(session, params)
+            task_id = await TaskRepository(session).create(params, prompt)
         if problem is not None:
             logger.warning(
                 "task_prompt_not_saved", task_id=str(task_id), reason=problem
@@ -44,13 +40,18 @@ class SqlTaskStore:
     # после коммита); текст промпта и параметры в лог не попадают.
     @staticmethod
     async def _render_prompt(
-        session: AsyncSession, people_count: int, weekly_budget: Decimal
+        session: AsyncSession, params: GenerationParams
     ) -> tuple[str | None, str | None]:
         template = await PromptTemplateRepository(session).get_active()
         if template is None:
             return None, "missing"
         try:
-            return render_prompt(template.template, people_count, weekly_budget), None
+            return (
+                render_prompt(
+                    template.template, params.people_count, params.weekly_budget
+                ),
+                None,
+            )
         except PromptTemplateError:
             return None, "invalid"
 

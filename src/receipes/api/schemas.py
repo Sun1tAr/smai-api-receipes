@@ -6,12 +6,19 @@ from pydantic import (
     ConfigDict,
     Field,
     PlainSerializer,
+    StrictInt,
     WithJsonSchema,
     field_validator,
 )
 
 MAX_PEOPLE = 20
 MAX_BUDGET = 1_000_000
+INT4_MIN = -(2**31)
+INT4_MAX = 2**31 - 1
+
+# Идентификатор справочника MS-2. Диапазон int4 — это тип колонки в БД; знак и
+# существование ID проверяются отдельно (SMAI-87).
+DictionaryId = Annotated[StrictInt, Field(ge=INT4_MIN, le=INT4_MAX)]
 
 
 # Целые значения отдаются как `35`, дробные как `35.5` (не `35.0`): клиент с Int
@@ -30,7 +37,16 @@ Number = Annotated[
 class GenerateMenuRequest(BaseModel):
     # Только camelCase из контракта: snake_case (`people_count`) не принимается.
     model_config = ConfigDict(
-        json_schema_extra={"example": {"peopleCount": 4, "weeklyBudget": 5000}},
+        json_schema_extra={
+            "example": {
+                "peopleCount": 4,
+                "weeklyBudget": 5000,
+                "habits": [3, 5],
+                "diet": 4,
+                "allergies": [1, 2],
+                "kitchenTools": [1, 2, 6],
+            }
+        },
     )
 
     people_count: int = Field(
@@ -53,6 +69,40 @@ class GenerateMenuRequest(BaseModel):
             f"Недельный бюджет в рублях: число больше 0 и не больше {MAX_BUDGET}, "
             "не более двух знаков после запятой. Строки отклоняются."
         ),
+    )
+
+    habits: list[DictionaryId] = Field(
+        description=(
+            "Идентификаторы пищевых привычек из справочника MS-2 (API-7). Поле "
+            "обязательно, но выбор может быть пустым: `[]`. Повторы сохраняются "
+            "один раз. Элементы только целые числа (int4): строки, `true`, `4.0` и "
+            "`null` отклоняются."
+        ),
+        examples=[[3, 5]],
+    )
+    diet: DictionaryId | None = Field(
+        default=None,
+        description=(
+            "Идентификатор диеты из справочника MS-2 или `null`. Поле можно не "
+            "передавать, это то же самое, что `null`."
+        ),
+        examples=[4],
+    )
+    allergies: list[DictionaryId] = Field(
+        default_factory=list,
+        description=(
+            "Идентификаторы аллергенов из справочника MS-2. Поле можно не "
+            "передавать, это то же самое, что `[]`. Повторы сохраняются один раз."
+        ),
+        examples=[[1, 2]],
+    )
+    kitchen_tools: list[DictionaryId] = Field(
+        alias="kitchenTools",
+        description=(
+            "Идентификаторы кухонной техники из справочника MS-2. Поле обязательно, "
+            "но выбор может быть пустым: `[]`. Повторы сохраняются один раз."
+        ),
+        examples=[[1, 2, 6]],
     )
 
     @field_validator("weekly_budget", mode="after")

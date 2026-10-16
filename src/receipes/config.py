@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     ollama_temperature: float = Field(default=0.3, ge=0, le=2)
     ollama_keep_alive: str = Field(default="30m", min_length=1)
 
+    # Справочники MS-2 (API-7). Не задан — клиент не создаётся; обязательным адрес
+    # станет в SMAI-87, когда MS-4 начнёт проверять ID.
+    ms2_base_url: AnyHttpUrl | None = None
+    ms2_timeout_seconds: float = Field(default=5, gt=0, le=60)
+
     # Фоновая генерация меню.
     generation_worker_enabled: bool = True
     generation_worker_interval_seconds: float = Field(default=2, gt=0, le=3600)
@@ -99,7 +104,9 @@ class Settings(BaseSettings):
         return value
 
     # Учётные данные в URL попали бы в логи, трейсы и сообщения об ошибках.
-    @field_validator("ollama_base_url", "otel_exporter_otlp_endpoint", mode="after")
+    @field_validator(
+        "ollama_base_url", "otel_exporter_otlp_endpoint", "ms2_base_url", mode="after"
+    )
     @classmethod
     def reject_url_credentials(cls, value: AnyHttpUrl | None) -> AnyHttpUrl | None:
         if value is not None and (value.username or value.password):

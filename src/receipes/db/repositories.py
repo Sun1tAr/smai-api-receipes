@@ -1,5 +1,4 @@
 from datetime import datetime
-from decimal import Decimal
 from typing import NamedTuple
 from uuid import UUID, uuid4
 
@@ -8,6 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from receipes.db.models import (
+    GenerationParameterAllergen,
+    GenerationParameterHabit,
+    GenerationParameterKitchenTool,
     GenerationParameters,
     GenerationTask,
     Ingredient,
@@ -22,6 +24,7 @@ from receipes.db.models import (
 )
 from receipes.domain.menu import MenuPayload
 from receipes.domain.names import name_key, normalize_name
+from receipes.domain.params import GenerationParams
 from receipes.domain.status import TaskStatus
 
 # Репозитории работают в транзакции вызывающего кода и сами не делают commit.
@@ -39,18 +42,46 @@ class FinishedTask(NamedTuple):
     finished_at: datetime
 
 
+_PARAMETER_LINKS = (
+    selectinload(GenerationParameters.habits),
+    selectinload(GenerationParameters.allergies),
+    selectinload(GenerationParameters.kitchen_tools),
+)
+
+
 class TaskRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
     # Параметры и задача pending создаются вместе; возвращается task_id. Промпт, если
     # он уже собран, сохраняется сразу; иначе его добавит воркер при захвате.
-    async def create(
-        self, people_count: int, weekly_budget: Decimal, prompt: str | None = None
-    ) -> UUID:
+    async def create(self, params: GenerationParams, prompt: str | None = None) -> UUID:
         parameters = GenerationParameters(
-            id=uuid4(), people_count=people_count, weekly_budget=weekly_budget
+            id=uuid4(),
+            people_count=params.people_count,
+            weekly_budget=params.weekly_budget,
+            diet_id=params.diet,
         )
+        links: list[object] = [
+            *(
+                GenerationParameterHabit(
+                    id=uuid4(), parameters_id=parameters.id, habit_id=value
+                )
+                for value in params.habits
+            ),
+            *(
+                GenerationParameterAllergen(
+                    id=uuid4(), parameters_id=parameters.id, allergen_id=value
+                )
+                for value in params.allergies
+            ),
+            *(
+                GenerationParameterKitchenTool(
+                    id=uuid4(), parameters_id=parameters.id, kitchen_tool_id=value
+                )
+                for value in params.kitchen_tools
+            ),
+        ]
         created_at = utcnow()
         task = GenerationTask(
             task_id=uuid4(),
@@ -60,7 +91,7 @@ class TaskRepository:
             created_at=created_at,
             status_changed_at=created_at,
         )
-        self._session.add_all([parameters, task])
+        self._session.add_all([parameters, *links, task])
         await self._session.flush()
         return task.task_id
 
@@ -72,7 +103,7 @@ class TaskRepository:
             select(GenerationTask)
             .where(GenerationTask.task_id == task_id)
             .options(
-                selectinload(GenerationTask.parameters),
+                selectinload(GenerationTask.parameters).options(*_PARAMETER_LINKS),
                 recipe_load.selectinload(Recipe.nutrition),
                 recipe_load.selectinload(Recipe.instructions),
                 recipe_load.selectinload(Recipe.ingredients).selectinload(
@@ -111,8 +142,25 @@ class TaskRepository:
                 GenerationTask, GenerationTask.parameters_id == GenerationParameters.id
             )
             .where(GenerationTask.task_id == task_id)
+            .options(*_PARAMETER_LINKS)
         )
         return await self._session.scalar(query)
+
+    # Параметры задачи целиком; списки отсортированы по ID, повторов нет.
+    async def get_params(self, task_id: UUID) -> GenerationParams | None:
+        row = await self.get_parameters(task_id)
+        if row is None:
+            return None
+        return GenerationParams(
+            people_count=row.people_count,
+            weekly_budget=row.weekly_budget,
+            habits=tuple(sorted(item.habit_id for item in row.habits)),
+            diet=row.diet_id,
+            allergies=tuple(sorted(item.allergen_id for item in row.allergies)),
+            kitchen_tools=tuple(
+                sorted(item.kitchen_tool_id for item in row.kitchen_tools)
+            ),
+        )
 
     async def get_prompt(self, task_id: UUID) -> str | None:
         query = select(GenerationTask.prompt).where(GenerationTask.task_id == task_id)

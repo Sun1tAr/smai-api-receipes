@@ -33,7 +33,13 @@ async def post_and_process(settings, factory, handler):
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
             created = await client.post(
-                "/generate-menu", json={"peopleCount": 4, "weeklyBudget": 5000}
+                "/generate-menu",
+                json={
+                    "peopleCount": 4,
+                    "weeklyBudget": 5000,
+                    "habits": [],
+                    "kitchenTools": [],
+                },
             )
             task_id = created.json()["task_id"]
             before = (await client.get(f"/generate-menu/{task_id}")).json()
@@ -105,7 +111,13 @@ async def test_status_is_in_progress_while_ollama_is_called(
         ) as client:
             holder["client"] = client
             created = await client.post(
-                "/generate-menu", json={"peopleCount": 4, "weeklyBudget": 5000}
+                "/generate-menu",
+                json={
+                    "peopleCount": 4,
+                    "weeklyBudget": 5000,
+                    "habits": [],
+                    "kitchenTools": [],
+                },
             )
             holder["task_id"] = created.json()["task_id"]
             await app.state.worker.process_one()
@@ -158,7 +170,13 @@ async def test_worker_started_with_the_app_serves_a_posted_task(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
             created = await client.post(
-                "/generate-menu", json={"peopleCount": 2, "weeklyBudget": 900}
+                "/generate-menu",
+                json={
+                    "peopleCount": 2,
+                    "weeklyBudget": 900,
+                    "habits": [],
+                    "kitchenTools": [],
+                },
             )
             task_id = created.json()["task_id"]
             for _ in range(100):
@@ -175,7 +193,13 @@ async def create_tasks(client: httpx.AsyncClient, count: int) -> list[str]:
     ids = []
     for _ in range(count):
         created = await client.post(
-            "/generate-menu", json={"peopleCount": 2, "weeklyBudget": 700}
+            "/generate-menu",
+            json={
+                "peopleCount": 2,
+                "weeklyBudget": 700,
+                "habits": [],
+                "kitchenTools": [],
+            },
         )
         ids.append(created.json()["task_id"])
     return ids

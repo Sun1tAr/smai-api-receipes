@@ -16,6 +16,7 @@ from receipes.config import Settings
 from receipes.database import create_lock_engine
 from receipes.db.models import PromptTemplate
 from receipes.db.repositories import TaskRepository
+from receipes.domain.params import GenerationParams
 from receipes.domain.status import TaskStatus
 from receipes.generation.metrics import GenerationMetrics
 from receipes.generation.ollama import OllamaClient
@@ -72,7 +73,9 @@ async def stop(task: asyncio.Task) -> None:
 
 async def stuck_task(factory: Factory):
     async with factory() as session, session.begin():
-        task_id = await TaskRepository(session).create(2, Decimal("100"))
+        task_id = await TaskRepository(session).create(
+            GenerationParams(2, Decimal("100"))
+        )
         await TaskRepository(session).claim_next()
     return task_id
 
@@ -130,7 +133,9 @@ async def test_second_worker_does_not_take_tasks_while_the_lock_is_busy(
     holder = make_worker(session_factory, settings)
     assert await holder._ensure_lock() is True
     async with session_factory() as session, session.begin():
-        task_id = await TaskRepository(session).create(2, Decimal("100"))
+        task_id = await TaskRepository(session).create(
+            GenerationParams(2, Decimal("100"))
+        )
     other = make_worker(session_factory, settings)
     running = asyncio.create_task(other.run())
     await asyncio.sleep(0.3)

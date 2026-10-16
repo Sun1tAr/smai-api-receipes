@@ -25,6 +25,7 @@ from receipes.api.menu import restore_example_nulls
 from receipes.api.menu import router as menu_router
 from receipes.config import Settings
 from receipes.database import create_engine, create_lock_engine
+from receipes.dictionaries import DictionaryClient
 from receipes.errors import error_response, register_error_handlers
 from receipes.generation.metrics import GenerationMetrics
 from receipes.generation.metrics_refresh import QueueMetricsRefresher
@@ -105,6 +106,7 @@ def create_app(
     settings: Settings | None = None,
     *,
     ollama_transport: httpx.AsyncBaseTransport | None = None,
+    ms2_transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     configure_logging(settings.log_level)
@@ -123,6 +125,13 @@ def create_app(
         OllamaClient.build_http_client(settings, ollama_transport),
         generation_metrics,
         provider.get_tracer("receipes.ollama"),
+    )
+    # Клиент справочников MS-2 создаётся только при заданном MS2_BASE_URL; в
+    # SMAI-88 его пока никто не вызывает (проверка ID — SMAI-87).
+    dictionaries = (
+        DictionaryClient(DictionaryClient.build_http_client(settings, ms2_transport))
+        if settings.ms2_base_url is not None
+        else None
     )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     worker = GenerationWorker(
@@ -163,6 +172,8 @@ def create_app(
                 with suppress(asyncio.CancelledError):
                     await worker_task
             await ollama.aclose()
+            if dictionaries is not None:
+                await dictionaries.aclose()
             await lock_engine.dispose()
             await engine.dispose()
             instrumentor.uninstrument()
@@ -180,6 +191,7 @@ def create_app(
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.ollama = ollama
+    app.state.dictionaries = dictionaries
     app.state.generation_metrics = generation_metrics
     app.state.worker = worker
     app.state.tracer_provider = provider

@@ -19,19 +19,22 @@ from receipes.db.models import (
     Recipe,
     RecipeIngredient,
 )
+from receipes.domain.params import GenerationParams
 from receipes.domain.status import TaskStatus
 
 
 class FakeStore:
     def __init__(self) -> None:
         self.created: list[tuple[int, Decimal]] = []
+        self.params: list[GenerationParams] = []
         self.tasks: dict[UUID, GenerationTask] = {}
         self.fail = False
 
-    async def create(self, people_count: int, weekly_budget: Decimal) -> UUID:
+    async def create(self, params: GenerationParams) -> UUID:
         if self.fail:
             raise ConnectionError("SELECT secret FROM users")
-        self.created.append((people_count, weekly_budget))
+        self.created.append((params.people_count, params.weekly_budget))
+        self.params.append(params)
         return UUID("b1e2c3d4-5678-90ab-cdef-1234567890ab")
 
     async def get(self, task_id: UUID) -> GenerationTask | None:
@@ -99,7 +102,8 @@ async def client(store: FakeStore):
 
 async def test_post_creates_task_and_returns_202_with_task_id(client, store) -> None:
     response = await client.post(
-        "/generate-menu", json={"peopleCount": 4, "weeklyBudget": 5000}
+        "/generate-menu",
+        json={"peopleCount": 4, "weeklyBudget": 5000, "habits": [], "kitchenTools": []},
     )
     assert response.status_code == 202
     assert response.json() == {"task_id": "b1e2c3d4-5678-90ab-cdef-1234567890ab"}
@@ -120,13 +124,19 @@ async def test_boundary_values_are_accepted(
     client, store, people: int, budget: float, expected: Decimal
 ) -> None:
     response = await client.post(
-        "/generate-menu", json={"peopleCount": people, "weeklyBudget": budget}
+        "/generate-menu",
+        json={
+            "peopleCount": people,
+            "weeklyBudget": budget,
+            "habits": [],
+            "kitchenTools": [],
+        },
     )
     assert response.status_code == 202
     assert store.created == [(people, expected)]
 
 
-async def test_fields_of_version_2_are_accepted_and_ignored(client, store) -> None:
+async def test_fields_of_version_2_are_passed_to_the_store(client, store) -> None:
     response = await client.post(
         "/generate-menu",
         json={
@@ -140,29 +150,85 @@ async def test_fields_of_version_2_are_accepted_and_ignored(client, store) -> No
         },
     )
     assert response.status_code == 202
-    assert store.created == [(2, Decimal("100.0"))]
+    assert store.params == [
+        GenerationParams(2, Decimal("100.0"), (3, 5), 4, (1,), (1, 2))
+    ]
 
 
-VALID_BODY = b'{"peopleCount": 4, "weeklyBudget": 5000}'
+VALID_BODY = (
+    b'{"peopleCount": 4, "weeklyBudget": 5000, "habits": [], "kitchenTools": []}'
+)
 BAD_BODIES = [
     pytest.param({}, id="empty-object"),
-    pytest.param({"weeklyBudget": 5000}, id="no-people"),
+    pytest.param(
+        {"weeklyBudget": 5000, "habits": [], "kitchenTools": []}, id="no-people"
+    ),
     pytest.param({"peopleCount": 4}, id="no-budget"),
-    pytest.param({"peopleCount": 0, "weeklyBudget": 5000}, id="people-0"),
-    pytest.param({"peopleCount": 21, "weeklyBudget": 5000}, id="people-21"),
-    pytest.param({"peopleCount": -1, "weeklyBudget": 5000}, id="people-neg"),
-    pytest.param({"peopleCount": "4", "weeklyBudget": 5000}, id="people-str"),
-    pytest.param({"peopleCount": True, "weeklyBudget": 5000}, id="people-bool"),
-    pytest.param({"peopleCount": 4.0, "weeklyBudget": 5000}, id="people-float"),
-    pytest.param({"peopleCount": None, "weeklyBudget": 5000}, id="people-null"),
-    pytest.param({"peopleCount": 4, "weeklyBudget": 0}, id="budget-0"),
-    pytest.param({"peopleCount": 4, "weeklyBudget": -1}, id="budget-neg"),
-    pytest.param({"peopleCount": 4, "weeklyBudget": 0.001}, id="budget-3-places"),
-    pytest.param({"peopleCount": 4, "weeklyBudget": 12.345}, id="budget-3-places-b"),
-    pytest.param({"peopleCount": 4, "weeklyBudget": 1000000.01}, id="budget-over"),
-    pytest.param({"peopleCount": 4, "weeklyBudget": "5000"}, id="budget-str"),
-    pytest.param({"peopleCount": 4, "weeklyBudget": True}, id="budget-bool"),
-    pytest.param({"peopleCount": 4, "weeklyBudget": None}, id="budget-null"),
+    pytest.param(
+        {"peopleCount": 0, "weeklyBudget": 5000, "habits": [], "kitchenTools": []},
+        id="people-0",
+    ),
+    pytest.param(
+        {"peopleCount": 21, "weeklyBudget": 5000, "habits": [], "kitchenTools": []},
+        id="people-21",
+    ),
+    pytest.param(
+        {"peopleCount": -1, "weeklyBudget": 5000, "habits": [], "kitchenTools": []},
+        id="people-neg",
+    ),
+    pytest.param(
+        {"peopleCount": "4", "weeklyBudget": 5000, "habits": [], "kitchenTools": []},
+        id="people-str",
+    ),
+    pytest.param(
+        {"peopleCount": True, "weeklyBudget": 5000, "habits": [], "kitchenTools": []},
+        id="people-bool",
+    ),
+    pytest.param(
+        {"peopleCount": 4.0, "weeklyBudget": 5000, "habits": [], "kitchenTools": []},
+        id="people-float",
+    ),
+    pytest.param(
+        {"peopleCount": None, "weeklyBudget": 5000, "habits": [], "kitchenTools": []},
+        id="people-null",
+    ),
+    pytest.param(
+        {"peopleCount": 4, "weeklyBudget": 0, "habits": [], "kitchenTools": []},
+        id="budget-0",
+    ),
+    pytest.param(
+        {"peopleCount": 4, "weeklyBudget": -1, "habits": [], "kitchenTools": []},
+        id="budget-neg",
+    ),
+    pytest.param(
+        {"peopleCount": 4, "weeklyBudget": 0.001, "habits": [], "kitchenTools": []},
+        id="budget-3-places",
+    ),
+    pytest.param(
+        {"peopleCount": 4, "weeklyBudget": 12.345, "habits": [], "kitchenTools": []},
+        id="budget-3-places-b",
+    ),
+    pytest.param(
+        {
+            "peopleCount": 4,
+            "weeklyBudget": 1000000.01,
+            "habits": [],
+            "kitchenTools": [],
+        },
+        id="budget-over",
+    ),
+    pytest.param(
+        {"peopleCount": 4, "weeklyBudget": "5000", "habits": [], "kitchenTools": []},
+        id="budget-str",
+    ),
+    pytest.param(
+        {"peopleCount": 4, "weeklyBudget": True, "habits": [], "kitchenTools": []},
+        id="budget-bool",
+    ),
+    pytest.param(
+        {"peopleCount": 4, "weeklyBudget": None, "habits": [], "kitchenTools": []},
+        id="budget-null",
+    ),
     pytest.param([1, 2], id="array"),
     pytest.param("text", id="string"),
     pytest.param(None, id="null"),
@@ -189,7 +255,10 @@ async def test_invalid_body_is_400_in_service_format(client, store, body) -> Non
 async def test_nan_and_infinity_are_rejected(client, store, literal: str) -> None:
     response = await client.post(
         "/generate-menu",
-        content=f'{{"peopleCount": 4, "weeklyBudget": {literal}}}',
+        content=(
+            f'{{"peopleCount": 4, "weeklyBudget": {literal}, '
+            '"habits": [], "kitchenTools": []}'
+        ),
         headers={"Content-Type": "application/json"},
     )
     assert response.status_code == 400
@@ -201,9 +270,12 @@ async def test_nan_and_infinity_are_rejected(client, store, literal: str) -> Non
     [
         (b"", "application/json"),
         (b"{broken", "application/json"),
-        (b'{"peopleCount": 4, "weeklyBudget": 5000}', "text/plain"),
         (
-            b'{"peopleCount": 4, "weeklyBudget": 5000}',
+            VALID_BODY,
+            "text/plain",
+        ),
+        (
+            VALID_BODY,
             "application/x-www-form-urlencoded",
         ),
     ],
@@ -223,7 +295,7 @@ async def test_post_database_failure_is_500_without_details(client, store) -> No
     store.fail = True
     response = await client.post(
         "/generate-menu",
-        json={"peopleCount": 4, "weeklyBudget": 5000},
+        json={"peopleCount": 4, "weeklyBudget": 5000, "habits": [], "kitchenTools": []},
         headers={"X-Request-ID": "rid-api1"},
     )
     assert response.status_code == 500
@@ -354,7 +426,12 @@ async def test_snake_case_fields_are_not_accepted(client, store) -> None:
     locs = {
         tuple(field["loc"]) for field in response.json()["error"]["details"]["fields"]
     }
-    assert locs == {("body", "peopleCount"), ("body", "weeklyBudget")}
+    assert locs == {
+        ("body", "peopleCount"),
+        ("body", "weeklyBudget"),
+        ("body", "habits"),
+        ("body", "kitchenTools"),
+    }
     assert store.created == []
 
 
@@ -381,3 +458,94 @@ async def test_task_id_path_parameter_is_documented(client) -> None:
     (parameter,) = document["paths"]["/generate-menu/{task_id}"]["get"]["parameters"]
     assert parameter["name"] == "task_id" and parameter["in"] == "path"
     assert "UUID" in parameter["description"]
+
+
+BASE = {"peopleCount": 4, "weeklyBudget": 5000}
+
+
+async def test_empty_choices_and_null_diet_are_accepted(client, store) -> None:
+    response = await client.post(
+        "/generate-menu",
+        json={**BASE, "habits": [], "diet": None, "allergies": [], "kitchenTools": []},
+    )
+    assert response.status_code == 202
+    assert store.params == [GenerationParams(4, Decimal("5000.0"))]
+
+
+async def test_optional_fields_default_to_empty(client, store) -> None:
+    response = await client.post(
+        "/generate-menu", json={**BASE, "habits": [2], "kitchenTools": [1]}
+    )
+    assert response.status_code == 202
+    assert store.params[0].diet is None and store.params[0].allergies == ()
+
+
+async def test_duplicates_are_stored_once_in_id_order(client, store) -> None:
+    response = await client.post(
+        "/generate-menu",
+        json={**BASE, "habits": [5, 3, 5], "kitchenTools": [2, 2], "allergies": [7, 1]},
+    )
+    assert response.status_code == 202
+    params = store.params[0]
+    assert (params.habits, params.kitchen_tools, params.allergies) == (
+        (3, 5),
+        (2,),
+        (1, 7),
+    )
+
+
+@pytest.mark.parametrize(
+    ("extra", "loc"),
+    [
+        pytest.param({"kitchenTools": []}, ["body", "habits"], id="habits-missing"),
+        pytest.param({"habits": []}, ["body", "kitchenTools"], id="tools-missing"),
+        pytest.param(
+            {"habits": [True], "kitchenTools": []}, ["body", "habits", "0"], id="bool"
+        ),
+        pytest.param(
+            {"habits": ["3"], "kitchenTools": []}, ["body", "habits", "0"], id="str"
+        ),
+        pytest.param(
+            {"habits": [3.0], "kitchenTools": []}, ["body", "habits", "0"], id="float"
+        ),
+        pytest.param(
+            {"habits": [None], "kitchenTools": []}, ["body", "habits", "0"], id="null"
+        ),
+        pytest.param(
+            {"habits": 3, "kitchenTools": []}, ["body", "habits"], id="scalar"
+        ),
+        pytest.param(
+            {"habits": [], "kitchenTools": [], "diet": "1"}, ["body", "diet"], id="diet"
+        ),
+        pytest.param(
+            {"habits": [], "kitchenTools": [], "allergies": None},
+            ["body", "allergies"],
+            id="allergies-null",
+        ),
+        pytest.param(
+            {"habits": [2**31], "kitchenTools": []},
+            ["body", "habits", "0"],
+            id="over-int4",
+        ),
+        pytest.param(
+            {"habits": [], "kitchenTools": [-(2**31) - 1]},
+            ["body", "kitchenTools", "0"],
+            id="under-int4",
+        ),
+    ],
+)
+async def test_invalid_v2_fields_return_400(client, store, extra, loc) -> None:
+    response = await client.post("/generate-menu", json={**BASE, **extra})
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == "VALIDATION_ERROR"
+    assert [field["loc"] for field in error["details"]["fields"]] == [loc]
+    assert store.params == []
+
+
+async def test_int4_bounds_are_accepted(client, store) -> None:
+    response = await client.post(
+        "/generate-menu",
+        json={**BASE, "habits": [-(2**31)], "kitchenTools": [2**31 - 1]},
+    )
+    assert response.status_code == 202

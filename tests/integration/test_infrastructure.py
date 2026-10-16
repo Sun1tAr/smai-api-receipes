@@ -137,7 +137,7 @@ async def test_domain_migration_uses_its_own_version_table_and_downgrades_cleanl
                     text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
                 )
             )
-        assert version == "0003_task_status_changed_at"
+        assert version == "0004_generation_parameters_v2"
         assert "alembic_version" not in tables
         assert {"generation_task", "menu", "recipe", "instruction"} <= tables
         alembic("downgrade", "base")
