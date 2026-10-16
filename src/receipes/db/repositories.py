@@ -28,14 +28,18 @@ class TaskRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    # Параметры и задача pending создаются вместе; возвращается task_id.
-    async def create(self, people_count: int, weekly_budget: Decimal) -> UUID:
+    # Параметры и задача pending создаются вместе; возвращается task_id. Промпт, если
+    # он уже собран, сохраняется сразу; иначе его добавит воркер при захвате.
+    async def create(
+        self, people_count: int, weekly_budget: Decimal, prompt: str | None = None
+    ) -> UUID:
         parameters = GenerationParameters(
             id=uuid4(), people_count=people_count, weekly_budget=weekly_budget
         )
         task = GenerationTask(
             task_id=uuid4(),
             status=TaskStatus.PENDING,
+            prompt=prompt,
             parameters_id=parameters.id,
         )
         self._session.add_all([parameters, task])
@@ -87,6 +91,10 @@ class TaskRepository:
             )
             .where(GenerationTask.task_id == task_id)
         )
+        return await self._session.scalar(query)
+
+    async def get_prompt(self, task_id: UUID) -> str | None:
+        query = select(GenerationTask.prompt).where(GenerationTask.task_id == task_id)
         return await self._session.scalar(query)
 
     async def set_prompt(self, task_id: UUID, prompt: str) -> None:

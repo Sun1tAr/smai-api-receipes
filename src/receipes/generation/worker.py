@@ -281,10 +281,15 @@ class GenerationWorker:
             self._record(task_id, "done", started, generated)
         return True
 
-    # Транзакция 2: параметры и активный шаблон, промпт сохраняется в задаче.
+    # Транзакция 2: готовый промпт задачи или (для задач без него) параметры и активный
+    # шаблон; собранный промпт сохраняется в задаче.
     async def _prepare_prompt(self, task_id: UUID) -> str:
         async with self._sessions() as session, session.begin():
             tasks = TaskRepository(session)
+            # Промпт, сохранённый при создании задачи, не пересобираем.
+            saved = await tasks.get_prompt(task_id)
+            if saved is not None:
+                return saved
             parameters = await tasks.get_parameters(task_id)
             template = await PromptTemplateRepository(session).get_active()
             if parameters is None or template is None:
