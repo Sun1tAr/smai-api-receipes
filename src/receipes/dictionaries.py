@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 import httpx
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, StrictInt, ValidationError
 
 from receipes.config import Settings
 from receipes.domain.errors import DictionaryError
@@ -12,7 +12,7 @@ DICTIONARIES_PATH = "/dictionaries"
 class _Item(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    id: int
+    id: StrictInt
     name: str
 
 
@@ -48,7 +48,8 @@ class DictionaryClient:
     def build_http_client(
         settings: Settings, transport: httpx.AsyncBaseTransport | None = None
     ) -> httpx.AsyncClient:
-        assert settings.ms2_base_url is not None
+        if settings.ms2_base_url is None:
+            raise ValueError("MS2_BASE_URL is not set")
         return httpx.AsyncClient(
             base_url=str(settings.ms2_base_url),
             timeout=settings.ms2_timeout_seconds,

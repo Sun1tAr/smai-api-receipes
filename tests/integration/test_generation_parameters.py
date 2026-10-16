@@ -1,5 +1,5 @@
 import os
-import subprocess
+from collections.abc import Callable
 from decimal import Decimal
 from uuid import UUID
 
@@ -15,6 +15,8 @@ from receipes.db.models import (
     GenerationParameterHabit,
     GenerationParameterKitchenTool,
     GenerationParameters,
+    GenerationTask,
+    PromptTemplate,
 )
 from receipes.db.repositories import TaskRepository
 from receipes.domain.params import GenerationParams
@@ -124,9 +126,6 @@ async def test_v1_style_request_is_rejected_and_stores_nothing(
 async def test_prompt_and_result_ignore_v2_parameters(
     api: httpx.AsyncClient, session_factory: Factory
 ) -> None:
-    from receipes.db.models import GenerationTask, PromptTemplate
-    from receipes.db.repositories import PromptTemplateRepository  # noqa: F401
-
     async with session_factory() as session, session.begin():
         session.add(
             PromptTemplate(template="{people_count} человек, {weekly_budget} рублей")
@@ -152,22 +151,14 @@ async def test_prompt_and_result_ignore_v2_parameters(
     assert result.json() == {"status": "pending", "menu": None, "error": None}
 
 
-def alembic_run(env: dict[str, str], *arguments: str) -> str:
-    result = subprocess.run(
-        ["alembic", *arguments], env=env, capture_output=True, text=True, check=False
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    return result.stdout + result.stderr
-
-
 async def test_migration_keeps_v1_tasks_and_downgrade_drops_v2_data(
-    settings: Settings, alembic_env: dict[str, str]
+    settings: Settings, alembic: Callable[..., str], schema: None
 ) -> None:
     from receipes.database import create_engine
 
     engine = create_engine(settings)
     try:
-        alembic_run(alembic_env, "downgrade", "0003_task_status_changed_at")
+        alembic("downgrade", "0003_task_status_changed_at")
         async with engine.begin() as connection:
             await connection.execute(
                 text("TRUNCATE generation_task, generation_parameters CASCADE")
@@ -186,7 +177,7 @@ async def test_migration_keeps_v1_tasks_and_downgrade_drops_v2_data(
                     " 'pending', '00000000-0000-0000-0000-000000000001', now())"
                 )
             )
-        alembic_run(alembic_env, "upgrade", "head")
+        alembic("upgrade", "head")
         factory = async_sessionmaker(engine, expire_on_commit=False)
         async with factory() as session:
             params = await TaskRepository(session).get_params(
@@ -198,7 +189,7 @@ async def test_migration_keeps_v1_tasks_and_downgrade_drops_v2_data(
             await TaskRepository(session).create(
                 GenerationParams(2, Decimal("1"), (1,), 2, (3,), (4,))
             )
-        alembic_run(alembic_env, "downgrade", "0003_task_status_changed_at")
+        alembic("downgrade", "0003_task_status_changed_at")
         async with engine.connect() as connection:
             tables = set(
                 await connection.scalars(
@@ -215,13 +206,12 @@ async def test_migration_keeps_v1_tasks_and_downgrade_drops_v2_data(
             )
         assert not any(name.startswith("generation_parameter_") for name in tables)
         assert "diet_id" not in columns
-        alembic_run(alembic_env, "upgrade", "head")
     finally:
-        alembic_run(alembic_env, "upgrade", "head")
+        alembic("upgrade", "head")
         await engine.dispose()
 
 
-def test_alembic_has_a_single_head(alembic_env: dict[str, str]) -> None:
-    output = alembic_run(alembic_env, "heads")
+def test_alembic_has_a_single_head(alembic: Callable[..., str]) -> None:
+    output = alembic("heads")
     assert output.count("(head)") == 1
     assert "0004_generation_parameters_v2" in output

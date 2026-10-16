@@ -86,6 +86,7 @@ async def test_app_starts_without_ms2_url_and_builds_client_with_it() -> None:
         assert plain.state.dictionaries is None
         assert isinstance(with_url.state.dictionaries, DictionaryClient)
     finally:
+        await with_url.state.dictionaries.aclose()
         for app in (plain, with_url):
             await app.state.engine.dispose()
             app.state.tracer_provider.shutdown()

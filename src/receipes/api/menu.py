@@ -2,7 +2,7 @@ from decimal import Decimal
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Path
+from fastapi import APIRouter, Body, Depends, Path
 
 from receipes.api.dependencies import TaskStore, get_task_store
 from receipes.api.schemas import (
@@ -31,9 +31,11 @@ def _error_example(code: str, message: str, details: dict[str, Any]) -> dict[str
 
 def _error_doc(
     description: str,
-    example: dict[str, Any],
+    example: dict[str, Any] | None = None,
     examples: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # OpenAPI: либо один `example`, либо именованные `examples`, но не оба сразу.
+    assert (example is None) != (examples is None)
     content = {"examples": examples} if examples else {"example": example}
     return {
         "model": ErrorResponse,
@@ -41,6 +43,29 @@ def _error_doc(
         "content": {"application/json": content},
     }
 
+
+REQUEST_EXAMPLES = {
+    "full": {
+        "summary": "Все параметры выбраны",
+        "value": {
+            "peopleCount": 4,
+            "weeklyBudget": 5000,
+            "habits": [3, 5],
+            "diet": 4,
+            "allergies": [1, 2],
+            "kitchenTools": [1, 2, 6],
+        },
+    },
+    "empty": {
+        "summary": "Ничего не выбрано (минимальный запрос v2)",
+        "value": {
+            "peopleCount": 4,
+            "weeklyBudget": 5000,
+            "habits": [],
+            "kitchenTools": [],
+        },
+    },
+}
 
 INTERNAL_ERROR_DOC = _error_doc(
     "Внутренняя ошибка сервиса (например, недоступна база данных). Подробности "
@@ -162,11 +187,6 @@ RESULT_EXAMPLES = {
         400: _error_doc(
             "Некорректные параметры: поля не заданы, неверный тип или значение вне "
             "границ, битый JSON, пустое тело, тело не JSON-объект.",
-            _error_example(
-                "VALIDATION_ERROR",
-                "Request validation failed",
-                {"fields": [{"loc": ["body", "peopleCount"], "type": "int_type"}]},
-            ),
             examples={
                 "peopleCount": {
                     "summary": "Неверный тип peopleCount",
@@ -229,7 +249,8 @@ RESULT_EXAMPLES = {
     },
 )
 async def generate_menu(
-    body: GenerateMenuRequest, store: Store
+    body: Annotated[GenerateMenuRequest, Body(openapi_examples=REQUEST_EXAMPLES)],
+    store: Store,
 ) -> GenerateMenuResponse:
     params = GenerationParams(
         people_count=body.people_count,

@@ -127,6 +127,12 @@ async def test_request_example_and_fields_are_documented(app) -> None:
     }
     assert all(item["description"] for item in schema["properties"].values())
     operation = document["paths"]["/generate-menu"]["post"]
+    body_examples = operation["requestBody"]["content"]["application/json"]["examples"]
+    assert {"full", "empty"} <= set(body_examples)
+    for item in body_examples.values():
+        jsonschema.validate(item["value"], schema)
+    assert body_examples["empty"]["value"]["habits"] == []
+    assert body_examples["empty"]["value"]["kitchenTools"] == []
     assert "habits" in operation["description"]
     assert "игнорируются" not in operation["description"]
     examples = operation["responses"]["400"]["content"]["application/json"]["examples"]

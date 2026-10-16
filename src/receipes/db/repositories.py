@@ -103,6 +103,8 @@ class TaskRepository:
             select(GenerationTask)
             .where(GenerationTask.task_id == task_id)
             .options(
+                # Связи параметров подгружаются заранее: lazy="raise" не даёт ленивой
+                # загрузки (+3 дешёвых SELECT по индексу parameters_id).
                 selectinload(GenerationTask.parameters).options(*_PARAMETER_LINKS),
                 recipe_load.selectinload(Recipe.nutrition),
                 recipe_load.selectinload(Recipe.instructions),
@@ -146,7 +148,7 @@ class TaskRepository:
         )
         return await self._session.scalar(query)
 
-    # Параметры задачи целиком; списки отсортированы по ID, повторов нет.
+    # Параметры задачи целиком; GenerationParams сам сортирует списки по ID.
     async def get_params(self, task_id: UUID) -> GenerationParams | None:
         row = await self.get_parameters(task_id)
         if row is None:
@@ -154,12 +156,10 @@ class TaskRepository:
         return GenerationParams(
             people_count=row.people_count,
             weekly_budget=row.weekly_budget,
-            habits=tuple(sorted(item.habit_id for item in row.habits)),
+            habits=tuple(item.habit_id for item in row.habits),
             diet=row.diet_id,
-            allergies=tuple(sorted(item.allergen_id for item in row.allergies)),
-            kitchen_tools=tuple(
-                sorted(item.kitchen_tool_id for item in row.kitchen_tools)
-            ),
+            allergies=tuple(item.allergen_id for item in row.allergies),
+            kitchen_tools=tuple(item.kitchen_tool_id for item in row.kitchen_tools),
         )
 
     async def get_prompt(self, task_id: UUID) -> str | None:
