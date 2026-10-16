@@ -1,5 +1,6 @@
 import asyncio
 import os
+from uuid import UUID
 
 import httpx
 import pytest
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from receipes.config import Settings
 from receipes.db.models import PromptTemplate
+from receipes.db.repositories import TaskRepository
 
 pytestmark = [
     pytest.mark.integration,
@@ -35,6 +37,9 @@ async def post_and_process(settings, factory, handler):
             )
             task_id = created.json()["task_id"]
             before = (await client.get(f"/generate-menu/{task_id}")).json()
+            async with factory() as session:
+                saved = await TaskRepository(session).get_prompt(UUID(task_id))
+            assert saved == "4 чел., 5000 руб."
             # False при сбое стороны Ollama: следующая итерация начнётся с паузы.
             await app.state.worker.process_one()
             after = await client.get(f"/generate-menu/{task_id}")

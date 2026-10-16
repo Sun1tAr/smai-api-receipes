@@ -27,26 +27,32 @@ class SqlTaskStore:
 
     async def create(self, people_count: int, weekly_budget: Decimal) -> UUID:
         async with self._sessions() as session, session.begin():
-            prompt = await self._render_prompt(session, people_count, weekly_budget)
-            return await TaskRepository(session).create(
+            prompt, problem = await self._render_prompt(
+                session, people_count, weekly_budget
+            )
+            task_id = await TaskRepository(session).create(
                 people_count, weekly_budget, prompt
             )
+        if problem is not None:
+            logger.warning(
+                "task_prompt_not_saved", task_id=str(task_id), reason=problem
+            )
+        return task_id
 
     # Промпт фиксируется на момент создания задачи. Нет годного шаблона: задача всё
-    # равно принимается, промпт соберёт воркер (текст промпта и параметры не логируем).
+    # равно принимается, промпт соберёт воркер. Второе значение — причина (для лога
+    # после коммита); текст промпта и параметры в лог не попадают.
     @staticmethod
     async def _render_prompt(
         session: AsyncSession, people_count: int, weekly_budget: Decimal
-    ) -> str | None:
+    ) -> tuple[str | None, str | None]:
         template = await PromptTemplateRepository(session).get_active()
         if template is None:
-            logger.warning("task_prompt_not_saved", reason="missing")
-            return None
+            return None, "missing"
         try:
-            return render_prompt(template.template, people_count, weekly_budget)
+            return render_prompt(template.template, people_count, weekly_budget), None
         except PromptTemplateError:
-            logger.warning("task_prompt_not_saved", reason="invalid")
-            return None
+            return None, "invalid"
 
     async def get(self, task_id: UUID) -> GenerationTask | None:
         async with self._sessions() as session:
