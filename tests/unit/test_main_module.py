@@ -15,6 +15,7 @@ def test_server_listens_on_all_interfaces_port_8000(
     monkeypatch.setenv("DB_USER", "receipes")
     monkeypatch.setenv("DB_PASSWORD", "local-only")
     monkeypatch.setenv("OLLAMA_BASE_URL", "http://ollama.test:11434")
+    monkeypatch.setenv("MS2_BASE_URL", "http://ms2.test:8000")
     entrypoint.main()
     options = calls[0][1]
     assert options["host"] == "0.0.0.0"
@@ -37,6 +38,7 @@ def test_invalid_configuration_exits_with_names_but_without_values(
     monkeypatch.setenv("DB_PASSWORD", "private-env-password")
     monkeypatch.setenv("DB_PORT", "private-not-a-port")
     monkeypatch.setenv("OLLAMA_BASE_URL", "http://user:private-url-pass@ollama:11434")
+    monkeypatch.setenv("MS2_BASE_URL", "http://ms2.test:8000")
     with pytest.raises(SystemExit) as exit_info:
         entrypoint.main()
     assert exit_info.value.code == 1

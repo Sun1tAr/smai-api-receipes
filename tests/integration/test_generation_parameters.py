@@ -28,13 +28,34 @@ pytestmark = [
 
 Factory = async_sessionmaker[AsyncSession]
 BASE = {"peopleCount": 2, "weeklyBudget": 100}
+IDS = [{"id": i, "name": f"n{i}"} for i in range(1, 7)]
+DICTIONARIES = {
+    "habits": IDS,
+    "diets": IDS,
+    "allergies": IDS,
+    "kitchenTools": IDS,
+}
+
+
+# Справочники MS-2 подменяются: handler.response меняется в тесте.
+class Ms2Stub:
+    def __init__(self) -> None:
+        self.response = httpx.Response(200, json=DICTIONARIES)
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        return self.response
 
 
 @pytest.fixture
-async def api(settings: Settings, session_factory: Factory):
+def ms2() -> Ms2Stub:
+    return Ms2Stub()
+
+
+@pytest.fixture
+async def api(settings: Settings, session_factory: Factory, ms2: Ms2Stub):
     from receipes.main import create_app
 
-    app = create_app(settings)
+    app = create_app(settings, ms2_transport=httpx.MockTransport(ms2))
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -113,6 +134,36 @@ async def test_failed_link_insert_leaves_nothing(session_factory: Factory) -> No
                 GenerationParams(2, Decimal("100"), habits=(1, 2**40))
             )
     assert await count(session_factory, GenerationParameters) == [0]
+
+
+async def test_unknown_id_is_rejected_and_stores_nothing(
+    api: httpx.AsyncClient, session_factory: Factory
+) -> None:
+    response = await api.post(
+        "/generate-menu", json={**BASE, "habits": [1, 99], "kitchenTools": []}
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["details"]["fields"] == [
+        {"loc": ["body", "habits", "1"], "type": "unknown_id"}
+    ]
+    assert await count(session_factory, GenerationTask, GenerationParameters) == [0, 0]
+
+
+async def test_ms2_failure_stores_nothing(
+    api: httpx.AsyncClient, session_factory: Factory, ms2: Ms2Stub
+) -> None:
+    ms2.response = httpx.Response(500)
+    response = await api.post(
+        "/generate-menu", json={**BASE, "habits": [1], "kitchenTools": []}
+    )
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "INTERNAL_ERROR"
+    assert await count(
+        session_factory,
+        GenerationTask,
+        GenerationParameters,
+        GenerationParameterHabit,
+    ) == [0, 0, 0]
 
 
 async def test_v1_style_request_is_rejected_and_stores_nothing(

@@ -23,6 +23,7 @@ def settings() -> Settings:
         db_user=os.environ["TEST_DB_USER"],
         db_password=os.environ["TEST_DB_PASSWORD"],
         ollama_base_url="http://ollama.test:11434",
+        ms2_base_url="http://ms2.test:8000",
         # Воркер включается только тестами, которым он нужен.
         generation_worker_enabled=False,
     )
@@ -39,6 +40,7 @@ def alembic_env(settings: Settings) -> dict[str, str]:
         "DB_USER": settings.db_user,
         "DB_PASSWORD": settings.db_password.get_secret_value(),
         "OLLAMA_BASE_URL": str(settings.ollama_base_url),
+        "MS2_BASE_URL": str(settings.ms2_base_url),
     }
 
 

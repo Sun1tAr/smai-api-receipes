@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from receipes.db.models import GenerationTask
 from receipes.db.repositories import PromptTemplateRepository, TaskRepository
+from receipes.dictionaries import Dictionaries
 from receipes.domain.errors import PromptTemplateError
 from receipes.domain.params import GenerationParams
 from receipes.generation.prompt import render_prompt
@@ -62,3 +63,12 @@ class SqlTaskStore:
 
 def get_task_store(request: Request) -> TaskStore:
     return SqlTaskStore(request.app.state.session_factory)
+
+
+# Порт справочников MS-2 для API: в тестах подменяется фейком.
+class DictionarySource(Protocol):
+    async def fetch(self) -> Dictionaries: ...
+
+
+def get_dictionaries(request: Request) -> DictionarySource:
+    return request.app.state.dictionaries

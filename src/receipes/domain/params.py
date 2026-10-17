@@ -3,7 +3,7 @@ from decimal import Decimal
 
 
 # Параметры генерации (LE-4 v2). Идентификаторы справочников MS-2 хранятся как есть:
-# проверка существования и лимиты — в SMAI-87, подстановка в промпт — в SMAI-89.
+# проверяются в API (схема и справочники MS-2), подстановка в промпт — в SMAI-89.
 @dataclass(frozen=True)
 class GenerationParams:
     people_count: int

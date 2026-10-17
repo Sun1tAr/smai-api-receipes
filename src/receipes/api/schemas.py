@@ -10,14 +10,16 @@ from pydantic import (
     WithJsonSchema,
     field_validator,
 )
+from pydantic_core import PydanticCustomError
 
 MAX_PEOPLE = 20
 MAX_BUDGET = 1_000_000
+MAX_HABITS = 3
 INT4_MIN = -(2**31)
 INT4_MAX = 2**31 - 1
 
-# Идентификатор справочника MS-2. Диапазон int4 — это тип колонки в БД; знак и
-# существование ID проверяются отдельно (SMAI-87).
+# Идентификатор справочника MS-2. Диапазон int4 — это тип колонки в БД; существование
+# ID (в том числе нулевых и отрицательных) проверяется по справочникам MS-2.
 DictionaryId = Annotated[StrictInt, Field(ge=INT4_MIN, le=INT4_MAX)]
 
 
@@ -74,9 +76,11 @@ class GenerateMenuRequest(BaseModel):
     habits: list[DictionaryId] = Field(
         description=(
             "Идентификаторы пищевых привычек из справочника MS-2 (API-7). Поле "
-            "обязательно, но выбор может быть пустым: `[]`. Повторы сохраняются "
-            "один раз. Элементы только целые числа (int4): строки, `true`, `4.0` и "
-            "`null` отклоняются."
+            f"обязательно, но выбор может быть пустым: `[]`. Не больше {MAX_HABITS} "
+            "разных ID, иначе 400 `too_long`; повторы сохраняются один раз и за "
+            "отдельные привычки не считаются. Элементы только целые числа (int4): "
+            "строки, `true`, `4.0` и `null` отклоняются. ID должен существовать в "
+            "справочнике MS-2, иначе 400 `unknown_id`."
         ),
         examples=[[3, 5]],
     )
@@ -84,7 +88,8 @@ class GenerateMenuRequest(BaseModel):
         default=None,
         description=(
             "Идентификатор диеты из справочника MS-2 или `null`. Поле можно не "
-            "передавать, это то же самое, что `null`."
+            "передавать, это то же самое, что `null`. ID должен существовать в "
+            "справочнике MS-2, иначе 400 `unknown_id`."
         ),
         examples=[4],
     )
@@ -92,7 +97,8 @@ class GenerateMenuRequest(BaseModel):
         default_factory=list,
         description=(
             "Идентификаторы аллергенов из справочника MS-2. Поле можно не "
-            "передавать, это то же самое, что `[]`. Повторы сохраняются один раз."
+            "передавать, это то же самое, что `[]`. Повторы сохраняются один раз. "
+            "ID должен существовать в справочнике MS-2, иначе 400 `unknown_id`."
         ),
         examples=[[1, 2]],
     )
@@ -100,10 +106,24 @@ class GenerateMenuRequest(BaseModel):
         alias="kitchenTools",
         description=(
             "Идентификаторы кухонной техники из справочника MS-2. Поле обязательно, "
-            "но выбор может быть пустым: `[]`. Повторы сохраняются один раз."
+            "но выбор может быть пустым: `[]`. Повторы сохраняются один раз. ID "
+            "должен существовать в справочнике MS-2, иначе 400 `unknown_id`."
         ),
         examples=[[1, 2, 6]],
     )
+
+    # Считаем разные ID: повторы всё равно схлопываются. Тип ошибки `too_long`, как у
+    # max_length, место — само поле.
+    @field_validator("habits", mode="after")
+    @classmethod
+    def at_most_three_habits(cls, value: list[int]) -> list[int]:
+        if len(set(value)) > MAX_HABITS:
+            raise PydanticCustomError(
+                "too_long",
+                "must have at most {max_length} distinct items",
+                {"max_length": MAX_HABITS},
+            )
+        return value
 
     @field_validator("weekly_budget", mode="after")
     @classmethod
