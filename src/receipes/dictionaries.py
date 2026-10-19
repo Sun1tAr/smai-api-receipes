@@ -1,9 +1,16 @@
 import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Annotated, Protocol
 
 import httpx
-from pydantic import BaseModel, ConfigDict, StrictInt, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    StrictInt,
+    StringConstraints,
+    ValidationError,
+)
 
 from receipes.config import Settings
 from receipes.domain.errors import DictionaryError
@@ -16,7 +23,9 @@ class _Item(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     id: StrictInt
-    name: str
+    # Пустое название (или из пробелов) дало бы в промпте «привычки: , B»: это сбой
+    # сида MS-2, как и повтор id.
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
 class _Payload(BaseModel):
@@ -78,6 +87,11 @@ def find_unknown_ids(
     unknown += unknown_in("allergies", dictionaries.allergies, allergies)
     unknown += unknown_in("kitchenTools", dictionaries.kitchen_tools, kitchen_tools)
     return unknown
+
+
+# Порт справочников MS-2 для API и воркера: в тестах подменяется фейком.
+class DictionarySource(Protocol):
+    async def fetch(self) -> Dictionaries: ...
 
 
 # Клиент API-7 MS-2 (`GET /dictionaries`). Ответ не кэшируется: запросы с ID редки

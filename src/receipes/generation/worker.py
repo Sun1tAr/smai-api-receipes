@@ -21,9 +21,12 @@ from receipes.db.repositories import (
     PromptTemplateRepository,
     TaskRepository,
 )
+from receipes.dictionaries import DictionarySource
 from receipes.domain.errors import (
     GENERATION_FAILED,
     SERVICE_RESTARTED,
+    DictionariesUnavailable,
+    DictionaryError,
     GenerationError,
     InvalidNeurocoreResponse,
     NeurocoreError,
@@ -32,10 +35,17 @@ from receipes.domain.errors import (
     NeurocoreUnavailable,
     PromptTemplateError,
     TaskStateConflict,
+    UnknownDictionaryId,
 )
+from receipes.domain.params import GenerationParams
 from receipes.generation.metrics import GenerationMetrics
 from receipes.generation.ollama import GeneratedMenu, OllamaClient
-from receipes.generation.prompt import render_prompt, validate_template
+from receipes.generation.prompt import (
+    build_constraints,
+    needs_dictionaries,
+    render_prompt,
+    validate_template,
+)
 
 logger = structlog.get_logger()
 
@@ -74,6 +84,7 @@ class GenerationWorker:
         ollama: OllamaClient,
         settings: Settings,
         metrics: GenerationMetrics,
+        dictionaries: DictionarySource,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
         self._sessions = session_factory
@@ -83,6 +94,7 @@ class GenerationWorker:
         self._ollama = ollama
         self._settings = settings
         self._metrics = metrics
+        self._dictionaries = dictionaries
         self._sleep = sleep
         self._ollama_down = False
         # После 404 пробой служит наличие модели в /api/tags, а не просто ответ 200.
@@ -295,7 +307,8 @@ class GenerationWorker:
         return True
 
     # Транзакция 2: готовый промпт задачи или (для задач без него) параметры и активный
-    # шаблон; собранный промпт сохраняется в задаче.
+    # шаблон. Названия справочников запрашиваются у MS-2 вне транзакций БД; собранный
+    # промпт сохраняется в задаче отдельной короткой транзакцией.
     async def _prepare_prompt(self, task_id: UUID) -> str:
         async with self._sessions() as session, session.begin():
             tasks = TaskRepository(session)
@@ -303,15 +316,35 @@ class GenerationWorker:
             saved = await tasks.get_prompt(task_id)
             if saved is not None:
                 return saved
-            parameters = await tasks.get_parameters(task_id)
+            params = await tasks.get_params(task_id)
             template = await PromptTemplateRepository(session).get_active()
-            if parameters is None or template is None:
-                raise PromptTemplateError
-            prompt = render_prompt(
-                template.template, parameters.people_count, parameters.weekly_budget
-            )
-            await tasks.set_prompt(task_id, prompt)
+        if params is None or template is None:
+            raise PromptTemplateError
+        # Битый шаблон отклоняется до обращения к MS-2.
+        validate_template(template.template)
+        constraints = await self._constraints(task_id, params)
+        prompt = render_prompt(
+            template.template, params.people_count, params.weekly_budget, constraints
+        )
+        async with self._sessions() as session, session.begin():
+            await TaskRepository(session).set_prompt(task_id, prompt)
         return prompt
+
+    # Задача без ID MS-2 не вызывает. Недоступность справочников или ID, которого в
+    # них больше нет, фатальны для задачи: повтора нет (LE-6), в логе только причина.
+    async def _constraints(self, task_id: UUID, params: GenerationParams) -> str:
+        if not needs_dictionaries(params):
+            return ""
+        try:
+            return build_constraints(params, await self._dictionaries.fetch())
+        except DictionaryError:
+            reason = "unavailable"
+        except UnknownDictionaryId:
+            reason = "unknown_id"
+        logger.warning(
+            "generation_dictionaries_failed", task_id=str(task_id), reason=reason
+        )
+        raise DictionariesUnavailable
 
     # Вызов Ollama вне транзакций; повтор только для невалидного ответа.
     async def _generate(self, task_id: UUID, prompt: str) -> GeneratedMenu:

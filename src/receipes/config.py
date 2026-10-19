@@ -11,9 +11,10 @@ from pydantic_core import PydanticCustomError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import URL
 
-# Запас контекста сверх OLLAMA_NUM_PREDICT на сам промпт: ~820 токенов измерено
-# (SMAI-54) плюс запас на рост шаблона.
-CONTEXT_RESERVE_TOKENS = 1024
+# Запас контекста сверх OLLAMA_NUM_PREDICT на сам промпт: ~820 токенов шаблона
+# (SMAI-54) плюс блок ограничений v2 (SMAI-89: худший случай по сиду MS-2
+# +334 токена по замеру, всего 1156) плюс запас на рост.
+CONTEXT_RESERVE_TOKENS = 1536
 
 
 class Settings(BaseSettings):

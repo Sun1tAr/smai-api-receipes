@@ -25,10 +25,12 @@ from receipes.db.models import (
     Recipe,
 )
 from receipes.db.repositories import FinishedTask, TaskRepository
+from receipes.dictionaries import Dictionaries
+from receipes.domain.errors import DictionaryError, PromptTemplateError
 from receipes.domain.params import GenerationParams
 from receipes.domain.status import TaskStatus
 from receipes.generation.metrics import GenerationMetrics
-from receipes.generation.ollama import OllamaClient
+from receipes.generation.ollama import RESPONSE_FORMAT, OllamaClient
 from receipes.generation.worker import GenerationWorker
 from receipes.observability import configure_logging
 
@@ -42,6 +44,30 @@ Handler = Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]]
 TEMPLATE = "Меню для {people_count} человек, бюджет {weekly_budget} рублей."
 
 
+DICTIONARIES = Dictionaries(
+    habits={1: "Вегетарианство", 2: "Без сахара", 3: "Low-carb"},
+    diets={4: "Кето"},
+    allergies={1: "Глютен", 2: "Лактоза"},
+    kitchen_tools={1: "Духовка", 6: "Блендер"},
+)
+
+
+# Справочники MS-2 для воркера: считает обращения, может упасть, может зависнуть.
+class StubDictionaries:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.calls = 0
+        self.error = error
+        self.on_fetch: Callable[[], Awaitable[None]] | None = None
+
+    async def fetch(self) -> Dictionaries:
+        self.calls += 1
+        if self.on_fetch is not None:
+            await self.on_fetch()
+        if self.error is not None:
+            raise self.error
+        return DICTIONARIES
+
+
 class Rig:
     def __init__(
         self,
@@ -49,7 +75,9 @@ class Rig:
         settings: Settings,
         handler: Handler,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        dictionaries: StubDictionaries | None = None,
     ) -> None:
+        self.dictionaries = dictionaries or StubDictionaries()
         self.factory = factory
         self.requests: list[dict[str, Any]] = []
 
@@ -64,7 +92,13 @@ class Rig:
         http = OllamaClient.build_http_client(settings, httpx.MockTransport(recording))
         client = OllamaClient(settings, http, metrics, NoOpTracer())
         self.worker = GenerationWorker(
-            factory, factory.kw["bind"], client, settings, metrics, sleep=sleep
+            factory,
+            factory.kw["bind"],
+            client,
+            settings,
+            metrics,
+            self.dictionaries,
+            sleep=sleep,
         )
 
     def sample(self, name: str, **labels: str) -> float:
@@ -108,9 +142,10 @@ def rig(
     settings: Settings,
     handler: Handler = good,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    dictionaries: StubDictionaries | None = None,
     **extra: Any,
 ):
-    return Rig(factory, settings.model_copy(update=extra), handler, sleep)
+    return Rig(factory, settings.model_copy(update=extra), handler, sleep, dictionaries)
 
 
 async def test_no_pending_task_means_nothing_to_do(
@@ -859,3 +894,210 @@ async def test_task_is_created_without_prompt_when_template_is_unusable(
     done = await harness.task(task_id)
     assert done.status == TaskStatus.DONE
     assert done.prompt == "Меню для 4 человек, бюджет 5000.5 рублей."
+
+
+# --- SMAI-89: ограничения v2 в промпте воркера ---
+
+V2 = GenerationParams(
+    2,
+    Decimal("100"),
+    habits=(1, 3),
+    diet=4,
+    allergies=(2,),
+    kitchen_tools=(1, 6),
+)
+V2_BLOCK = (
+    "Ограничения пользователя (обязательны к выполнению):\n"
+    "- привычки питания: «Вегетарианство», «Low-carb»;\n"
+    "- диета: «Кето»;\n"
+    "- аллергены (не использовать ни в одном блюде и ингредиенте): «Лактоза»;\n"
+    "- доступная кухонная техника (не требуй другой): «Духовка», «Блендер»."
+)
+
+
+async def add_v2_task(factory: Factory, params: GenerationParams = V2) -> UUID:
+    async with factory() as session, session.begin():
+        return await TaskRepository(session).create(params)
+
+
+async def test_worker_fallback_adds_v2_names_and_saves_the_prompt(
+    session_factory: Factory, settings: Settings
+) -> None:
+    await add_template(session_factory, "{people_count} {weekly_budget}\n\nФинал")
+    task_id = await add_v2_task(session_factory)
+    harness = rig(session_factory, settings)
+    await harness.worker.process_one()
+    task = await harness.task(task_id)
+    expected = f"2 100\n\n{V2_BLOCK}\n\nФинал"
+    assert task.status == TaskStatus.DONE
+    assert task.prompt == expected
+    assert harness.requests[0]["prompt"] == expected
+    assert harness.dictionaries.calls == 1
+
+
+async def test_worker_does_not_call_ms2_for_a_task_without_ids(
+    ready: Factory, settings: Settings
+) -> None:
+    await add_task(ready)
+    harness = rig(ready, settings)
+    await harness.worker.process_one()
+    assert harness.dictionaries.calls == 0
+
+
+async def test_worker_does_not_call_ms2_when_the_prompt_is_already_saved(
+    ready: Factory, settings: Settings
+) -> None:
+    stub = StubDictionaries()
+    task_id = await SqlTaskStore(ready).create(V2, DICTIONARIES)
+    harness = rig(ready, settings, dictionaries=stub)
+    await harness.worker.process_one()
+    prompt = harness.requests[0]["prompt"]
+    assert V2_BLOCK in prompt
+    assert (await harness.task(task_id)).prompt == prompt
+    assert stub.calls == 0
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        DictionaryError("Dictionaries timeout"),
+        DictionaryError("Dictionaries unavailable"),
+        DictionaryError("Dictionaries error"),
+        DictionaryError("Invalid dictionaries response"),
+    ],
+)
+async def test_ms2_errors_fail_the_task_without_touching_ollama_or_queue(
+    session_factory: Factory,
+    settings: Settings,
+    capsys: pytest.CaptureFixture[str],
+    error: Exception,
+) -> None:
+    configure_logging("INFO")
+    await add_template(session_factory)
+    first = await add_v2_task(session_factory)
+    second = await add_task(session_factory)
+    harness = rig(session_factory, settings, dictionaries=StubDictionaries(error))
+    # True: задача взята; пауз Ollama нет, очередь идёт дальше.
+    assert await harness.worker.process_one() is True
+    failed = await harness.task(first)
+    assert (failed.status, failed.error) == (
+        TaskStatus.FAILED,
+        "Dictionaries unavailable",
+    )
+    assert harness.requests == []
+    assert await harness.worker.process_one() is True
+    assert (await harness.task(second)).status == TaskStatus.DONE
+    assert harness.sample("menu_generation_tasks_total", status="failed") == 1
+    out = capsys.readouterr().out
+    assert "generation_dictionaries_failed" in out and "Кето" not in out
+
+
+async def test_id_missing_from_ms2_fails_the_task_with_a_safe_message(
+    session_factory: Factory, settings: Settings
+) -> None:
+    await add_template(session_factory)
+    task_id = await add_v2_task(
+        session_factory, GenerationParams(2, Decimal("100"), habits=(1, 99))
+    )
+    harness = rig(session_factory, settings)
+    await harness.worker.process_one()
+    task = await harness.task(task_id)
+    assert (task.status, task.error) == (TaskStatus.FAILED, "Dictionaries unavailable")
+    assert task.prompt is None
+    assert harness.requests == []
+
+
+async def test_no_transaction_is_open_while_waiting_for_ms2(
+    session_factory: Factory, settings: Settings
+) -> None:
+    await add_template(session_factory)
+    task_id = await add_v2_task(session_factory)
+    stub = StubDictionaries()
+    idle: list[int] = []
+
+    async def hang() -> None:
+        async with session_factory() as session:
+            idle.append(
+                await session.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE state LIKE 'idle in transaction%' "
+                        "AND pid <> pg_backend_pid() "
+                        "AND datname = current_database()"
+                    )
+                )
+            )
+
+    stub.on_fetch = hang
+    harness = rig(session_factory, settings, dictionaries=stub)
+    await harness.worker.process_one()
+    assert (await harness.task(task_id)).status == TaskStatus.DONE
+    assert idle == [0]
+
+
+async def test_broken_template_is_rejected_before_ms2_is_called(
+    session_factory: Factory, settings: Settings
+) -> None:
+    await add_template(session_factory, "нет плейсхолдеров")
+    task_id = await add_v2_task(session_factory)
+    harness = rig(session_factory, settings)
+    with pytest.raises(PromptTemplateError):
+        await harness.worker._prepare_prompt(task_id)
+    assert harness.dictionaries.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (httpx.Response(503, text="down"), "Neurocore unavailable"),
+        (httpx.Response(404, text="no model"), "Neurocore model not found"),
+        (httpx.Response(500, text="boom"), "Neurocore error"),
+    ],
+)
+async def test_ollama_errors_for_a_task_with_v2_parameters_behave_as_before(
+    session_factory: Factory,
+    settings: Settings,
+    response: httpx.Response,
+    message: str,
+) -> None:
+    await add_template(session_factory)
+    task_id = await SqlTaskStore(session_factory).create(V2, DICTIONARIES)
+    harness = rig(session_factory, settings, handler=lambda request: response)
+    # Ollama-сторона: задача failed, False = пауза перед следующей итерацией.
+    assert await harness.worker.process_one() is False
+    task = await harness.task(task_id)
+    assert (task.status, task.error) == (TaskStatus.FAILED, message)
+    assert harness.worker._ollama_down is True
+    assert V2_BLOCK in harness.requests[0]["prompt"]
+
+
+async def test_ollama_receives_the_fixed_response_format_with_and_without_v2(
+    session_factory: Factory, settings: Settings
+) -> None:
+    await add_template(session_factory)
+    await add_task(session_factory)
+    await add_v2_task(session_factory)
+    harness = rig(session_factory, settings)
+    await harness.worker.process_one()
+    await harness.worker.process_one()
+    plain, rich = harness.requests
+    assert plain["format"] == rich["format"] == RESPONSE_FORMAT
+    assert plain["prompt"] != rich["prompt"]
+
+
+@pytest.mark.parametrize(
+    ("dictionaries", "reason"),
+    [(None, "dictionaries_missing"), (Dictionaries({}, {}, {}, {}), "unknown_id")],
+)
+async def test_api_task_keeps_a_null_prompt_when_names_are_unavailable(
+    ready: Factory,
+    capsys: pytest.CaptureFixture[str],
+    dictionaries: Dictionaries | None,
+    reason: str,
+) -> None:
+    configure_logging("INFO")
+    task_id = await SqlTaskStore(ready).create(V2, dictionaries)
+    async with ready() as session:
+        assert await TaskRepository(session).get_prompt(task_id) is None
+    out = capsys.readouterr().out
+    assert "task_prompt_not_saved" in out and reason in out

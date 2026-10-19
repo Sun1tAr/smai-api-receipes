@@ -22,9 +22,11 @@ EMPTY = {**BASE}
 class FakeStore:
     def __init__(self) -> None:
         self.params: list = []
+        self.dictionaries: list = []
 
-    async def create(self, params):
+    async def create(self, params, dictionaries=None):
         self.params.append(params)
+        self.dictionaries.append(dictionaries)
         return "b1e2c3d4-5678-90ab-cdef-1234567890ab"
 
 
@@ -337,3 +339,24 @@ def test_openapi_documents_the_new_checks() -> None:
             "description"
         ]
     )
+
+
+async def test_same_ms2_answer_goes_to_the_store_for_the_prompt(setup) -> None:
+    client, ms2, store = setup
+    response = await client.post(
+        "/generate-menu", json={**BASE, "habits": [1], "diet": 4, "kitchenTools": [6]}
+    )
+    assert response.status_code == 202
+    assert ms2.calls == 1
+    (dictionaries,) = store.dictionaries
+    assert dictionaries.habits[1] == "habit 1"
+    assert dictionaries.diets[4] == "diet"
+    assert dictionaries.kitchen_tools[6] == "blender"
+
+
+async def test_request_without_ids_passes_no_dictionaries_to_the_store(setup) -> None:
+    client, ms2, store = setup
+    response = await client.post("/generate-menu", json=EMPTY)
+    assert response.status_code == 202
+    assert ms2.calls == 0
+    assert store.dictionaries == [None]

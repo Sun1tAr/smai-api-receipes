@@ -131,7 +131,7 @@ def create_app(
     dictionaries = DictionaryClient.from_settings(settings, ms2_transport)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     worker = GenerationWorker(
-        session_factory, lock_engine, ollama, settings, generation_metrics
+        session_factory, lock_engine, ollama, settings, generation_metrics, dictionaries
     )
 
     refresher = QueueMetricsRefresher(

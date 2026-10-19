@@ -2,6 +2,8 @@ import copy
 import json
 from typing import Any
 
+from receipes.dictionaries import Dictionaries
+
 # Валидный ответ модели (формат API-3) и сборка ответа Ollama вокруг него.
 
 
@@ -56,3 +58,9 @@ def ollama_reply(
     if eval_count is not None:
         body["eval_count"] = eval_count
     return body
+
+
+# Справочники для воркера в тестах, где ID не используются: обращение к MS-2 = сбой.
+class UnusedDictionaries:
+    async def fetch(self) -> Dictionaries:
+        raise AssertionError("MS-2 must not be called")
