@@ -16,7 +16,7 @@ Ollama. Инфраструктура (**SMAI-58**): каркас приложе�
 | Метод и путь | Назначение | Ответы | Статус |
 | --- | --- | --- | --- |
 | `GET /health` | Готовность: `SELECT 1` к PostgreSQL (Ollama не проверяется); не пишет спаны, лог запроса на уровне DEBUG | 200 `{"status":"ok"}`, 503 `INTERNAL_ERROR` | служебный |
-| `POST /generate-menu` | API-1: создать задачу генерации меню (`peopleCount` 1–20, `weeklyBudget` > 0, ≤ 1 000 000, до 2 знаков). Поля v2 (`habits`, `diet`, `allergies`, `kitchenTools`) пока не поддерживаются и игнорируются | 202 `{"task_id"}`, 400 `VALIDATION_ERROR`, 500 `INTERNAL_ERROR` | бизнес |
+| `POST /generate-menu` | API-1: создать задачу генерации меню. Тело: `peopleCount` 1–20, `weeklyBudget` > 0 (≤ 1 000 000, до 2 знаков) и параметры v2: `habits` и `kitchenTools` (обязательны, можно `[]`), `diet` (число или `null`, можно не передавать), `allergies` (можно не передавать). ID — целые int4, повторы сохраняются один раз. Параметры сохраняются с задачей; существование ID в MS-2 и максимум 3 привычки пока не проверяются (SMAI-87), в промпт параметры v2 пока не попадают (SMAI-89). Запрос без `habits` или `kitchenTools` (формат v1) — 400 | 202 `{"task_id"}`, 400 `VALIDATION_ERROR`, 500 `INTERNAL_ERROR` | бизнес |
 | `GET /generate-menu/{task_id}` | API-2: статус задачи; всегда `status`, `menu`, `error` (`menu` только при `done`, `error` только при `failed`). Порядок рецептов и ингредиентов не гарантируется | 200, 404 `NOT_FOUND` (неизвестный или не-UUID `task_id`), 500 `INTERNAL_ERROR` | бизнес |
 | `GET /metrics` | Метрики Prometheus: HTTP, Python, GC и процесс (вне схемы OpenAPI) | 200 `text/plain` | служебный |
 | `GET /docs` | Swagger UI | 200 `text/html` | служебный |
@@ -84,6 +84,8 @@ Compose-сети. При старте контейнер выполняет `ale
 | `OLLAMA_NUM_PREDICT` | Максимум токенов ответа (≈13 блюд; при большем числе ответ обрежется) | `4096` |
 | `OLLAMA_TEMPERATURE` | Температура, [0, 2] | `0.3` |
 | `OLLAMA_KEEP_ALIVE` | Сколько держать модель в памяти | `30m` |
+| `MS2_BASE_URL` | Адрес MS-2 «Словарь» (http/https, без учётных данных); клиент `GET /dictionaries` создаётся, только если задан. Пока в запросах не используется (проверка ID — SMAI-87, где адрес станет обязательным) | Не задан |
+| `MS2_TIMEOUT_SECONDS` | Таймаут каждой фазы запроса к MS-2 (подключение, чтение, запись), (0, 60] | `5` |
 | `GENERATION_WORKER_ENABLED` | Включить фоновый воркер генерации | `true` |
 | `GENERATION_WORKER_INTERVAL_SECONDS` | Интервал опроса очереди, (0, 3600] | `2` |
 | `GENERATION_BAD_RESPONSE_RETRIES` | Повторы при невалидном ответе модели (таймаут, обрезка и недоступность не повторяются), [0, 10] | `1` |

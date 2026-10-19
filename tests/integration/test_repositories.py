@@ -30,6 +30,7 @@ from receipes.domain.menu import (
     NutritionPayload,
     RecipePayload,
 )
+from receipes.domain.params import GenerationParams
 from receipes.domain.status import TaskStatus
 
 pytestmark = [
@@ -65,7 +66,9 @@ def menu_of(*recipes: RecipePayload) -> MenuPayload:
 
 async def create_task(factory: Factory, people: int = 4, budget: str = "5000") -> UUID:
     async with factory() as session, session.begin():
-        return await TaskRepository(session).create(people, Decimal(budget))
+        return await TaskRepository(session).create(
+            GenerationParams(people, Decimal(budget))
+        )
 
 
 async def test_create_and_get_pending_task(session_factory: Factory) -> None:

@@ -5,7 +5,6 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from receipes.config import Settings
@@ -78,7 +77,13 @@ async def test_post_creates_pending_task_with_parameters_in_the_database(
             PromptTemplate(template="{people_count} чел., {weekly_budget} руб.")
         )
     response = await api.post(
-        "/generate-menu", json={"peopleCount": 3, "weeklyBudget": 1234.5}
+        "/generate-menu",
+        json={
+            "peopleCount": 3,
+            "weeklyBudget": 1234.5,
+            "habits": [],
+            "kitchenTools": [],
+        },
     )
     assert response.status_code == 202
     task_id = UUID(response.json()["task_id"])
@@ -97,23 +102,10 @@ async def test_post_creates_pending_task_with_parameters_in_the_database(
     assert parameters.weekly_budget == Decimal("1234.50")
 
 
-async def test_v2_fields_are_not_stored(
-    api: httpx.AsyncClient, session_factory: Factory
-) -> None:
-    response = await api.post(
-        "/generate-menu",
-        json={"peopleCount": 2, "weeklyBudget": 100, "habits": [1], "diet": 2},
-    )
-    assert response.status_code == 202
-    async with session_factory() as session:
-        columns = set(GenerationParameters.__table__.columns.keys())
-        rows = (await session.scalars(select(GenerationParameters))).all()
-    assert columns == {"id", "people_count", "weekly_budget"} and len(rows) == 1
-
-
 async def test_get_pending_after_post(api: httpx.AsyncClient) -> None:
     created = await api.post(
-        "/generate-menu", json={"peopleCount": 4, "weeklyBudget": 5000}
+        "/generate-menu",
+        json={"peopleCount": 4, "weeklyBudget": 5000, "habits": [], "kitchenTools": []},
     )
     response = await api.get(f"/generate-menu/{created.json()['task_id']}")
     assert response.status_code == 200
@@ -131,7 +123,8 @@ async def test_get_done_task_returns_the_saved_menu(
     api: httpx.AsyncClient, session_factory: Factory
 ) -> None:
     created = await api.post(
-        "/generate-menu", json={"peopleCount": 4, "weeklyBudget": 5000}
+        "/generate-menu",
+        json={"peopleCount": 4, "weeklyBudget": 5000, "habits": [], "kitchenTools": []},
     )
     task_id = UUID(created.json()["task_id"])
     async with session_factory() as session, session.begin():
@@ -164,7 +157,8 @@ async def test_get_failed_task_returns_error(
     api: httpx.AsyncClient, session_factory: Factory
 ) -> None:
     created = await api.post(
-        "/generate-menu", json={"peopleCount": 4, "weeklyBudget": 5000}
+        "/generate-menu",
+        json={"peopleCount": 4, "weeklyBudget": 5000, "habits": [], "kitchenTools": []},
     )
     task_id = UUID(created.json()["task_id"])
     async with session_factory() as session, session.begin():

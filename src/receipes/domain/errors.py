@@ -58,3 +58,11 @@ class InvalidNeurocoreResponse(GenerationError):
 # новый контейнер при старте пометил её failed). Результат записывать нельзя.
 class TaskStateConflict(Exception):
     pass
+
+
+# Справочники MS-2 недоступны или ответили неверно. Текст безопасный: без URL,
+# тела ответа и подробностей сети.
+class DictionaryError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message

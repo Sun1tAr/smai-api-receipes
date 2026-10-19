@@ -42,16 +42,17 @@ def alembic_env(settings: Settings) -> dict[str, str]:
     }
 
 
-def run_alembic(env: dict[str, str], *arguments: str) -> None:
+def run_alembic(env: dict[str, str], *arguments: str) -> str:
     result = subprocess.run(
         ["alembic", *arguments], env=env, capture_output=True, text=True, check=False
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout + result.stderr
 
 
 # Запуск alembic с окружением тестовой БД: alembic("upgrade", "head").
 @pytest.fixture
-def alembic(alembic_env: dict[str, str]) -> Callable[..., None]:
+def alembic(alembic_env: dict[str, str]) -> Callable[..., str]:
     return lambda *arguments: run_alembic(alembic_env, *arguments)
 
 

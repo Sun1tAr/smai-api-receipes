@@ -268,3 +268,26 @@ def test_urls_with_credentials_are_rejected_without_echoing_them(
     assert "private-pass" not in text and "user" not in text.replace(
         "user:password", ""
     )
+
+
+def test_ms2_defaults_do_not_prevent_startup() -> None:
+    settings = make()
+    assert settings.ms2_base_url is None
+    assert settings.ms2_timeout_seconds == 5
+
+
+def test_ms2_settings_are_read() -> None:
+    settings = make(ms2_base_url="http://ms2:8000", ms2_timeout_seconds=2.5)
+    assert str(settings.ms2_base_url) == "http://ms2:8000/"
+    assert settings.ms2_timeout_seconds == 2.5
+
+
+@pytest.mark.parametrize("value", [0, -1, 61])
+def test_ms2_timeout_must_be_in_range(value: float) -> None:
+    with pytest.raises(ValidationError):
+        make(ms2_timeout_seconds=value)
+
+
+def test_ms2_url_must_not_contain_credentials() -> None:
+    with pytest.raises(ValidationError):
+        make(ms2_base_url="http://user:pass@ms2:8000")

@@ -89,11 +89,19 @@ async def test_every_operation_is_documented_with_exact_error_codes(app) -> None
             if code.startswith(("4", "5")):
                 content = response["content"]["application/json"]
                 assert content["schema"]["$ref"].endswith("/ErrorResponse")
-                example = content["example"]
-                jsonschema.validate(
-                    example,
-                    {**schemas["ErrorResponse"], "components": {"schemas": schemas}},
+                examples = (
+                    [content["example"]]
+                    if "example" in content
+                    else [item["value"] for item in content["examples"].values()]
                 )
+                for example in examples:
+                    jsonschema.validate(
+                        example,
+                        {
+                            **schemas["ErrorResponse"],
+                            "components": {"schemas": schemas},
+                        },
+                    )
 
 
 async def test_request_example_and_fields_are_documented(app) -> None:
@@ -103,11 +111,34 @@ async def test_request_example_and_fields_are_documented(app) -> None:
         document = (await client.get("/openapi.json")).json()
     schema = document["components"]["schemas"]["GenerateMenuRequest"]
     jsonschema.validate(schema["example"], schema)
-    assert set(schema["properties"]) == {"peopleCount", "weeklyBudget"}
+    assert set(schema["properties"]) == {
+        "peopleCount",
+        "weeklyBudget",
+        "habits",
+        "diet",
+        "allergies",
+        "kitchenTools",
+    }
+    assert set(schema["required"]) == {
+        "peopleCount",
+        "weeklyBudget",
+        "habits",
+        "kitchenTools",
+    }
     assert all(item["description"] for item in schema["properties"].values())
     operation = document["paths"]["/generate-menu"]["post"]
+    body_examples = operation["requestBody"]["content"]["application/json"]["examples"]
+    assert {"full", "empty"} <= set(body_examples)
+    for item in body_examples.values():
+        jsonschema.validate(item["value"], schema)
+    assert body_examples["empty"]["value"]["habits"] == []
+    assert body_examples["empty"]["value"]["kitchenTools"] == []
     assert "habits" in operation["description"]
-    assert "игнорируются" in operation["description"]
+    assert "игнорируются" not in operation["description"]
+    examples = operation["responses"]["400"]["content"]["application/json"]["examples"]
+    assert {"habits_missing", "habits_item", "diet_type", "out_of_range"} <= set(
+        examples
+    )
     result = document["paths"]["/generate-menu/{task_id}"]["get"]["description"]
     assert "10 минут" in result and "порядок" in result
     error = document["components"]["schemas"]["TaskResultResponse"]["properties"][

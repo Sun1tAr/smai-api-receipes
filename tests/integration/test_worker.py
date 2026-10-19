@@ -25,6 +25,7 @@ from receipes.db.models import (
     Recipe,
 )
 from receipes.db.repositories import FinishedTask, TaskRepository
+from receipes.domain.params import GenerationParams
 from receipes.domain.status import TaskStatus
 from receipes.generation.metrics import GenerationMetrics
 from receipes.generation.ollama import OllamaClient
@@ -91,7 +92,9 @@ async def add_template(factory: Factory, text: str = TEMPLATE) -> None:
 
 async def add_task(factory: Factory, people: int = 4, budget: str = "5000.50") -> UUID:
     async with factory() as session, session.begin():
-        return await TaskRepository(session).create(people, Decimal(budget))
+        return await TaskRepository(session).create(
+            GenerationParams(people, Decimal(budget))
+        )
 
 
 @pytest.fixture
@@ -803,7 +806,7 @@ async def test_started_application_runs_the_worker_and_stops_it_cleanly(
 
 # SMAI-94: промпт сохраняется при создании задачи, а не только при захвате воркером.
 async def test_prompt_is_saved_when_the_task_is_created(ready: Factory) -> None:
-    task_id = await SqlTaskStore(ready).create(4, Decimal("5000.50"))
+    task_id = await SqlTaskStore(ready).create(GenerationParams(4, Decimal("5000.50")))
     async with ready() as session:
         assert await TaskRepository(session).get_prompt(task_id) == (
             "Меню для 4 человек, бюджет 5000.5 рублей."
@@ -813,7 +816,7 @@ async def test_prompt_is_saved_when_the_task_is_created(ready: Factory) -> None:
 async def test_worker_uses_the_prompt_saved_at_creation(
     ready: Factory, settings: Settings
 ) -> None:
-    task_id = await SqlTaskStore(ready).create(4, Decimal("5000.50"))
+    task_id = await SqlTaskStore(ready).create(GenerationParams(4, Decimal("5000.50")))
     await add_template(ready, "новый {people_count} {weekly_budget}")
     harness = rig(ready, settings)
     await harness.worker.process_one()
@@ -837,7 +840,9 @@ async def test_task_is_created_without_prompt_when_template_is_unusable(
     if template is not None:
         template += " СЕКРЕТНЫЙ-ТЕКСТ-ШАБЛОНА"
         await add_template(session_factory, template)
-    task_id = await SqlTaskStore(session_factory).create(4, Decimal("5000.50"))
+    task_id = await SqlTaskStore(session_factory).create(
+        GenerationParams(4, Decimal("5000.50"))
+    )
     async with session_factory() as session:
         assert await TaskRepository(session).get_prompt(task_id) is None
     lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("{")]

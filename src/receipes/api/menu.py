@@ -2,7 +2,7 @@ from decimal import Decimal
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Path
+from fastapi import APIRouter, Body, Depends, Path
 
 from receipes.api.dependencies import TaskStore, get_task_store
 from receipes.api.schemas import (
@@ -15,6 +15,7 @@ from receipes.api.schemas import (
     TaskResultResponse,
 )
 from receipes.db.models import GenerationTask
+from receipes.domain.params import GenerationParams
 from receipes.domain.status import TaskStatus
 from receipes.errors import ErrorResponse, error_response
 
@@ -28,13 +29,43 @@ def _error_example(code: str, message: str, details: dict[str, Any]) -> dict[str
     return {"error": {"code": code, "message": message, "details": details}}
 
 
-def _error_doc(description: str, example: dict[str, Any]) -> dict[str, Any]:
+def _error_doc(
+    description: str,
+    example: dict[str, Any] | None = None,
+    examples: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    # OpenAPI: либо один `example`, либо именованные `examples`, но не оба сразу.
+    assert (example is None) != (examples is None)
+    content = {"examples": examples} if examples else {"example": example}
     return {
         "model": ErrorResponse,
         "description": description,
-        "content": {"application/json": {"example": example}},
+        "content": {"application/json": content},
     }
 
+
+REQUEST_EXAMPLES = {
+    "full": {
+        "summary": "Все параметры выбраны",
+        "value": {
+            "peopleCount": 4,
+            "weeklyBudget": 5000,
+            "habits": [3, 5],
+            "diet": 4,
+            "allergies": [1, 2],
+            "kitchenTools": [1, 2, 6],
+        },
+    },
+    "empty": {
+        "summary": "Ничего не выбрано (минимальный запрос v2)",
+        "value": {
+            "peopleCount": 4,
+            "weeklyBudget": 5000,
+            "habits": [],
+            "kitchenTools": [],
+        },
+    },
+}
 
 INTERNAL_ERROR_DOC = _error_doc(
     "Внутренняя ошибка сервиса (например, недоступна база данных). Подробности "
@@ -141,10 +172,14 @@ RESULT_EXAMPLES = {
         "Создаёт задачу генерации меню и сразу возвращает её идентификатор; меню "
         "готовится в фоне. Результат запрашивается по `task_id` через "
         "`GET /generate-menu/{task_id}`.\n\n"
-        "Принимаются только поля `peopleCount` и `weeklyBudget` (версия 1). "
-        "Остальные поля тела, в том числе параметры версии 2 (`habits`, `diet`, "
-        "`allergies`, `kitchenTools`), **пока не поддерживаются: молча "
-        "игнорируются** и в генерации не участвуют."
+        "В теле запроса: `peopleCount`, `weeklyBudget` и параметры версии 2: `habits`, "
+        "`kitchenTools` (обязательны в JSON, могут быть `[]`), `diet` (число или "
+        "`null`, можно не передавать) и `allergies` (можно не передавать). "
+        "Параметры сохраняются вместе с задачей. Запрос без `habits` или "
+        "`kitchenTools` (формат версии 1) получает 400.\n\n"
+        "Здесь проверяются только типы и диапазон int4; существование ID в "
+        "справочниках MS-2 и ограничение на число привычек пока не проверяются, а "
+        "в промпт новые параметры пока не попадают."
     ),
     response_model=GenerateMenuResponse,
     responses={
@@ -152,19 +187,80 @@ RESULT_EXAMPLES = {
         400: _error_doc(
             "Некорректные параметры: поля не заданы, неверный тип или значение вне "
             "границ, битый JSON, пустое тело, тело не JSON-объект.",
-            _error_example(
-                "VALIDATION_ERROR",
-                "Request validation failed",
-                {"fields": [{"loc": ["body", "peopleCount"], "type": "int_type"}]},
-            ),
+            examples={
+                "peopleCount": {
+                    "summary": "Неверный тип peopleCount",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {
+                            "fields": [
+                                {"loc": ["body", "peopleCount"], "type": "int_type"}
+                            ]
+                        },
+                    ),
+                },
+                "habits_missing": {
+                    "summary": "Нет обязательного habits",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {"fields": [{"loc": ["body", "habits"], "type": "missing"}]},
+                    ),
+                },
+                "habits_item": {
+                    "summary": "Элемент habits не целое число",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {
+                            "fields": [
+                                {"loc": ["body", "habits", "0"], "type": "int_type"}
+                            ]
+                        },
+                    ),
+                },
+                "diet_type": {
+                    "summary": "diet не число и не null",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {"fields": [{"loc": ["body", "diet"], "type": "int_type"}]},
+                    ),
+                },
+                "out_of_range": {
+                    "summary": "ID вне диапазона int4",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {
+                            "fields": [
+                                {
+                                    "loc": ["body", "kitchenTools", "0"],
+                                    "type": "less_than_equal",
+                                }
+                            ]
+                        },
+                    ),
+                },
+            },
         ),
         500: INTERNAL_ERROR_DOC,
     },
 )
 async def generate_menu(
-    body: GenerateMenuRequest, store: Store
+    body: Annotated[GenerateMenuRequest, Body(openapi_examples=REQUEST_EXAMPLES)],
+    store: Store,
 ) -> GenerateMenuResponse:
-    task_id = await store.create(body.people_count, Decimal(str(body.weekly_budget)))
+    params = GenerationParams(
+        people_count=body.people_count,
+        weekly_budget=Decimal(str(body.weekly_budget)),
+        habits=tuple(body.habits),
+        diet=body.diet,
+        allergies=tuple(body.allergies),
+        kitchen_tools=tuple(body.kitchen_tools),
+    )
+    task_id = await store.create(params)
     return GenerateMenuResponse(task_id=str(task_id))
 
 
