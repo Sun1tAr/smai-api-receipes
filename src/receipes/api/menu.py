@@ -7,7 +7,6 @@ from fastapi import APIRouter, Body, Depends, Path
 from fastapi.exceptions import RequestValidationError
 
 from receipes.api.dependencies import (
-    DictionarySource,
     TaskStore,
     get_dictionaries,
     get_task_store,
@@ -22,7 +21,12 @@ from receipes.api.schemas import (
     TaskResultResponse,
 )
 from receipes.db.models import GenerationTask
-from receipes.dictionaries import UNKNOWN_ID, find_unknown_ids
+from receipes.dictionaries import (
+    UNKNOWN_ID,
+    Dictionaries,
+    DictionarySource,
+    find_unknown_ids,
+)
 from receipes.domain.errors import DictionaryError
 from receipes.domain.params import GenerationParams
 from receipes.domain.status import TaskStatus
@@ -194,8 +198,11 @@ RESULT_EXAMPLES = {
         "повторяющийся неизвестный ID отмечается на каждом вхождении. Пустые "
         "списки и `diet: null` принимаются и MS-2 не вызывают. Если справочники "
         "MS-2 недоступны, ответили ошибкой или не уложились в таймаут, задача не "
-        "создаётся и сервис отвечает 500. В промпт новые параметры пока не "
-        "попадают."
+        "создаётся и сервис отвечает 500.\n\n"
+        "Названия выбранных привычек, диеты, аллергенов и техники из справочников "
+        "MS-2 попадают в промпт отдельным блоком ограничений; пустые списки и "
+        "`diet: null` ограничений не добавляют. Формат ответа модели от параметров "
+        "не зависит."
     ),
     response_model=GenerateMenuResponse,
     responses={
@@ -299,7 +306,7 @@ async def generate_menu(
     # Порядок: схема (уже прошла) -> проверка ID в MS-2 -> создание задачи. Проверка
     # идёт до транзакции БД и не держит её.
     try:
-        await _check_dictionary_ids(body, dictionaries)
+        known = await _check_dictionary_ids(body, dictionaries)
     except DictionaryError as error:
         logger.warning("dictionaries_failed", reason=error.message)
         return error_response(500, "INTERNAL_ERROR", "Internal server error")
@@ -311,20 +318,22 @@ async def generate_menu(
         allergies=tuple(body.allergies),
         kitchen_tools=tuple(body.kitchen_tools),
     )
-    task_id = await store.create(params)
+    task_id = await store.create(params, known)
     return GenerateMenuResponse(task_id=str(task_id))
 
 
-# Запрос без единого ID (все списки пусты, diet = null) MS-2 не вызывает.
+# Запрос без единого ID (все списки пусты, diet = null) MS-2 не вызывает. Тот же
+# ответ MS-2 идёт в промпт задачи: названия и проверка ID из одного снимка.
 async def _check_dictionary_ids(
     body: GenerateMenuRequest, dictionaries: DictionarySource
-) -> None:
+) -> Dictionaries | None:
     if not (
         body.habits or body.allergies or body.kitchen_tools or body.diet is not None
     ):
-        return
+        return None
+    known = await dictionaries.fetch()
     unknown = find_unknown_ids(
-        await dictionaries.fetch(),
+        known,
         habits=body.habits,
         diet=body.diet,
         allergies=body.allergies,
@@ -337,6 +346,7 @@ async def _check_dictionary_ids(
                 for loc in unknown
             ]
         )
+    return known
 
 
 def _menu_response(task: GenerationTask) -> MenuResponse:

@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import httpx
 import pytest
-from menu_samples import ollama_reply, sample_menu
+from menu_samples import UnusedDictionaries, ollama_reply, sample_menu
 from opentelemetry.trace import NoOpTracer
 from prometheus_client import CollectorRegistry
 from sqlalchemy import text
@@ -52,6 +52,7 @@ def make_worker(factory: Factory, settings: Settings) -> GenerationWorker:
         client,
         settings,
         metrics,
+        UnusedDictionaries(),
         sleep=quick_sleep,
     )
 

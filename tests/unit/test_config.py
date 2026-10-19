@@ -203,8 +203,9 @@ def test_metrics_refresh_interval_accepts_the_allowed_range(seconds: float) -> N
     ("num_predict", "num_ctx", "valid"),
     [
         (4096, 4096, False),
-        (4096, 5119, False),
-        (4096, 5120, True),
+        (4096, 5120, False),
+        (4096, 5631, False),
+        (4096, 5632, True),
         (4096, 8192, True),
         (16384, 8192, False),
         (16384, 32768, True),

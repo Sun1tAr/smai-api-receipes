@@ -20,6 +20,13 @@ class PromptTemplateError(GenerationError):
         super().__init__(GENERATION_FAILED)
 
 
+# Справочники MS-2 недоступны или не знают ID задачи: меню не собрать. Повтора нет,
+# задача остаётся failed (LE-6); причина (без значений ID) пишется в лог воркера.
+class DictionariesUnavailable(GenerationError):
+    def __init__(self) -> None:
+        super().__init__("Dictionaries unavailable")
+
+
 class NeurocoreUnavailable(GenerationError):
     def __init__(self) -> None:
         super().__init__("Neurocore unavailable")
@@ -57,6 +64,11 @@ class InvalidNeurocoreResponse(GenerationError):
 # Задачу перевели из in_progress в другое состояние, пока шла генерация (например,
 # новый контейнер при старте пометил её failed). Результат записывать нельзя.
 class TaskStateConflict(Exception):
+    pass
+
+
+# ID параметров задачи нет в справочниках MS-2. Значение ID в сообщении не пишется.
+class UnknownDictionaryId(Exception):
     pass
 
 

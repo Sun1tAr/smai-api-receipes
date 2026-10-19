@@ -41,8 +41,10 @@ DICTIONARIES = {
 class Ms2Stub:
     def __init__(self) -> None:
         self.response = httpx.Response(200, json=DICTIONARIES)
+        self.calls = 0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.calls += 1
         return self.response
 
 
@@ -174,8 +176,22 @@ async def test_v1_style_request_is_rejected_and_stores_nothing(
     assert await count(session_factory, GenerationParameters) == [0]
 
 
-async def test_prompt_and_result_ignore_v2_parameters(
-    api: httpx.AsyncClient, session_factory: Factory
+async def saved_prompts(
+    factory: Factory, *responses: httpx.Response
+) -> list[str | None]:
+    async with factory() as session:
+        return [
+            await session.scalar(
+                select(GenerationTask.prompt).where(
+                    GenerationTask.task_id == UUID(item.json()["task_id"])
+                )
+            )
+            for item in responses
+        ]
+
+
+async def test_prompt_carries_names_of_selected_v2_parameters(
+    api: httpx.AsyncClient, session_factory: Factory, ms2: Ms2Stub
 ) -> None:
     async with session_factory() as session, session.begin():
         session.add(
@@ -184,22 +200,47 @@ async def test_prompt_and_result_ignore_v2_parameters(
     plain = await api.post(
         "/generate-menu", json={**BASE, "habits": [], "kitchenTools": []}
     )
+    assert ms2.calls == 0
     rich = await api.post(
         "/generate-menu",
         json={**BASE, "habits": [1], "diet": 2, "allergies": [3], "kitchenTools": [4]},
     )
-    async with session_factory() as session:
-        prompts = [
-            await session.scalar(
-                select(GenerationTask.prompt).where(
-                    GenerationTask.task_id == UUID(item.json()["task_id"])
-                )
-            )
-            for item in (plain, rich)
-        ]
-    assert prompts[0] == prompts[1] == "2 человек, 100 рублей"
+    # Названия и проверка ID из одного запроса к MS-2.
+    assert ms2.calls == 1
+    prompts = await saved_prompts(session_factory, plain, rich)
+    assert prompts[0] == "2 человек, 100 рублей"
+    assert prompts[1] == (
+        "2 человек, 100 рублей\n\n"
+        "Ограничения пользователя (обязательны к выполнению):\n"
+        "- привычки питания: «n1»;\n"
+        "- диета: «n2»;\n"
+        "- аллергены (не использовать ни в одном блюде и ингредиенте): «n3»;\n"
+        "- доступная кухонная техника (не требуй другой): «n4»."
+    )
     result = await api.get(f"/generate-menu/{rich.json()['task_id']}")
     assert result.json() == {"status": "pending", "menu": None, "error": None}
+
+
+async def test_same_parameters_give_the_same_prompt(
+    api: httpx.AsyncClient, session_factory: Factory
+) -> None:
+    async with session_factory() as session, session.begin():
+        session.add(PromptTemplate(template="{people_count} {weekly_budget}"))
+    body = {**BASE, "habits": [3, 1], "diet": 2, "allergies": [], "kitchenTools": [6]}
+    first = await api.post("/generate-menu", json=body)
+    second = await api.post("/generate-menu", json={**body, "habits": [1, 3, 3]})
+    prompts = await saved_prompts(session_factory, first, second)
+    assert prompts[0] == prompts[1] and prompts[0] is not None
+
+
+async def test_without_template_the_task_waits_for_the_worker(
+    api: httpx.AsyncClient, session_factory: Factory
+) -> None:
+    response = await api.post(
+        "/generate-menu", json={**BASE, "habits": [1], "kitchenTools": []}
+    )
+    assert response.status_code == 202
+    assert await saved_prompts(session_factory, response) == [None]
 
 
 async def test_migration_keeps_v1_tasks_and_downgrade_drops_v2_data(

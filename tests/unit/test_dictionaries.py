@@ -98,6 +98,9 @@ async def test_app_always_builds_the_dictionary_client() -> None:
         {**PAYLOAD, "allergies": []},
         {**PAYLOAD, "kitchenTools": []},
         {**PAYLOAD, "allergies": [{"id": 1, "name": "a"}, {"id": 1, "name": "b"}]},
+        # Пустое название дало бы в промпте строку вида «привычки: , B».
+        {**PAYLOAD, "habits": [{"id": 1, "name": ""}]},
+        {**PAYLOAD, "diets": [{"id": 1, "name": "   \n"}]},
     ],
 )
 async def test_broken_dictionary_seed_is_a_server_error(broken: dict) -> None:
@@ -167,3 +170,9 @@ def test_id_from_another_dictionary_is_unknown() -> None:
         ("body", "habits", 2),
     ]
     assert unknown(diet=0) == [("body", "diet")]
+
+
+async def test_dictionary_names_are_stripped() -> None:
+    payload = {**PAYLOAD, "habits": [{"id": 1, "name": "  Быстрые перекусы \n"}]}
+    result = await client_for(lambda r: httpx.Response(200, json=payload)).fetch()
+    assert result.habits == {1: "Быстрые перекусы"}

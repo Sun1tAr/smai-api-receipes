@@ -155,3 +155,13 @@ async def test_request_example_and_fields_are_documented(app) -> None:
         "Menu generation failed",
     ):
         assert text in error
+
+
+async def test_generate_menu_description_says_names_go_into_the_prompt(app) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        schema = (await client.get("/openapi.json")).json()
+    description = schema["paths"]["/generate-menu"]["post"]["description"]
+    assert "попадают в промпт" in description
+    assert "пока не" not in description

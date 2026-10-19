@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 from fakes import unavailable_db_settings
+from menu_samples import UnusedDictionaries
 from prometheus_client import CollectorRegistry
 
 from receipes.db.repositories import FinishedTask
@@ -36,6 +37,7 @@ def make_worker(
         None,  # type: ignore[arg-type]
         unavailable_db_settings(generation_worker_interval_seconds=7),
         GenerationMetrics(registry or CollectorRegistry()),
+        UnusedDictionaries(),
         sleep=sleep,
     )
 
