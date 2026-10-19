@@ -2,9 +2,16 @@ from decimal import Decimal
 from typing import Annotated, Any
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Body, Depends, Path
+from fastapi.exceptions import RequestValidationError
 
-from receipes.api.dependencies import TaskStore, get_task_store
+from receipes.api.dependencies import (
+    DictionarySource,
+    TaskStore,
+    get_dictionaries,
+    get_task_store,
+)
 from receipes.api.schemas import (
     GenerateMenuRequest,
     GenerateMenuResponse,
@@ -15,14 +22,18 @@ from receipes.api.schemas import (
     TaskResultResponse,
 )
 from receipes.db.models import GenerationTask
+from receipes.dictionaries import UNKNOWN_ID, find_unknown_ids
+from receipes.domain.errors import DictionaryError
 from receipes.domain.params import GenerationParams
 from receipes.domain.status import TaskStatus
 from receipes.errors import ErrorResponse, error_response
 
+logger = structlog.get_logger()
 router = APIRouter(tags=["menu"])
 
 TASK_NOT_FOUND = "Generation task not found"
 Store = Annotated[TaskStore, Depends(get_task_store)]
+DictionariesDep = Annotated[DictionarySource, Depends(get_dictionaries)]
 
 
 def _error_example(code: str, message: str, details: dict[str, Any]) -> dict[str, Any]:
@@ -177,16 +188,22 @@ RESULT_EXAMPLES = {
         "`null`, можно не передавать) и `allergies` (можно не передавать). "
         "Параметры сохраняются вместе с задачей. Запрос без `habits` или "
         "`kitchenTools` (формат версии 1) получает 400.\n\n"
-        "Здесь проверяются только типы и диапазон int4; существование ID в "
-        "справочниках MS-2 и ограничение на число привычек пока не проверяются, а "
-        "в промпт новые параметры пока не попадают."
+        "Проверки: типы и диапазоны; не больше 3 разных привычек; каждый ID "
+        "должен существовать в справочниках MS-2. Неизвестный ID даёт 400 "
+        '`unknown_id` с указанием элемента (`["body", "habits", "1"]`), '
+        "повторяющийся неизвестный ID отмечается на каждом вхождении. Пустые "
+        "списки и `diet: null` принимаются и MS-2 не вызывают. Если справочники "
+        "MS-2 недоступны, ответили ошибкой или не уложились в таймаут, задача не "
+        "создаётся и сервис отвечает 500. В промпт новые параметры пока не "
+        "попадают."
     ),
     response_model=GenerateMenuResponse,
     responses={
         202: {"description": "Задача создана и ждёт обработки."},
         400: _error_doc(
             "Некорректные параметры: поля не заданы, неверный тип или значение вне "
-            "границ, битый JSON, пустое тело, тело не JSON-объект.",
+            "границ, больше 3 разных привычек (`too_long`), неизвестный ID "
+            "(`unknown_id`), битый JSON, пустое тело, тело не JSON-объект.",
             examples={
                 "peopleCount": {
                     "summary": "Неверный тип peopleCount",
@@ -228,6 +245,26 @@ RESULT_EXAMPLES = {
                         {"fields": [{"loc": ["body", "diet"], "type": "int_type"}]},
                     ),
                 },
+                "habits_too_many": {
+                    "summary": "Больше трёх разных привычек",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {"fields": [{"loc": ["body", "habits"], "type": "too_long"}]},
+                    ),
+                },
+                "unknown_id": {
+                    "summary": "ID нет в справочнике MS-2 (второй элемент habits)",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {
+                            "fields": [
+                                {"loc": ["body", "habits", "1"], "type": "unknown_id"}
+                            ]
+                        },
+                    ),
+                },
                 "out_of_range": {
                     "summary": "ID вне диапазона int4",
                     "value": _error_example(
@@ -245,13 +282,27 @@ RESULT_EXAMPLES = {
                 },
             },
         ),
-        500: INTERNAL_ERROR_DOC,
+        500: _error_doc(
+            "Внутренняя ошибка сервиса: недоступна база данных или справочники "
+            "MS-2 (недоступны, ответили ошибкой или не уложились в таймаут), "
+            "поэтому ID проверить нельзя. Задача не создаётся. Подробности только "
+            "в логе сервиса.",
+            _error_example("INTERNAL_ERROR", "Internal server error", {}),
+        ),
     },
 )
 async def generate_menu(
     body: Annotated[GenerateMenuRequest, Body(openapi_examples=REQUEST_EXAMPLES)],
     store: Store,
-) -> GenerateMenuResponse:
+    dictionaries: DictionariesDep,
+) -> Any:
+    # Порядок: схема (уже прошла) -> проверка ID в MS-2 -> создание задачи. Проверка
+    # идёт до транзакции БД и не держит её.
+    try:
+        await _check_dictionary_ids(body, dictionaries)
+    except DictionaryError as error:
+        logger.warning("dictionaries_failed", reason=error.message)
+        return error_response(500, "INTERNAL_ERROR", "Internal server error")
     params = GenerationParams(
         people_count=body.people_count,
         weekly_budget=Decimal(str(body.weekly_budget)),
@@ -262,6 +313,30 @@ async def generate_menu(
     )
     task_id = await store.create(params)
     return GenerateMenuResponse(task_id=str(task_id))
+
+
+# Запрос без единого ID (все списки пусты, diet = null) MS-2 не вызывает.
+async def _check_dictionary_ids(
+    body: GenerateMenuRequest, dictionaries: DictionarySource
+) -> None:
+    if not (
+        body.habits or body.allergies or body.kitchen_tools or body.diet is not None
+    ):
+        return
+    unknown = find_unknown_ids(
+        await dictionaries.fetch(),
+        habits=body.habits,
+        diet=body.diet,
+        allergies=body.allergies,
+        kitchen_tools=body.kitchen_tools,
+    )
+    if unknown:
+        raise RequestValidationError(
+            [
+                {"loc": loc, "type": UNKNOWN_ID, "msg": "Unknown dictionary id"}
+                for loc in unknown
+            ]
+        )
 
 
 def _menu_response(task: GenerationTask) -> MenuResponse:

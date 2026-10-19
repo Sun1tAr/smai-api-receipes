@@ -48,9 +48,9 @@ class Settings(BaseSettings):
     ollama_temperature: float = Field(default=0.3, ge=0, le=2)
     ollama_keep_alive: str = Field(default="30m", min_length=1)
 
-    # Справочники MS-2 (API-7). Не задан — клиент не создаётся; обязательным адрес
-    # станет в SMAI-87, когда MS-4 начнёт проверять ID.
-    ms2_base_url: AnyHttpUrl | None = None
+    # Справочники MS-2 (API-7): MS-4 проверяет по ним ID из запроса API-1. Адрес
+    # обязателен; таймаут действует и на каждую фазу запроса, и на запрос целиком.
+    ms2_base_url: AnyHttpUrl
     ms2_timeout_seconds: float = Field(default=5, gt=0, le=60)
 
     # Фоновая генерация меню.

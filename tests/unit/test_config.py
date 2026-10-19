@@ -11,6 +11,7 @@ def required_settings(**extra: object) -> dict[str, object]:
         "db_user": "receipes",
         "db_password": "local-only",
         "ollama_base_url": "http://ollama.test:11434",
+        "ms2_base_url": "http://ms2.test:8000",
         **extra,
     }
 
@@ -29,7 +30,15 @@ def test_missing_required_settings_prevent_startup() -> None:
 
 
 @pytest.mark.parametrize(
-    "missing", ["db_host", "db_name", "db_user", "db_password", "ollama_base_url"]
+    "missing",
+    [
+        "db_host",
+        "db_name",
+        "db_user",
+        "db_password",
+        "ollama_base_url",
+        "ms2_base_url",
+    ],
 )
 def test_each_required_setting_is_required(missing: str) -> None:
     from receipes.config import Settings
@@ -66,6 +75,7 @@ def test_environment_overrides_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
     Path(".env").write_text(
         "DB_HOST=postgres\nDB_NAME=receipes\nDB_USER=receipes\n"
         "DB_PASSWORD=local-only\nOLLAMA_BASE_URL=http://ollama.test:11434\n"
+        "MS2_BASE_URL=http://ms2.test:8000\n"
     )
     monkeypatch.setenv("DB_HOST", "deployment-db")
     settings = Settings()
@@ -79,6 +89,7 @@ def test_extra_environment_is_ignored() -> None:
     Path(".env").write_text(
         "DB_HOST=postgres\nDB_NAME=receipes\nDB_USER=receipes\n"
         "DB_PASSWORD=local-only\nOLLAMA_BASE_URL=http://ollama.test:11434\n"
+        "MS2_BASE_URL=http://ms2.test:8000\n"
         "RECEIPES_HTTP_PORT=8001\nUNKNOWN=1\n"
     )
     assert Settings().db_host == "postgres"
@@ -90,6 +101,7 @@ def test_empty_values_in_dotenv_mean_unset() -> None:
     Path(".env").write_text(
         "DB_HOST=postgres\nDB_NAME=receipes\nDB_USER=receipes\n"
         "DB_PASSWORD=local-only\nOLLAMA_BASE_URL=http://ollama.test:11434\n"
+        "MS2_BASE_URL=http://ms2.test:8000\n"
         "DB_PORT=\nDB_TIMEOUT_SECONDS=\nLOG_LEVEL=\nOTEL_EXPORTER_OTLP_ENDPOINT=\n"
         "OLLAMA_MODEL=\nOLLAMA_NUM_CTX=\nOLLAMA_KEEP_ALIVE=\n"
         "GENERATION_WORKER_ENABLED=\n"
@@ -132,6 +144,7 @@ def test_values_are_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> No
         "DB_USER": "receipes",
         "DB_PASSWORD": "local-only",
         "OLLAMA_BASE_URL": "http://ollama.test:11434",
+        "MS2_BASE_URL": "http://ms2.test:8000",
         "OLLAMA_MODEL": "other:model",
         "OLLAMA_TEMPERATURE": "0.7",
         "GENERATION_WORKER_ENABLED": "false",
@@ -270,10 +283,14 @@ def test_urls_with_credentials_are_rejected_without_echoing_them(
     )
 
 
-def test_ms2_defaults_do_not_prevent_startup() -> None:
-    settings = make()
-    assert settings.ms2_base_url is None
-    assert settings.ms2_timeout_seconds == 5
+def test_ms2_timeout_has_a_default() -> None:
+    assert make().ms2_timeout_seconds == 5
+
+
+@pytest.mark.parametrize("value", ["", "   ", "ms2:8000", "ftp://ms2"])
+def test_ms2_url_must_be_a_valid_http_url(value: str) -> None:
+    with pytest.raises(ValidationError):
+        make(ms2_base_url=value)
 
 
 def test_ms2_settings_are_read() -> None:

@@ -126,13 +126,9 @@ def create_app(
         generation_metrics,
         provider.get_tracer("receipes.ollama"),
     )
-    # Клиент справочников MS-2 создаётся только при заданном MS2_BASE_URL; в
-    # SMAI-88 его пока никто не вызывает (проверка ID — SMAI-87).
-    dictionaries = (
-        DictionaryClient(DictionaryClient.build_http_client(settings, ms2_transport))
-        if settings.ms2_base_url is not None
-        else None
-    )
+    # Справочники MS-2 нужны для проверки ID в API-1; на старте их доступность не
+    # проверяется: запрос без ID от MS-2 не зависит.
+    dictionaries = DictionaryClient.from_settings(settings, ms2_transport)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     worker = GenerationWorker(
         session_factory, lock_engine, ollama, settings, generation_metrics
@@ -172,8 +168,7 @@ def create_app(
                 with suppress(asyncio.CancelledError):
                     await worker_task
             await ollama.aclose()
-            if dictionaries is not None:
-                await dictionaries.aclose()
+            await dictionaries.aclose()
             await lock_engine.dispose()
             await engine.dispose()
             instrumentor.uninstrument()

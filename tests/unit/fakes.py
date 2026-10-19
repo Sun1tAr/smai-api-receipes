@@ -10,6 +10,7 @@ def unavailable_db_settings(**extra: object) -> Settings:
         "db_name": "receipes",
         "db_password": "private-test-password",
         "ollama_base_url": "http://ollama.test:11434",
+        "ms2_base_url": "http://ms2.test:8000",
         "db_timeout_seconds": 1,
         **extra,
     }

@@ -7,7 +7,7 @@ import jsonschema
 import pytest
 from fakes import unavailable_db_settings
 
-from receipes.api.dependencies import get_task_store
+from receipes.api.dependencies import get_dictionaries, get_task_store
 from receipes.db.models import (
     GenerationParameters,
     GenerationTask,
@@ -19,6 +19,7 @@ from receipes.db.models import (
     Recipe,
     RecipeIngredient,
 )
+from receipes.dictionaries import Dictionaries
 from receipes.domain.params import GenerationParams
 from receipes.domain.status import TaskStatus
 
@@ -41,6 +42,19 @@ class FakeStore:
         if self.fail:
             raise ConnectionError("SELECT secret FROM users")
         return self.tasks.get(task_id)
+
+
+# Справочники MS-2 с запасом ID: тесты этого файла не про проверку ID (она в
+# test_api_validation.py).
+class FakeDictionaries:
+    async def fetch(self) -> Dictionaries:
+        ids = {i: str(i) for i in range(1, 10)}
+        return Dictionaries(
+            habits={**ids, -(2**31): "min"},
+            diets=ids,
+            allergies=ids,
+            kitchen_tools={**ids, 2**31 - 1: "max"},
+        )
 
 
 def make_recipe(name: str, quantity: str = "35.00") -> MenuRecipe:
@@ -91,6 +105,7 @@ async def client(store: FakeStore):
 
     app = create_app(unavailable_db_settings())
     app.dependency_overrides[get_task_store] = lambda: store
+    app.dependency_overrides[get_dictionaries] = FakeDictionaries
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
         base_url="http://test",

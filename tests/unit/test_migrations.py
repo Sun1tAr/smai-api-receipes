@@ -18,6 +18,7 @@ def test_migration_connection_failure_has_safe_logs_and_nonzero_exit() -> None:
             "DB_PASSWORD": "private-migration-password",
             "DB_TIMEOUT_SECONDS": "1",
             "OLLAMA_BASE_URL": "http://ollama.test:11434",
+            "MS2_BASE_URL": "http://ms2.test:8000",
         },
         capture_output=True,
         text=True,

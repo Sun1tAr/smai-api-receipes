@@ -25,6 +25,8 @@ def clean_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "OLLAMA_NUM_PREDICT",
         "OLLAMA_TEMPERATURE",
         "OLLAMA_KEEP_ALIVE",
+        "MS2_BASE_URL",
+        "MS2_TIMEOUT_SECONDS",
         "GENERATION_WORKER_ENABLED",
         "GENERATION_WORKER_INTERVAL_SECONDS",
         "GENERATION_BAD_RESPONSE_RETRIES",
