@@ -39,6 +39,7 @@ async def test_health_is_fully_documented_and_metrics_is_hidden(app) -> None:
         "/health",
         "/generate-menu",
         "/generate-menu/{task_id}",
+        "/profile/parameters",
     }
     operation = document["paths"]["/health"]["get"]
     assert operation["summary"]
@@ -65,6 +66,7 @@ EXPECTED_CODES = {
     ("/health", "get"): {"200", "503"},
     ("/generate-menu", "post"): {"202", "400", "500"},
     ("/generate-menu/{task_id}", "get"): {"200", "404", "500"},
+    ("/profile/parameters", "get"): {"200", "401", "500"},
 }
 
 
@@ -165,3 +167,32 @@ async def test_generate_menu_description_says_names_go_into_the_prompt(app) -> N
     description = schema["paths"]["/generate-menu"]["post"]["description"]
     assert "попадают в промпт" in description
     assert "пока не" not in description
+
+
+async def test_profile_parameters_and_user_header_are_documented(app) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        document = (await client.get("/openapi.json")).json()
+    schemas = document["components"]["schemas"]
+    operation = document["paths"]["/profile/parameters"]["get"]
+    examples = operation["responses"]["200"]["content"]["application/json"]["examples"]
+    assert set(examples) == {"saved", "empty"}
+    assert examples["empty"]["value"]["diet"] is None
+    for item in examples.values():
+        jsonschema.validate(
+            item["value"],
+            {**schemas["SavedParametersResponse"], "components": {"schemas": schemas}},
+        )
+    for item in (
+        operation,
+        document["paths"]["/generate-menu"]["post"],
+    ):
+        header = next(p for p in item["parameters"] if p["in"] == "header")
+        assert header["name"] == "X-User-Id"
+        assert header["required"] is False
+        assert header["description"]
+    post = document["paths"]["/generate-menu"]["post"]
+    assert (
+        "user_id" in post["responses"]["400"]["content"]["application/json"]["examples"]
+    )

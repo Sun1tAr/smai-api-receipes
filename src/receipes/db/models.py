@@ -28,12 +28,15 @@ class PromptTemplate(Base):
 
 class GenerationParameters(Base):
     __tablename__ = "generation_parameters"
+    __table_args__ = (Index("ix_generation_parameters_user_id", "user_id"),)
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     people_count: Mapped[int] = mapped_column(Integer)
     weekly_budget: Mapped[Decimal] = mapped_column(Numeric(12, 2))
     # Идентификаторы справочников MS-2 хранятся числами без FK (другая БД).
     diet_id: Mapped[int | None] = mapped_column(Integer)
+    # Владелец из MS-3 (без FK, другая БД); NULL = гость.
+    user_id: Mapped[int | None] = mapped_column(Integer)
 
     habits: Mapped[list["GenerationParameterHabit"]] = relationship(lazy="raise")
     allergies: Mapped[list["GenerationParameterAllergen"]] = relationship(lazy="raise")

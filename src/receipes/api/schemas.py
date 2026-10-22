@@ -220,3 +220,23 @@ class TaskResultResponse(BaseModel):
             "`Menu generation failed`."
         )
     )
+
+
+class SavedParametersResponse(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "habits": [3, 5],
+                "diet": 4,
+                "allergies": [1, 2],
+                "kitchenTools": [1, 2, 6],
+            }
+        }
+    )
+
+    habits: list[int] = Field(description="ID привычек по возрастанию; `[]`, если нет.")
+    diet: int | None = Field(description="ID диеты или `null`.")
+    allergies: list[int] = Field(description="ID аллергенов по возрастанию.")
+    kitchen_tools: list[int] = Field(
+        alias="kitchenTools", description="ID кухонной техники по возрастанию."
+    )
