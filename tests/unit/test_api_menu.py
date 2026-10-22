@@ -31,16 +31,27 @@ class FakeStore:
         self.dictionaries: list[Dictionaries | None] = []
         self.tasks: dict[UUID, GenerationTask] = {}
         self.fail = False
+        self.user_ids: list[int | None] = []
+        self.saved: dict[int, GenerationParameters] = {}
 
     async def create(
-        self, params: GenerationParams, dictionaries: Dictionaries | None = None
+        self,
+        params: GenerationParams,
+        dictionaries: Dictionaries | None = None,
+        user_id: int | None = None,
     ) -> UUID:
         if self.fail:
             raise ConnectionError("SELECT secret FROM users")
+        self.user_ids.append(user_id)
         self.created.append((params.people_count, params.weekly_budget))
         self.params.append(params)
         self.dictionaries.append(dictionaries)
         return UUID("b1e2c3d4-5678-90ab-cdef-1234567890ab")
+
+    async def last_done_parameters(self, user_id: int) -> GenerationParameters | None:
+        if self.fail:
+            raise ConnectionError("SELECT secret FROM users")
+        return self.saved.get(user_id)
 
     async def get(self, task_id: UUID) -> GenerationTask | None:
         if self.fail:

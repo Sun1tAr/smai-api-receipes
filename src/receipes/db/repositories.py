@@ -55,12 +55,18 @@ class TaskRepository:
 
     # Параметры и задача pending создаются вместе; возвращается task_id. Промпт, если
     # он уже собран, сохраняется сразу; иначе его добавит воркер при захвате.
-    async def create(self, params: GenerationParams, prompt: str | None = None) -> UUID:
+    async def create(
+        self,
+        params: GenerationParams,
+        prompt: str | None = None,
+        user_id: int | None = None,
+    ) -> UUID:
         parameters = GenerationParameters(
             id=uuid4(),
             people_count=params.people_count,
             weekly_budget=params.weekly_budget,
             diet_id=params.diet,
+            user_id=user_id,
         )
         links: list[object] = [
             *(
@@ -144,6 +150,26 @@ class TaskRepository:
                 GenerationTask, GenerationTask.parameters_id == GenerationParameters.id
             )
             .where(GenerationTask.task_id == task_id)
+            .options(*_PARAMETER_LINKS)
+        )
+        return await self._session.scalar(query)
+
+    # Параметры самой свежей задачи пользователя в статусе done (по created_at, при
+    # равенстве по task_id); None, если таких задач нет.
+    async def find_last_done_parameters(
+        self, user_id: int
+    ) -> GenerationParameters | None:
+        query = (
+            select(GenerationParameters)
+            .join(
+                GenerationTask, GenerationTask.parameters_id == GenerationParameters.id
+            )
+            .where(
+                GenerationParameters.user_id == user_id,
+                GenerationTask.status == TaskStatus.DONE,
+            )
+            .order_by(GenerationTask.created_at.desc(), GenerationTask.task_id.desc())
+            .limit(1)
             .options(*_PARAMETER_LINKS)
         )
         return await self._session.scalar(query)

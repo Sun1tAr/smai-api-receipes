@@ -3,13 +3,15 @@ from typing import Annotated, Any
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Body, Depends, Path
+from fastapi import APIRouter, Body, Depends, Header, Path, Request
 from fastapi.exceptions import RequestValidationError
 
 from receipes.api.dependencies import (
+    USER_ID_HEADER,
     TaskStore,
     get_dictionaries,
     get_task_store,
+    parse_user_id,
 )
 from receipes.api.schemas import (
     GenerateMenuRequest,
@@ -190,7 +192,11 @@ RESULT_EXAMPLES = {
         "В теле запроса: `peopleCount`, `weeklyBudget` и параметры версии 2: `habits`, "
         "`kitchenTools` (обязательны в JSON, могут быть `[]`), `diet` (число или "
         "`null`, можно не передавать) и `allergies` (можно не передавать). "
-        "Параметры сохраняются вместе с задачей. Запрос без `habits` или "
+        "Параметры сохраняются вместе с задачей. Необязательный заголовок "
+        "`X-User-Id` (его выставляет gateway по токену) задаёт владельца задачи: "
+        "по ним потом отдаются сохранённые параметры (API-13). Без заголовка запрос "
+        "гостевой, владелец не сохраняется; значение вне целых 1..2147483647 или "
+        "повтор заголовка даёт 400. Запрос без `habits` или "
         "`kitchenTools` (формат версии 1) получает 400.\n\n"
         "Проверки: типы и диапазоны; не больше 3 разных привычек; каждый ID "
         "должен существовать в справочниках MS-2. Неизвестный ID даёт 400 "
@@ -272,6 +278,18 @@ RESULT_EXAMPLES = {
                         },
                     ),
                 },
+                "user_id": {
+                    "summary": "Некорректный X-User-Id",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {
+                            "fields": [
+                                {"loc": ["header", USER_ID_HEADER], "type": "user_id"}
+                            ]
+                        },
+                    ),
+                },
                 "out_of_range": {
                     "summary": "ID вне диапазона int4",
                     "value": _error_example(
@@ -299,12 +317,38 @@ RESULT_EXAMPLES = {
     },
 )
 async def generate_menu(
+    request: Request,
     body: Annotated[GenerateMenuRequest, Body(openapi_examples=REQUEST_EXAMPLES)],
     store: Store,
     dictionaries: DictionariesDep,
+    # Только для OpenAPI: значение читается из `request` (см. ниже).
+    _x_user_id: Annotated[
+        str | None,
+        Header(
+            alias=USER_ID_HEADER,
+            description=(
+                "Владелец запроса: целое от 1 до 2147483647, заголовок один. Нет "
+                "заголовка: гость, `user_id` не сохраняется."
+            ),
+            examples=["42"],
+        ),
+    ] = None,
 ) -> Any:
-    # Порядок: схема (уже прошла) -> проверка ID в MS-2 -> создание задачи. Проверка
-    # идёт до транзакции БД и не держит её.
+    # Порядок: схема (уже прошла) -> заголовок -> проверка ID в MS-2 -> создание
+    # задачи. Проверка идёт до транзакции БД и не держит её.
+    # Читается из запроса целиком: повтор заголовка считается ошибкой.
+    owner_values = request.headers.getlist(USER_ID_HEADER)
+    user_id = parse_user_id(owner_values)
+    if owner_values and user_id is None:
+        raise RequestValidationError(
+            [
+                {
+                    "loc": ("header", USER_ID_HEADER),
+                    "type": "user_id",
+                    "msg": "Invalid user id",
+                }
+            ]
+        )
     try:
         known = await _check_dictionary_ids(body, dictionaries)
     except DictionaryError as error:
@@ -318,7 +362,7 @@ async def generate_menu(
         allergies=tuple(body.allergies),
         kitchen_tools=tuple(body.kitchen_tools),
     )
-    task_id = await store.create(params, known)
+    task_id = await store.create(params, known, user_id)
     return GenerateMenuResponse(task_id=str(task_id))
 
 

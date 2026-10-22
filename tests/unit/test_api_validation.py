@@ -24,7 +24,7 @@ class FakeStore:
         self.params: list = []
         self.dictionaries: list = []
 
-    async def create(self, params, dictionaries=None):
+    async def create(self, params, dictionaries=None, user_id=None):
         self.params.append(params)
         self.dictionaries.append(dictionaries)
         return "b1e2c3d4-5678-90ab-cdef-1234567890ab"
