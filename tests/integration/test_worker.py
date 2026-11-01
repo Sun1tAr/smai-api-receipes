@@ -1101,3 +1101,55 @@ async def test_api_task_keeps_a_null_prompt_when_names_are_unavailable(
         assert await TaskRepository(session).get_prompt(task_id) is None
     out = capsys.readouterr().out
     assert "task_prompt_not_saved" in out and reason in out
+
+
+@pytest.mark.parametrize("field", ["quantity", "unit"])
+async def test_missing_ingredient_amount_exhausts_retry_without_saving(
+    ready: Factory, settings: Settings, field: str
+) -> None:
+    harness = rig(ready, settings)
+    await add_task(ready)
+    await harness.worker.process_one()
+    before = {model: await harness.count(model) for model in (Menu, Recipe)}
+    menu = sample_menu()
+    del menu["recipes"][1]["ingredients"][0][field]
+    task_id = await add_task(ready)
+    harness = rig(
+        ready,
+        settings,
+        lambda r: httpx.Response(200, json=ollama_reply(menu)),
+        generation_bad_response_retries=1,
+    )
+    await harness.worker.process_one()
+    task = await harness.task(task_id)
+    assert (task.status, task.error, task.menu_id) == (
+        TaskStatus.FAILED,
+        "Invalid neurocore response",
+        None,
+    )
+    assert len(harness.requests) == 2
+    for model, count in before.items():
+        assert await harness.count(model) == count
+
+
+@pytest.mark.parametrize("field", ["quantity", "unit"])
+async def test_missing_ingredient_amount_then_valid_answer_saves_menu(
+    ready: Factory, settings: Settings, field: str
+) -> None:
+    menu = sample_menu()
+    del menu["recipes"][1]["ingredients"][0][field]
+    replies = iter([ollama_reply(menu), ollama_reply(sample_menu())])
+    task_id = await add_task(ready)
+    harness = rig(
+        ready,
+        settings,
+        lambda r: httpx.Response(200, json=next(replies)),
+        generation_bad_response_retries=1,
+    )
+    await harness.worker.process_one()
+    task = await harness.task(task_id)
+    assert (task.status, task.error) == (TaskStatus.DONE, None)
+    assert task.menu_id is not None
+    assert len(harness.requests) == 2
+    assert await harness.count(Menu) == 1
+    assert await harness.count(Recipe) == 3

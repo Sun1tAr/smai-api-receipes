@@ -266,3 +266,10 @@ def test_huge_quantity_is_bounds() -> None:
     assert rejected_reason(data) == "bounds"
     data["recipes"][0]["ingredients"][0]["quantity"] = 1e30
     assert rejected_reason(data) == "bounds"
+
+
+@pytest.mark.parametrize("field", ["quantity", "unit"])
+def test_missing_ingredient_amount_is_rejected(field: str) -> None:
+    data = sample_menu()
+    del data["recipes"][1]["ingredients"][0][field]
+    assert rejected_reason(data) == "schema"

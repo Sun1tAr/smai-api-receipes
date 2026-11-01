@@ -138,6 +138,18 @@ async def test_get_done_task_returns_the_saved_menu(
     assert (body["status"], body["error"]) == ("done", None)
     recipes = {recipe["name"]: recipe for recipe in body["menu"]["recipes"]}
     assert set(recipes) == {"Овсяная каша", "Куриный суп", "Запечённый лосось"}
+    async with session_factory() as session:
+        saved = await TaskRepository(session).get(task_id)
+        assert saved is not None
+        expected_ids = {
+            link.recipe.name: str(link.recipe.id) for link in saved.menu.menu_recipes
+        }
+    for result in (body, (await api.get(f"/generate-menu/{task_id}")).json()):
+        actual_ids = {
+            item["name"]: item["recipeId"] for item in result["menu"]["recipes"]
+        }
+        assert actual_ids == expected_ids
+        assert all(str(UUID(value)) == value for value in actual_ids.values())
     soup = recipes["Куриный суп"]
     assert {item["name"] for item in soup["ingredients"]} == {
         "Курица",

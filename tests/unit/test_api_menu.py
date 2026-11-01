@@ -371,8 +371,16 @@ async def test_get_done_returns_menu_with_all_fields(client, store) -> None:
     body = response.json()
     assert body["status"] == "done" and body["error"] is None
     assert len(body["menu"]["recipes"]) == 3
+    expected_ids = {link.recipe.name: str(link.recipe.id) for link in menu.menu_recipes}
+    for result in (body, (await client.get(f"/generate-menu/{task.task_id}")).json()):
+        actual_ids = {
+            item["name"]: item["recipeId"] for item in result["menu"]["recipes"]
+        }
+        assert actual_ids == expected_ids
+        assert all(str(UUID(value)) == value for value in actual_ids.values())
     recipe = body["menu"]["recipes"][0]
     assert recipe == {
+        "recipeId": str(menu.menu_recipes[0].recipe.id),
         "name": "Блюдо 0",
         "ingredients": [{"name": "Мука", "quantity": 35, "unit": "г"}],
         "calories": 350,
