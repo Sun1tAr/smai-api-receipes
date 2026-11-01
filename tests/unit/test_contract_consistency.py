@@ -1,3 +1,6 @@
+import copy
+from uuid import UUID
+
 import httpx
 import jsonschema
 from fakes import unavailable_db_settings
@@ -7,8 +10,7 @@ from receipes.domain.menu import parse_menu
 from receipes.generation.ollama import RESPONSE_FORMAT
 
 
-# Одна и та же структура меню описана в трёх местах: format для Ollama (API-3),
-# «ворота» MenuPayload и пример `done` в OpenAPI (API-2). Они не должны расходиться.
+# Общие поля API-2 и API-3 совпадают; recipeId добавляет только backend.
 async def test_openapi_done_example_is_a_valid_model_answer() -> None:
     from receipes.main import create_app
 
@@ -23,7 +25,18 @@ async def test_openapi_done_example_is_a_valid_model_answer() -> None:
         app.state.tracer_provider.shutdown()
     get = document["paths"]["/generate-menu/{task_id}"]["get"]
     examples = get["responses"]["200"]["content"]["application/json"]["examples"]
-    menu = examples["done"]["value"]["menu"]
+    value = examples["done"]["value"]
+    schemas = document["components"]["schemas"]
+    jsonschema.validate(
+        value,
+        {**schemas["TaskResultResponse"], "components": {"schemas": schemas}},
+        format_checker=jsonschema.FormatChecker(),
+    )
+    ids = [UUID(recipe["recipeId"]) for recipe in value["menu"]["recipes"]]
+    assert len(set(ids)) == len(ids)
+    menu = copy.deepcopy(value["menu"])
+    for recipe in menu["recipes"]:
+        del recipe["recipeId"]
     jsonschema.validate(menu, RESPONSE_FORMAT)
     assert len(parse_menu(menu).recipes) == len(menu["recipes"])
 

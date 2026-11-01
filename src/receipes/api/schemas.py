@@ -1,5 +1,6 @@
 from decimal import Decimal
 from typing import Annotated, Literal
+from uuid import UUID
 
 from pydantic import (
     BaseModel,
@@ -163,6 +164,10 @@ class NutritionResponse(BaseModel):
 
 class RecipeResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
+
+    recipe_id: UUID = Field(
+        alias="recipeId", description="Идентификатор сохранённого рецепта."
+    )
 
     name: str = Field(description="Название блюда.")
     ingredients: list[IngredientResponse] = Field(

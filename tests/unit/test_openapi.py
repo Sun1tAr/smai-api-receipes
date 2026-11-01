@@ -196,3 +196,11 @@ async def test_profile_parameters_and_user_header_are_documented(app) -> None:
     assert (
         "user_id" in post["responses"]["400"]["content"]["application/json"]["examples"]
     )
+
+
+async def test_recipe_id_is_required_uuid_in_api2(app) -> None:
+    schema = app.openapi()["components"]["schemas"]["RecipeResponse"]
+    assert "recipeId" in schema["required"]
+    assert schema["properties"]["recipeId"]["type"] == "string"
+    assert schema["properties"]["recipeId"]["format"] == "uuid"
+    assert schema["properties"]["recipeId"]["description"]

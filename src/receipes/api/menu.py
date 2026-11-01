@@ -95,6 +95,7 @@ DONE_EXAMPLE = {
     "menu": {
         "recipes": [
             {
+                "recipeId": "00000000-0000-4000-8000-000000000001",
                 "name": "Овсяная каша с яблоком",
                 "ingredients": [
                     {"name": "Овсяные хлопья", "quantity": 320, "unit": "г"},
@@ -117,6 +118,7 @@ DONE_EXAMPLE = {
                 "photo": None,
             },
             {
+                "recipeId": "00000000-0000-4000-8000-000000000002",
                 "name": "Куриный суп с лапшой",
                 "ingredients": [
                     {"name": "Куриное филе", "quantity": 600, "unit": "г"},
@@ -138,6 +140,7 @@ DONE_EXAMPLE = {
                 "photo": None,
             },
             {
+                "recipeId": "00000000-0000-4000-8000-000000000003",
                 "name": "Запечённый лосось с рисом",
                 "ingredients": [
                     {"name": "Лосось", "quantity": 600, "unit": "г"},
@@ -402,6 +405,7 @@ def _menu_response(task: GenerationTask) -> MenuResponse:
         recipe = link.recipe
         recipes.append(
             RecipeResponse(
+                recipe_id=recipe.id,
                 name=recipe.name,
                 ingredients=[
                     IngredientResponse(
