@@ -9,6 +9,8 @@ from time import monotonic
 
 import httpx
 
+CART_LINK_TOOL = "vkusvill_cart_link_create"
+
 _PROTOCOL_VERSION = "2025-03-26"
 _RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 _MAX_RESPONSE_BYTES = 256 * 1024
@@ -24,11 +26,13 @@ class McpError(Exception):
         unavailable: bool = False,
         retryable: bool = False,
         http_status: int | None = None,
+        code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.unavailable = unavailable
         self.retryable = retryable
         self.http_status = http_status
+        self.code = code
 
 
 def _invalid_response() -> McpError:
@@ -128,11 +132,13 @@ def _tool_error(error: object, *, unavailable: bool = False) -> McpError:
         or retryable
         or (status is not None and (status in (401, 403, 408, 429) or status >= 500))
     )
+    code = error.get("code")
     return McpError(
         "MCP tool failed",
         unavailable=unavailable,
         retryable=retryable,
         http_status=status,
+        code=code if isinstance(code, str) else None,
     )
 
 
@@ -222,6 +228,11 @@ class McpClient:
         self._cache.clear()
 
     async def call(self, tool: str, arguments: dict) -> dict:
+        params = {"name": tool, "arguments": arguments}
+        if tool == CART_LINK_TOOL:
+            data, _ = await self._call_tool(params)
+            return data
+
         key = (
             tool,
             json.dumps(
@@ -234,17 +245,10 @@ class McpClient:
         if (entry := self._cache.get(key)) is not None:
             return _json_object(entry[1])["data"]
 
-        params = {"name": tool, "arguments": arguments}
         retries = self._retries
         while True:
             try:
-                await self._ensure_session()
-                async with self._slots:
-                    if (headers := self._session_headers) is None:
-                        # Another call observed session expiry while this call queued.
-                        continue
-                    result, _ = await self._post("tools/call", params, headers=headers)
-                data, text = _tool_data(result)
+                data, text = await self._call_tool(params)
             except McpError as exc:
                 if not exc.retryable or retries <= 0:
                     raise
@@ -255,6 +259,16 @@ class McpClient:
                 if len(self._cache) > _CACHE_LIMIT:
                     self._cache.popitem(last=False)
                 return data
+
+    async def _call_tool(self, params: dict) -> tuple[dict, str]:
+        while True:
+            await self._ensure_session()
+            async with self._slots:
+                if (headers := self._session_headers) is None:
+                    # Another call observed session expiry while this call queued.
+                    continue
+                result, _ = await self._post("tools/call", params, headers=headers)
+            return _tool_data(result)
 
     async def _ensure_session(self) -> None:
         if self._session_headers is not None:
