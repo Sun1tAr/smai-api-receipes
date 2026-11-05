@@ -54,6 +54,14 @@ class Settings(BaseSettings):
     ms2_base_url: AnyHttpUrl
     ms2_timeout_seconds: float = Field(default=5, gt=0, le=60)
 
+    # MCP ВкусВилла (API-14). Без адреса остальные API остаются доступны.
+    vkusvill_mcp_url: AnyHttpUrl | None = None
+    mcp_call_timeout_seconds: float = Field(default=5, gt=0, le=5)
+    mcp_call_retries: int = Field(default=1, ge=0, le=1)
+    mcp_concurrency: int = Field(default=4, ge=1, le=4)
+    mcp_cache_ttl_seconds: float = Field(default=900, ge=0, le=900)
+    cart_deadline_seconds: float = Field(default=35, gt=0, le=35)
+
     # Фоновая генерация меню.
     generation_worker_enabled: bool = True
     generation_worker_interval_seconds: float = Field(default=2, gt=0, le=3600)
@@ -106,7 +114,11 @@ class Settings(BaseSettings):
 
     # Учётные данные в URL попали бы в логи, трейсы и сообщения об ошибках.
     @field_validator(
-        "ollama_base_url", "otel_exporter_otlp_endpoint", "ms2_base_url", mode="after"
+        "ollama_base_url",
+        "otel_exporter_otlp_endpoint",
+        "ms2_base_url",
+        "vkusvill_mcp_url",
+        mode="after",
     )
     @classmethod
     def reject_url_credentials(cls, value: AnyHttpUrl | None) -> AnyHttpUrl | None:

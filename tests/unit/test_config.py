@@ -67,6 +67,12 @@ def test_defaults() -> None:
     assert settings.generation_worker_interval_seconds == 2
     assert settings.generation_metrics_refresh_seconds == 15
     assert settings.generation_bad_response_retries == 1
+    assert settings.vkusvill_mcp_url is None
+    assert settings.mcp_call_timeout_seconds == 5
+    assert settings.mcp_call_retries == 1
+    assert settings.mcp_concurrency == 4
+    assert settings.mcp_cache_ttl_seconds == 900
+    assert settings.cart_deadline_seconds == 35
 
 
 def test_environment_overrides_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -187,6 +193,12 @@ def test_log_level_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
         {"generation_metrics_refresh_seconds": 300.01},
         {"generation_bad_response_retries": -1},
         {"generation_bad_response_retries": 11},
+        {"vkusvill_mcp_url": "https://user:pass@catalog.test/mcp"},
+        {"mcp_call_timeout_seconds": 6},
+        {"mcp_call_retries": 2},
+        {"mcp_concurrency": 5},
+        {"mcp_cache_ttl_seconds": 901},
+        {"cart_deadline_seconds": 36},
     ],
 )
 def test_out_of_range_values_are_rejected(override: dict[str, object]) -> None:
