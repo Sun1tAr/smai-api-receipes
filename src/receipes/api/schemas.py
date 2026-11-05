@@ -162,6 +162,34 @@ class NutritionResponse(BaseModel):
     carbohydrates: Number = Field(description="Углеводы одной порции, г.")
 
 
+class RecipeCardResponse(BaseModel):
+    recipe_id: UUID = Field(
+        alias="recipeId", description="Идентификатор сохранённого рецепта."
+    )
+    name: str = Field(description="Название блюда.")
+    calories: Number = Field(
+        description=(
+            "Калорийность одной порции, ккал, как её вернула модель. Может "
+            "расходиться с `nutrition.calories`; основным считайте "
+            "`nutrition.calories`."
+        )
+    )
+    nutrition: NutritionResponse = Field(description="КБЖУ одной порции.")
+    cooking_time: Number = Field(
+        alias="cookingTime", description="Время приготовления, минут."
+    )
+
+
+class LikedRecipesResponse(BaseModel):
+    recipes: list[RecipeCardResponse] = Field(
+        description="Избранные рецепты пользователя, последние лайки первыми."
+    )
+
+
+class LikeSuccessResponse(BaseModel):
+    success: Literal[True] = Field(description="Операция выполнена.")
+
+
 class RecipeResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 

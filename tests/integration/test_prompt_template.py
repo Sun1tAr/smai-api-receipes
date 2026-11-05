@@ -108,7 +108,7 @@ async def test_replacement_migration_preserves_v3_rows_and_refuses_lossy_downgra
                     " '00000000-0000-0000-0000-000000000001', now())"
                 )
             )
-        alembic("upgrade", "head")
+        alembic("upgrade", "0006_recipe_replacement")
         async with engine.begin() as connection:
             task = (
                 await connection.execute(

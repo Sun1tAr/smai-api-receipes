@@ -39,6 +39,8 @@ async def test_health_is_fully_documented_and_metrics_is_hidden(app) -> None:
         "/generate-menu/{task_id}",
         "/generate-menu/{task_id}/replace-recipe",
         "/profile/parameters",
+        "/recipes/{recipe_id}/like",
+        "/recipes/liked",
         "/recipes/cart",
         "/recipes/cart/link",
     }
@@ -69,6 +71,9 @@ EXPECTED_CODES = {
     ("/generate-menu/{task_id}", "get"): {"200", "404", "500"},
     ("/generate-menu/{task_id}/replace-recipe", "post"): {"200", "400", "404", "500"},
     ("/profile/parameters", "get"): {"200", "401", "500"},
+    ("/recipes/{recipe_id}/like", "post"): {"200", "401", "404", "409", "500"},
+    ("/recipes/{recipe_id}/like", "delete"): {"200", "401", "404", "500"},
+    ("/recipes/liked", "get"): {"200", "401", "500"},
     ("/recipes/cart", "post"): {"200", "400", "404", "500", "503"},
     ("/recipes/cart/link", "post"): {"200", "400", "500", "503"},
 }
@@ -258,3 +263,43 @@ async def test_cart_link_request_and_response_examples_match_schema(app) -> None
     jsonschema.validate({"items": items["examples"][0]}, {**payload, **components})
     success = operation["responses"]["200"]["content"]["application/json"]
     jsonschema.validate(success["example"], {**success["schema"], **components})
+
+
+async def test_likes_document_uuid_owner_and_success_examples(app) -> None:
+    document = app.openapi()
+    paths = document["paths"]
+    for method in ("post", "delete", "get"):
+        path = "/recipes/liked" if method == "get" else "/recipes/{recipe_id}/like"
+        operation = paths[path][method]
+        parameters = {p["name"]: p for p in operation["parameters"]}
+        assert parameters["X-User-Id"]["in"] == "header"
+        assert parameters["X-User-Id"]["required"] is True
+        assert parameters["X-User-Id"]["description"]
+        if method != "get":
+            recipe_id = parameters["recipe_id"]
+            assert recipe_id["in"] == "path" and recipe_id["required"] is True
+            assert recipe_id["schema"]["format"] == "uuid"
+        success = operation["responses"]["200"]["content"]["application/json"]
+        examples = (
+            [success["example"]]
+            if "example" in success
+            else [item["value"] for item in success["examples"].values()]
+        )
+        for example in examples:
+            jsonschema.validate(
+                example, {**success["schema"], "components": document["components"]}
+            )
+        if method == "get":
+            assert {"recipes": []} in examples
+            [card] = next(
+                example["recipes"] for example in examples if example["recipes"]
+            )
+            assert set(card) == {
+                "recipeId",
+                "name",
+                "calories",
+                "nutrition",
+                "cookingTime",
+            }
+        else:
+            assert examples == [{"success": True}]

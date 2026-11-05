@@ -45,6 +45,7 @@ class ErrorResponse(BaseModel):
 
 
 HTTP_ERRORS = {
+    401: ("UNAUTHORIZED", "User is not identified"),
     404: ("NOT_FOUND", "Resource not found"),
     405: ("METHOD_NOT_ALLOWED", "Method not allowed"),
 }

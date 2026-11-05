@@ -21,6 +21,7 @@ from prometheus_client import (
 from prometheus_fastapi_instrumentator import Instrumentator
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from receipes.api.likes import router as likes_router
 from receipes.api.menu import restore_example_nulls
 from receipes.api.menu import router as menu_router
 from receipes.api.profile import restore_profile_examples
@@ -218,6 +219,7 @@ def create_app(
     app.include_router(menu_router)
     app.include_router(profile_router)
     app.include_router(cart_router)
+    app.include_router(likes_router)
     app.openapi = lambda: build_openapi(app)
 
     # Request ID относится к текущему HTTP-вызову; query и тела не логируются.

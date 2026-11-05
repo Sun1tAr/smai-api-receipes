@@ -125,6 +125,19 @@ class Recipe(Base):
     )
 
 
+class RecipeLike(Base):
+    __tablename__ = "recipe_like"
+    __table_args__ = (
+        Index("ix_recipe_like_user_id_created_at", "user_id", "created_at"),
+    )
+
+    user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    recipe_id: Mapped[UUID] = mapped_column(ForeignKey("recipe.id"), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now()
+    )
+
+
 class RecipeIngredient(Base):
     __tablename__ = "recipe_ingredients"
     __table_args__ = (Index("ix_recipe_ingredients_recipe_id", "recipe_id"),)

@@ -137,9 +137,15 @@ async def test_domain_migration_uses_its_own_version_table_and_downgrades_cleanl
                     text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
                 )
             )
-        assert version == "0006_recipe_replacement"
+        assert version == "0007_recipe_like"
         assert "alembic_version" not in tables
-        assert {"generation_task", "menu", "recipe", "instruction"} <= tables
+        assert {
+            "generation_task",
+            "menu",
+            "recipe",
+            "instruction",
+            "recipe_like",
+        } <= tables
         alembic("downgrade", "base")
         async with engine.connect() as connection:
             tables = set(

@@ -19,12 +19,21 @@ Ollama. Инфраструктура (**SMAI-58**): каркас приложе�
 | `POST /generate-menu` | API-1: создать задачу генерации меню. Тело: `peopleCount` 1–20, `weeklyBudget` > 0 (≤ 1 000 000, до 2 знаков) и параметры v2: `habits` и `kitchenTools` (обязательны, можно `[]`), `diet` (число или `null`, можно не передавать), `allergies` (можно не передавать). ID — целые int4, повторы сохраняются один раз. Необязательный заголовок `X-User-Id` (одно целое 1–2147483647, ставит gateway по токену; повтор заголовка — 400) задаёт владельца задачи (`generation_parameters.user_id`); без него запрос гостевой, `user_id = NULL`; некорректное значение — 400 `VALIDATION_ERROR` (`loc` `["header","X-User-Id"]`, значение не возвращается). Не больше 3 разных привычек (иначе 400 `too_long`). Каждый ID должен существовать в справочниках MS-2, иначе 400 `unknown_id` с местом ошибки (`["body","habits","1"]`; повтор неизвестного ID отмечается на каждом вхождении). Запрос без единого ID MS-2 не вызывает. Если MS-2 недоступен, ответил ошибкой или не уложился в `MS2_TIMEOUT_SECONDS`, задача не создаётся и ответ 500. Параметры сохраняются с задачей, а названия выбранных ID (из того же ответа MS-2) попадают в промпт блоком ограничений. Запрос без `habits` или `kitchenTools` (формат v1) — 400 | 202 `{"task_id"}`, 400 `VALIDATION_ERROR`, 500 `INTERNAL_ERROR` | бизнес |
 | `GET /generate-menu/{task_id}` | API-2: статус задачи; всегда `status`, `menu`, `error` (`menu` только при `done`, `error` только при `failed`). Каждый рецепт содержит `recipeId` (UUID сохранённого рецепта, неизменный при повторном GET). Порядок рецептов и ингредиентов не гарантируется | 200, 404 `NOT_FOUND` (неизвестный или не-UUID `task_id`), 500 `INTERNAL_ERROR` | бизнес |
 | `POST /generate-menu/{task_id}/replace-recipe` | API-18: заменить один рецепт в готовом меню, включая гостевое. Тело `{"recipeId":"<UUID>"}`. API-2 по исходному `task_id` покажет новый состав | 200 `{"recipe":{…}}`, 400 `VALIDATION_ERROR`, 404 `NOT_FOUND` для отсутствующей задачи или рецепта в её меню, 500 `INTERNAL_ERROR` при сбое или таймауте | бизнес |
+| `POST /recipes/{recipe_id}/like` | API-19. Поставить лайк существующему рецепту | 200 `{"success":true}`, 401 `UNAUTHORIZED`, 404 `NOT_FOUND`, 409 `CONFLICT` (уже лайкнул), 500 `INTERNAL_ERROR` | бизнес |
+| `DELETE /recipes/{recipe_id}/like` | API-20. Убрать свой лайк | 200 `{"success":true}`, 401 `UNAUTHORIZED`, 404 `NOT_FOUND`, 500 `INTERNAL_ERROR` | бизнес |
+| `GET /recipes/liked` | API-21. Получить свои избранные рецепты, последние лайки первыми | 200 `{"recipes":[…]}`, 401 `UNAUTHORIZED`, 500 `INTERNAL_ERROR` | бизнес |
 | `POST /recipes/cart` | API-14: подобрать товары ВкусВилла для сохранённого рецепта. Тело `{"recipeId":"<UUID>"}`. Результат содержит `matches`, `total` в рублях, `allMatched` и `unmatchedCount` | 200, 400 `VALIDATION_ERROR`, 404 `NOT_FOUND` (гостевой, неизвестный или из незавершённой задачи), 503 `EXTERNAL_SERVICE_ERROR`, 500 `INTERNAL_ERROR` | бизнес |
 | `POST /recipes/cart/link` | API-16: создать одну ссылку ВкусВилла для 1–20 позиций из API-14. Тело `{"items":[{"id":606,"q":0.15}]}`. Авторизация не требуется | 200 `{"link":"https://vkusvill.ru/mobile?basket&share=2557567558"}`, 400 `VALIDATION_ERROR`, 503 `EXTERNAL_SERVICE_ERROR`, 500 `INTERNAL_ERROR` | бизнес |
 | `GET /profile/parameters` | API-13: сохранённые параметры пользователя (SMAI-102): `habits`, `diet`, `allergies`, `kitchenTools` самой свежей задачи пользователя в статусе `done` (по `created_at`, при равенстве по `task_id`); `pending`, `in_progress` и `failed` не учитываются; `peopleCount` и `weeklyBudget` не возвращаются. Нет готовых задач — 200 с пустыми списками и `diet: null`. Владелец задаётся заголовком `X-User-Id` (его ставит gateway по токену), без него или с некорректным значением (целое 1–2147483647) — 401 | 200, 401 `UNAUTHORIZED`, 500 `INTERNAL_ERROR` | бизнес |
 | `GET /metrics` | Метрики Prometheus: HTTP, Python, GC и процесс (вне схемы OpenAPI) | 200 `text/plain` | служебный |
 | `GET /docs` | Swagger UI | 200 `text/html` | служебный |
 | `GET /openapi.json` | Схема OpenAPI | 200 `application/json` | служебный |
+
+Для API-19…21 gateway передаёт один доверенный заголовок `X-User-Id` из
+проверенного токена. Пропуск, повтор или неверный ID дают 401. API-19 и API-20
+возвращают 404 для некорректного UUID. Карточка API-21 содержит `recipeId`,
+`name`, `calories`, `nutrition` и `cookingTime`. При равном времени лайка
+карточки идут по убыванию UUID. Если лайков нет, `recipes` пуст.
 
 Максимальный размер тела запроса задаётся на gateway, сам сервис его не ограничивает.
 
@@ -37,7 +46,8 @@ Ollama. Инфраструктура (**SMAI-58**): каркас приложе�
 
 Коды: `VALIDATION_ERROR` (400, ошибка валидации запроса), `NOT_FOUND` (404; для
 API-2 — `Generation task not found`, для API-18 — `Generation task or recipe not found`),
-`UNAUTHORIZED` (401, API-13 без валидного `X-User-Id`), `METHOD_NOT_ALLOWED` (405), `INTERNAL_ERROR` (500 и 503 у `/health`),
+`UNAUTHORIZED` (401, API-13 и API-19…21 без валидного `X-User-Id`),
+`CONFLICT` (409, повторный лайк в API-19), `METHOD_NOT_ALLOWED` (405), `INTERNAL_ERROR` (500 и 503 у `/health`),
 `EXTERNAL_SERVICE_ERROR` (503 у API-14 и API-16). Каждый ответ, включая
 500 на необработанное исключение, содержит заголовок `X-Request-ID`: входящее
 значение принимается, если это до 128 символов `A-Za-z0-9._-`, иначе
@@ -331,6 +341,9 @@ tests/integration/  интеграционные тесты (нужна PostgreS
 
 Миграции: `uv run alembic revision --autogenerate -m "SMAI-NN описание"`,
 `uv run alembic upgrade head`, `uv run alembic check` (БД должна быть доступна).
+
+Ревизия `0007_recipe_like` добавляет таблицу лайков. Alembic откатывает её
+только при пустой таблице.
 
 Alembic ждёт подключения не дольше `DB_TIMEOUT_SECONDS`, но длительность самих
 запросов миграции не ограничивает; ожидание чужой блокировки ограничено
