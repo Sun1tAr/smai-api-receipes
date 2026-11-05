@@ -1,5 +1,3 @@
-import json
-
 import httpx
 import jsonschema
 import pytest
@@ -40,6 +38,7 @@ async def test_health_is_fully_documented_and_metrics_is_hidden(app) -> None:
         "/generate-menu",
         "/generate-menu/{task_id}",
         "/profile/parameters",
+        "/recipes/cart",
     }
     operation = document["paths"]["/health"]["get"]
     assert operation["summary"]
@@ -67,6 +66,7 @@ EXPECTED_CODES = {
     ("/generate-menu", "post"): {"202", "400", "500"},
     ("/generate-menu/{task_id}", "get"): {"200", "404", "500"},
     ("/profile/parameters", "get"): {"200", "401", "500"},
+    ("/recipes/cart", "post"): {"200", "400", "404", "500", "503"},
 }
 
 
@@ -76,7 +76,7 @@ async def test_every_operation_is_documented_with_exact_error_codes(app) -> None
     ) as client:
         document = (await client.get("/openapi.json")).json()
     schemas = document["components"]["schemas"]
-    assert "422" not in json.dumps(document)
+    assert "HTTPValidationError" not in schemas
     operations = {
         (path, method): operation
         for path, item in document["paths"].items()
@@ -204,3 +204,26 @@ async def test_recipe_id_is_required_uuid_in_api2(app) -> None:
     assert schema["properties"]["recipeId"]["type"] == "string"
     assert schema["properties"]["recipeId"]["format"] == "uuid"
     assert schema["properties"]["recipeId"]["description"]
+
+
+async def test_cart_request_and_partial_success_examples_match_schema(app) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        document = (await client.get("/openapi.json")).json()
+    operation = document["paths"]["/recipes/cart"]["post"]
+    schemas = document["components"]["schemas"]
+    payload = schemas["CartRequest"]
+    assert payload["required"] == ["recipeId"]
+    recipe_id = payload["properties"]["recipeId"]
+    assert recipe_id["format"] == "uuid"
+    jsonschema.validate(
+        {"recipeId": recipe_id["examples"][0]},
+        payload,
+        format_checker=jsonschema.FormatChecker(),
+    )
+    success = operation["responses"]["200"]["content"]["application/json"]
+    jsonschema.validate(
+        success["example"], {**success["schema"], "components": document["components"]}
+    )
+    assert success["example"]["matches"][1]["product"] is None

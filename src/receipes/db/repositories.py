@@ -255,6 +255,28 @@ class MenuRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    async def find_cart_recipe(self, recipe_id: UUID) -> Recipe | None:
+        query = (
+            select(Recipe)
+            .join(MenuRecipe, MenuRecipe.recipe_id == Recipe.id)
+            .join(GenerationTask, GenerationTask.menu_id == MenuRecipe.menu_id)
+            .join(
+                GenerationParameters,
+                GenerationParameters.id == GenerationTask.parameters_id,
+            )
+            .where(
+                Recipe.id == recipe_id,
+                GenerationTask.status == TaskStatus.DONE,
+                GenerationParameters.user_id.is_not(None),
+            )
+            .options(
+                selectinload(Recipe.ingredients).selectinload(
+                    RecipeIngredient.ingredient
+                )
+            )
+        )
+        return await self._session.scalar(query)
+
     # Сохраняет меню целиком; рецепты каждый раз новые, ингредиенты переиспользуются
     # по ключу имени (name_key: регистр, ё/е, кавычки, пробелы, конечная пунктуация).
     async def save(self, payload: MenuPayload) -> UUID:

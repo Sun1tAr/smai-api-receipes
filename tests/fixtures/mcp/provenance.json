@@ -1,0 +1,8 @@
+{
+  "endpoint": "https://mcp.vkusvill.ru/mcp",
+  "captured_on": "2026-11-05",
+  "init.json": "Live initialize response (HTTP 200 JSON, no Mcp-Session-Id)",
+  "search.json": "Live tools/call response for vkusvill_products_search, query Молоко",
+  "details-milk.json": "Live tools/call response for vkusvill_product_details, product 72194",
+  "sse": "Synthetic event stream assembled in test_cart_mcp.py"
+}

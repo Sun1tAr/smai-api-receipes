@@ -25,6 +25,9 @@ from receipes.api.menu import restore_example_nulls
 from receipes.api.menu import router as menu_router
 from receipes.api.profile import restore_profile_examples
 from receipes.api.profile import router as profile_router
+from receipes.cart.api import restore_cart_example
+from receipes.cart.api import router as cart_router
+from receipes.cart.mcp import McpClient
 from receipes.config import Settings
 from receipes.database import create_engine, create_lock_engine
 from receipes.dictionaries import DictionaryClient
@@ -83,6 +86,7 @@ def build_openapi(app: FastAPI) -> dict[str, Any]:
                 operation["responses"].pop("422", None)
         restore_example_nulls(schema)
         restore_profile_examples(schema)
+        restore_cart_example(schema)
         for name in ("HTTPValidationError", "ValidationError"):
             schema.get("components", {}).get("schemas", {}).pop(name, None)
         app.openapi_schema = schema
@@ -110,6 +114,7 @@ def create_app(
     *,
     ollama_transport: httpx.AsyncBaseTransport | None = None,
     ms2_transport: httpx.AsyncBaseTransport | None = None,
+    mcp_transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     configure_logging(settings.log_level)
@@ -132,6 +137,18 @@ def create_app(
     # Справочники MS-2 нужны для проверки ID в API-1; на старте их доступность не
     # проверяется: запрос без ID от MS-2 не зависит.
     dictionaries = DictionaryClient.from_settings(settings, ms2_transport)
+    vkusvill_mcp = (
+        McpClient(
+            str(settings.vkusvill_mcp_url),
+            timeout=settings.mcp_call_timeout_seconds,
+            retries=settings.mcp_call_retries,
+            concurrency=settings.mcp_concurrency,
+            cache_ttl=settings.mcp_cache_ttl_seconds,
+            transport=mcp_transport,
+        )
+        if settings.vkusvill_mcp_url is not None
+        else None
+    )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     worker = GenerationWorker(
         session_factory, lock_engine, ollama, settings, generation_metrics, dictionaries
@@ -172,6 +189,8 @@ def create_app(
                     await worker_task
             await ollama.aclose()
             await dictionaries.aclose()
+            if vkusvill_mcp is not None:
+                await vkusvill_mcp.aclose()
             await lock_engine.dispose()
             await engine.dispose()
             instrumentor.uninstrument()
@@ -190,6 +209,7 @@ def create_app(
     app.state.session_factory = session_factory
     app.state.ollama = ollama
     app.state.dictionaries = dictionaries
+    app.state.vkusvill_mcp = vkusvill_mcp
     app.state.generation_metrics = generation_metrics
     app.state.worker = worker
     app.state.tracer_provider = provider
@@ -197,6 +217,7 @@ def create_app(
     app.include_router(router)
     app.include_router(menu_router)
     app.include_router(profile_router)
+    app.include_router(cart_router)
     app.openapi = lambda: build_openapi(app)
 
     # Request ID относится к текущему HTTP-вызову; query и тела не логируются.
