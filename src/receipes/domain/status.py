@@ -1,6 +1,11 @@
 from enum import StrEnum
 
 
+class TaskKind(StrEnum):
+    MENU = "menu"
+    REPLACE = "replace"
+
+
 # Статусы задачи генерации (LE-6).
 class TaskStatus(StrEnum):
     PENDING = "pending"

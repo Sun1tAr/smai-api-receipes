@@ -3,6 +3,8 @@ from datetime import datetime, timedelta
 import structlog
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
+from receipes.domain.status import TaskKind
+
 logger = structlog.get_logger()
 
 # Генерация идёт от секунд до десятков минут в худшем случае: свои границы.
@@ -55,13 +57,14 @@ class GenerationMetrics:
     def __init__(self, registry: CollectorRegistry) -> None:
         self.tasks = Counter(
             "menu_generation_tasks",
-            "Finished menu generation tasks by final status.",
-            ["status"],
+            "Finished generation tasks by kind and final status.",
+            ["kind", "status"],
             registry=registry,
         )
         self.duration = Histogram(
             "menu_generation_duration_seconds",
             "Time from task claim to its final status.",
+            ["kind"],
             buckets=DURATION_BUCKETS,
             registry=registry,
         )
@@ -80,32 +83,32 @@ class GenerationMetrics:
         self.rejected = Counter(
             "menu_generation_rejected",
             "Model responses rejected by validation, by reason.",
-            ["reason"],
+            ["kind", "reason"],
             registry=registry,
         )
         self.queue_tasks = Gauge(
             "recipes_generation_tasks",
-            "Generation tasks by status, refreshed in the background.",
-            ["status"],
+            "Generation tasks by kind and status, refreshed in the background.",
+            ["kind", "status"],
             registry=registry,
         )
         self.oldest_age = Gauge(
             "recipes_generation_task_oldest_age_seconds",
             "Age of the oldest task in the status, 0 if there are none.",
-            ["status"],
+            ["kind", "status"],
             registry=registry,
         )
         self.task_duration = Histogram(
             "recipes_generation_task_duration_seconds",
             "Task creation to its terminal status, including the queue wait.",
-            ["status"],
+            ["kind", "status"],
             buckets=TASK_BUCKETS,
             registry=registry,
         )
         self.task_processing = Histogram(
             "recipes_generation_task_processing_seconds",
             "Time the task spent in in_progress.",
-            ["status"],
+            ["kind", "status"],
             buckets=TASK_BUCKETS,
             registry=registry,
         )
@@ -114,20 +117,21 @@ class GenerationMetrics:
             "Unix time of the last successful refresh of the queue gauges.",
             registry=registry,
         )
-        for status in QUEUE_STATUSES:
-            self.queue_tasks.labels(status).set(0)
-        for status in AGE_STATUSES:
-            self.oldest_age.labels(status).set(0)
+        for kind in TaskKind:
+            for status in QUEUE_STATUSES:
+                self.queue_tasks.labels(kind, status).set(0)
+            for status in AGE_STATUSES:
+                self.oldest_age.labels(kind, status).set(0)
+            for status in TASK_STATUSES:
+                self.task_duration.labels(kind, status)
+                self.task_processing.labels(kind, status)
+                self.tasks.labels(kind, status)
+            self.duration.labels(kind)
+            for reason in REJECT_REASONS:
+                self.rejected.labels(kind, reason)
         self.refresh_timestamp.set(0)
-        for status in TASK_STATUSES:
-            self.task_duration.labels(status)
-            self.task_processing.labels(status)
-        for status in TASK_STATUSES:
-            self.tasks.labels(status)
         for outcome in OLLAMA_OUTCOMES:
             self.ollama_requests.labels(outcome)
-        for reason in REJECT_REASONS:
-            self.rejected.labels(reason)
 
     # Вызывать только после commit терминального перехода: ровно один раз на задачу.
     # processing не пишется, если начало обработки неизвестно (восстановление).
@@ -137,14 +141,17 @@ class GenerationMetrics:
         created_at: datetime,
         finished_at: datetime,
         claimed_at: datetime | None = None,
+        *,
+        kind: TaskKind,
     ) -> None:
-        self.task_duration.labels(status).observe(
+        self.tasks.labels(kind, status).inc()
+        self.task_duration.labels(kind, status).observe(
             self._seconds(finished_at - created_at)
         )
         if claimed_at is not None:
-            self.task_processing.labels(status).observe(
-                self._seconds(finished_at - claimed_at)
-            )
+            processing = self._seconds(finished_at - claimed_at)
+            self.task_processing.labels(kind, status).observe(processing)
+            self.duration.labels(kind).observe(processing)
 
     # created_at пишет приложение, остальное БД: расхождение часов не должно давать
     # отрицательных наблюдений, но и теряться молча не должно.

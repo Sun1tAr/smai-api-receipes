@@ -69,6 +69,7 @@ class Settings(BaseSettings):
     generation_metrics_refresh_seconds: float = Field(default=15, gt=0, le=300)
     # Повторы только при невалидном ответе модели (не при таймауте и обрезке).
     generation_bad_response_retries: int = Field(default=1, ge=0, le=10)
+    replace_wait_seconds: float = Field(default=120, gt=0, le=175)
 
     # LOG_LEVEL=info допустим: регистр в окружении легко перепутать.
     @field_validator("log_level", mode="before")

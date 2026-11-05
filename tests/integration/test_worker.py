@@ -165,8 +165,12 @@ async def test_successful_cycle_saves_menu_and_marks_done(
     assert task.menu is not None and task.menu_id == task.menu.id
     names = {link.recipe.name for link in task.menu.menu_recipes}
     assert names == {"Овсяная каша", "Куриный суп", "Запечённый лосось"}
-    assert harness.sample("menu_generation_tasks_total", status="done") == 1
-    assert harness.sample("menu_generation_tasks_total", status="failed") == 0
+    assert (
+        harness.sample("menu_generation_tasks_total", kind="menu", status="done") == 1
+    )
+    assert (
+        harness.sample("menu_generation_tasks_total", kind="menu", status="failed") == 0
+    )
 
 
 # Фолбэк: задача без сохранённого промпта (создана до SMAI-94 или без шаблона).
@@ -253,7 +257,9 @@ async def test_ollama_http_errors_fail_the_task_without_retry(
     task = await harness.task(task_id)
     assert (task.status, task.error, task.menu_id) == (TaskStatus.FAILED, message, None)
     assert len(harness.requests) == 1
-    assert harness.sample("menu_generation_tasks_total", status="failed") == 1
+    assert (
+        harness.sample("menu_generation_tasks_total", kind="menu", status="failed") == 1
+    )
     assert await harness.count(Menu) == 0
 
 
@@ -323,7 +329,10 @@ async def test_invalid_answer_is_retried_once_then_fails(
     )
     assert len(harness.requests) == 2
     assert harness.requests[0]["prompt"] == harness.requests[1]["prompt"]
-    assert harness.sample("menu_generation_rejected_total", reason="schema") == 2
+    assert (
+        harness.sample("menu_generation_rejected_total", kind="menu", reason="schema")
+        == 2
+    )
 
 
 async def test_bad_answer_then_good_answer_finishes_done(
@@ -335,7 +344,10 @@ async def test_bad_answer_then_good_answer_finishes_done(
     await harness.worker.process_one()
     assert (await harness.task(task_id)).status == TaskStatus.DONE
     assert len(harness.requests) == 2
-    assert harness.sample("menu_generation_rejected_total", reason="count") == 1
+    assert (
+        harness.sample("menu_generation_rejected_total", kind="menu", reason="count")
+        == 1
+    )
 
 
 async def test_zero_retries_means_one_attempt(
@@ -379,7 +391,12 @@ async def test_recipe_count_rules(
             TaskStatus.FAILED,
             "Invalid neurocore response",
         )
-        assert harness.sample("menu_generation_rejected_total", reason="count") == 2
+        assert (
+            harness.sample(
+                "menu_generation_rejected_total", kind="menu", reason="count"
+            )
+            == 2
+        )
 
 
 def tags(*names: str) -> httpx.Response:
@@ -559,7 +576,9 @@ async def test_missing_template_leaves_tasks_pending_and_logs_once(
         task = await harness.task(task_id)
         assert (task.status, task.error) == (TaskStatus.PENDING, None)
     assert harness.requests == []
-    assert harness.sample("menu_generation_tasks_total", status="failed") == 0
+    assert (
+        harness.sample("menu_generation_tasks_total", kind="menu", status="failed") == 0
+    )
     lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("{")]
     entries = [item for item in map(json.loads, lines) if item["level"] == "error"]
     assert [(item["message"], item["reason"]) for item in entries] == [
@@ -603,7 +622,9 @@ async def test_ollama_down_does_not_burn_the_queue(
     for task_id in task_ids[1:]:
         assert (await harness.task(task_id)).status == TaskStatus.PENDING
     assert calls == ["/api/generate", "/api/tags", "/api/tags", "/api/tags"]
-    assert harness.sample("menu_generation_tasks_total", status="failed") == 1
+    assert (
+        harness.sample("menu_generation_tasks_total", kind="menu", status="failed") == 1
+    )
 
 
 async def test_backoff_grows_to_the_cap_and_resets_after_recovery(
@@ -631,7 +652,9 @@ async def test_backoff_grows_to_the_cap_and_resets_after_recovery(
     assert await worker.process_one() is True
     assert not worker._ollama_down
     assert worker._idle_delay() == settings.generation_worker_interval_seconds
-    assert harness.sample("menu_generation_tasks_total", status="done") == 1
+    assert (
+        harness.sample("menu_generation_tasks_total", kind="menu", status="done") == 1
+    )
 
 
 async def test_timeout_also_starts_the_backoff(
@@ -716,7 +739,9 @@ async def test_cancellation_during_the_ollama_call_leaves_task_in_progress(
         None,
     )
     assert await harness.count(Menu) == 0
-    assert harness.sample("menu_generation_tasks_total", status="failed") == 0
+    assert (
+        harness.sample("menu_generation_tasks_total", kind="menu", status="failed") == 0
+    )
 
 
 async def test_task_failed_by_restart_during_generation_is_not_overwritten(
@@ -741,8 +766,12 @@ async def test_task_failed_by_restart_during_generation_is_not_overwritten(
     )
     for model in (Menu, Recipe, MenuRecipe):
         assert await harness.count(model) == 0
-    assert harness.sample("menu_generation_tasks_total", status="done") == 0
-    assert harness.sample("menu_generation_tasks_total", status="failed") == 0
+    assert (
+        harness.sample("menu_generation_tasks_total", kind="menu", status="done") == 0
+    )
+    assert (
+        harness.sample("menu_generation_tasks_total", kind="menu", status="failed") == 0
+    )
     messages = [
         json.loads(line)["message"]
         for line in capsys.readouterr().out.splitlines()
@@ -808,10 +837,13 @@ async def test_metrics_endpoint_exposes_generation_series(
         ) as client:
             metrics = await client.get("/metrics")
     text = metrics.text
-    assert 'menu_generation_tasks_total{status="done"} 1.0' in text
+    assert 'menu_generation_tasks_total{kind="menu",status="done"} 1.0' in text
     assert 'ollama_requests_total{outcome="success"} 1.0' in text
     assert "menu_generation_duration_seconds_bucket" in text
-    assert 'menu_generation_rejected_total{reason="duplicate_name"} 0.0' in text
+    assert (
+        'menu_generation_rejected_total{kind="menu",reason="duplicate_name"} 0.0'
+        in text
+    )
     assert task_id
 
 
@@ -987,7 +1019,9 @@ async def test_ms2_errors_fail_the_task_without_touching_ollama_or_queue(
     assert harness.requests == []
     assert await harness.worker.process_one() is True
     assert (await harness.task(second)).status == TaskStatus.DONE
-    assert harness.sample("menu_generation_tasks_total", status="failed") == 1
+    assert (
+        harness.sample("menu_generation_tasks_total", kind="menu", status="failed") == 1
+    )
     out = capsys.readouterr().out
     assert "generation_dictionaries_failed" in out and "Кето" not in out
 

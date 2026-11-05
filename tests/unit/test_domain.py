@@ -7,13 +7,17 @@ from receipes.domain.names import name_key, normalize_name
 from receipes.domain.status import ALLOWED_TRANSITIONS, TaskStatus, can_transition
 
 ERD_COLUMNS = {
-    "prompt_template": {"id", "template", "created_at"},
+    "prompt_template": {"id", "template", "created_at", "kind"},
     "generation_task": {
         "task_id",
         "status",
+        "kind",
         "prompt",
         "parameters_id",
         "menu_id",
+        "source_task_id",
+        "replaced_recipe_id",
+        "result_recipe_id",
         "created_at",
         "status_changed_at",
         "error",
@@ -39,6 +43,9 @@ ERD_COLUMNS = {
 ERD_FOREIGN_KEYS = {
     ("generation_task", "parameters_id", "generation_parameters"),
     ("generation_task", "menu_id", "menu"),
+    ("generation_task", "source_task_id", "generation_task"),
+    ("generation_task", "replaced_recipe_id", "recipe"),
+    ("generation_task", "result_recipe_id", "recipe"),
     ("generation_parameter_habits", "parameters_id", "generation_parameters"),
     ("generation_parameter_allergies", "parameters_id", "generation_parameters"),
     ("generation_parameter_kitchen_tools", "parameters_id", "generation_parameters"),

@@ -238,10 +238,18 @@ async def test_recovery_retries_until_the_database_answers(
     assert calls == ["Service restarted"]
     # Восстановленные задачи попадают только в полное время задачи.
     name = "recipes_generation_task_duration_seconds"
-    assert registry.get_sample_value(f"{name}_count", {"status": "failed"}) == 2
-    assert registry.get_sample_value(f"{name}_sum", {"status": "failed"}) == 80
+    assert (
+        registry.get_sample_value(f"{name}_count", {"kind": "menu", "status": "failed"})
+        == 2
+    )
+    assert (
+        registry.get_sample_value(f"{name}_sum", {"kind": "menu", "status": "failed"})
+        == 80
+    )
     processing = "recipes_generation_task_processing_seconds_count"
-    assert registry.get_sample_value(processing, {"status": "failed"}) == 0
+    assert (
+        registry.get_sample_value(processing, {"kind": "menu", "status": "failed"}) == 0
+    )
 
 
 async def test_standby_waits_ten_seconds_between_lock_attempts_not_the_interval() -> (

@@ -4,10 +4,11 @@ from decimal import Decimal
 from receipes.dictionaries import Dictionaries
 from receipes.domain.errors import PromptTemplateError, UnknownDictionaryId
 from receipes.domain.params import GenerationParams
+from receipes.domain.status import TaskKind
 
 PLACEHOLDERS = frozenset({"people_count", "weekly_budget"})
+REPLACE_PLACEHOLDERS = PLACEHOLDERS | {"replaced_recipe", "existing_recipes"}
 _ANY_BRACES = re.compile(r"\{([^{}]*)\}")
-_PLACEHOLDER = re.compile(r"\{(people_count|weekly_budget)\}")
 
 
 # Число для промпта без хвостовых нулей: 5000, 5000.5 (не 5000.00 и не 5E+3).
@@ -17,10 +18,11 @@ def format_number(value: Decimal | int) -> str:
 
 # В шаблоне должны быть оба плейсхолдера и никаких других скобок: ни других {…},
 # ни «{{», «}}» (экранирование здесь не поддерживается), ни непарных { и }.
-def validate_template(template: str) -> None:
+def validate_template(template: str, kind: TaskKind = TaskKind.MENU) -> None:
     found = set(_ANY_BRACES.findall(template))
     leftover = _ANY_BRACES.sub("", template)
-    if found != PLACEHOLDERS or "{" in leftover or "}" in leftover:
+    expected = REPLACE_PLACEHOLDERS if kind == TaskKind.REPLACE else PLACEHOLDERS
+    if found != expected or "{" in leftover or "}" in leftover:
         raise PromptTemplateError
 
 
@@ -92,11 +94,21 @@ def render_prompt(
     people_count: int,
     weekly_budget: Decimal,
     constraints: str = "",
+    *,
+    replaced_recipe: str | None = None,
+    existing_recipes: tuple[str, ...] = (),
 ) -> str:
-    validate_template(template)
     values = {
         "people_count": format_number(people_count),
         "weekly_budget": format_number(weekly_budget),
     }
-    text = _PLACEHOLDER.sub(lambda match: values[match.group(1)], template)
+    if replaced_recipe is None:
+        validate_template(template)
+    else:
+        validate_template(template, TaskKind.REPLACE)
+        values.update(
+            replaced_recipe=_quote(replaced_recipe),
+            existing_recipes=", ".join(_quote(name) for name in existing_recipes),
+        )
+    text = _ANY_BRACES.sub(lambda match: values[match.group(1)], template)
     return _insert_constraints(text, constraints)

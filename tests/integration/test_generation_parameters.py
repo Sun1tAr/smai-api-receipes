@@ -306,4 +306,4 @@ async def test_migration_keeps_v1_tasks_and_downgrade_drops_v2_data(
 def test_alembic_has_a_single_head(alembic: Callable[..., str]) -> None:
     output = alembic("heads")
     assert output.count("(head)") == 1
-    assert "0005_parameters_user_id" in output
+    assert "0006_recipe_replacement" in output

@@ -196,6 +196,16 @@ class RecipeResponse(BaseModel):
     )
 
 
+class ReplaceRecipeRequest(BaseModel):
+    recipe_id: UUID = Field(
+        alias="recipeId", description="UUID заменяемого рецепта из готового меню."
+    )
+
+
+class ReplaceRecipeResponse(BaseModel):
+    recipe: RecipeResponse = Field(description="Новый рецепт, сохранённый в меню.")
+
+
 class MenuResponse(BaseModel):
     recipes: list[RecipeResponse] = Field(
         description=(

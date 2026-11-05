@@ -7,6 +7,7 @@ from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from receipes.database import Base
+from receipes.domain.status import TaskKind
 
 # Схема строго по ERD MS-4 (SMAI-A-110): PK, FK и NOT NULL по ТЗ; CHECK и UNIQUE
 # сверх ERD не добавляются (решение Sun1tAr), инварианты держит код.
@@ -21,6 +22,7 @@ class PromptTemplate(Base):
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     template: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(String(16), server_default=TaskKind.MENU)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), default=utcnow
     )
@@ -178,14 +180,20 @@ class GenerationTask(Base):
 
     task_id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     status: Mapped[str] = mapped_column(String(16))
+    kind: Mapped[str] = mapped_column(String(16), server_default=TaskKind.MENU)
     prompt: Mapped[str | None] = mapped_column(Text)
     parameters_id: Mapped[UUID] = mapped_column(ForeignKey("generation_parameters.id"))
     menu_id: Mapped[UUID | None] = mapped_column(ForeignKey("menu.id"))
+    source_task_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("generation_task.task_id")
+    )
+    replaced_recipe_id: Mapped[UUID | None] = mapped_column(ForeignKey("recipe.id"))
+    result_recipe_id: Mapped[UUID | None] = mapped_column(ForeignKey("recipe.id"))
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), default=utcnow
     )
     # Время последней смены статуса: при создании равно created_at, переходы
-    # пишут now() БД (только запросами репозитория).
+    # используют часы БД (только запросами репозитория).
     status_changed_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=func.now()
     )
@@ -193,3 +201,6 @@ class GenerationTask(Base):
 
     parameters: Mapped[GenerationParameters] = relationship(lazy="raise")
     menu: Mapped[Menu | None] = relationship(lazy="raise")
+    result_recipe: Mapped[Recipe | None] = relationship(
+        foreign_keys=[result_recipe_id], lazy="raise"
+    )

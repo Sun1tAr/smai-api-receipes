@@ -53,7 +53,7 @@ def refresher(harness: Rig, factory: Factory) -> QueueMetricsRefresher:
 
 
 def count(harness: Rig, name: str, status: str) -> float:
-    return harness.sample(f"{name}_count", status=status)
+    return harness.sample(f"{name}_count", kind="menu", status=status)
 
 
 async def backdate(factory: Factory, task_id: UUID, seconds: int) -> None:
@@ -132,14 +132,21 @@ async def test_gauges_follow_the_queue_and_every_task_is_counted_once(
     harness = rig(ready, settings)
     refresh = refresher(harness, ready)
     await refresh.refresh_once()
-    assert harness.sample("recipes_generation_tasks", status="pending") == 3
+    assert (
+        harness.sample("recipes_generation_tasks", kind="menu", status="pending") == 3
+    )
     assert harness.sample("recipes_generation_tasks_refresh_timestamp_seconds") > 0
 
     assert await harness.worker.process_one() is True
     await refresh.refresh_once()
-    assert harness.sample("recipes_generation_tasks", status="pending") == 2
-    assert harness.sample("recipes_generation_tasks", status="done") == 1
-    assert harness.sample("recipes_generation_tasks", status="in_progress") == 0
+    assert (
+        harness.sample("recipes_generation_tasks", kind="menu", status="pending") == 2
+    )
+    assert harness.sample("recipes_generation_tasks", kind="menu", status="done") == 1
+    assert (
+        harness.sample("recipes_generation_tasks", kind="menu", status="in_progress")
+        == 0
+    )
     assert count(harness, DURATION, "done") == 1
     assert count(harness, PROCESSING, "done") == 1
     assert count(harness, DURATION, "failed") == 0
@@ -152,8 +159,8 @@ async def test_duration_includes_the_queue_wait_and_processing_does_not(
     await backdate(ready, task_id, 100)
     harness = rig(ready, settings)
     await harness.worker.process_one()
-    duration = harness.sample(f"{DURATION}_sum", status="done")
-    processing = harness.sample(f"{PROCESSING}_sum", status="done")
+    duration = harness.sample(f"{DURATION}_sum", kind="menu", status="done")
+    processing = harness.sample(f"{PROCESSING}_sum", kind="menu", status="done")
     assert duration >= 100
     assert 0 <= processing < 30
 
@@ -170,8 +177,8 @@ async def test_oldest_age_grows_for_pending_and_in_progress(
     harness = rig(ready, settings)
     await refresher(harness, ready).refresh_once()
     age = "recipes_generation_task_oldest_age_seconds"
-    assert 300 <= harness.sample(age, status="in_progress") < 330
-    assert 120 <= harness.sample(age, status="pending") < 150
+    assert 300 <= harness.sample(age, kind="menu", status="in_progress") < 330
+    assert 120 <= harness.sample(age, kind="menu", status="pending") < 150
 
 
 async def test_failed_task_is_counted_with_failed_status(
@@ -204,9 +211,16 @@ async def test_ollama_down_fails_one_task_and_keeps_the_rest_pending(
         await harness.worker.process_one()
         await refresh.refresh_once()
         # Задача никогда не возвращается из in_progress в pending.
-        assert harness.sample("recipes_generation_tasks", status="in_progress") == 0
-    assert harness.sample("recipes_generation_tasks", status="failed") == 1
-    assert harness.sample("recipes_generation_tasks", status="pending") == 2
+        assert (
+            harness.sample(
+                "recipes_generation_tasks", kind="menu", status="in_progress"
+            )
+            == 0
+        )
+    assert harness.sample("recipes_generation_tasks", kind="menu", status="failed") == 1
+    assert (
+        harness.sample("recipes_generation_tasks", kind="menu", status="pending") == 2
+    )
     assert count(harness, DURATION, "failed") == 1
 
 
@@ -275,7 +289,9 @@ async def test_metrics_endpoint_answers_when_the_database_goes_away(
     app = create_app(config, ollama_transport=httpx.MockTransport(good))
     original = QueueMetricsRefresher._fetch
 
-    async def broken(self: QueueMetricsRefresher) -> dict[str, tuple[int, float]]:
+    async def broken(
+        self: QueueMetricsRefresher,
+    ) -> dict[tuple[str, str], tuple[int, float]]:
         raise ConnectionError("database is down")
 
     stamp = "recipes_generation_tasks_refresh_timestamp_seconds"
@@ -295,7 +311,7 @@ async def test_metrics_endpoint_answers_when_the_database_goes_away(
             await asyncio.sleep(3 * interval)
             after = await client.get("/metrics")
             monkeypatch.setattr(QueueMetricsRefresher, "_fetch", original)
-    assert 'recipes_generation_tasks{status="pending"} 1.0' in before
+    assert 'recipes_generation_tasks{kind="menu",status="pending"} 1.0' in before
     assert after.status_code == 200
     assert first > 0 and _value(after.text, stamp) == first
 
