@@ -212,16 +212,7 @@ class TaskRepository:
     # Параметры задачи целиком; GenerationParams сам сортирует списки по ID.
     async def get_params(self, task_id: UUID) -> GenerationParams | None:
         row = await self.get_parameters(task_id)
-        if row is None:
-            return None
-        return GenerationParams(
-            people_count=row.people_count,
-            weekly_budget=row.weekly_budget,
-            habits=tuple(item.habit_id for item in row.habits),
-            diet=row.diet_id,
-            allergies=tuple(item.allergen_id for item in row.allergies),
-            kitchen_tools=tuple(item.kitchen_tool_id for item in row.kitchen_tools),
-        )
+        return None if row is None else row.to_params()
 
     async def get_prompt(self, task_id: UUID) -> str | None:
         query = select(GenerationTask.prompt).where(GenerationTask.task_id == task_id)
@@ -650,3 +641,9 @@ class RecipeLikeRepository:
             Nutrition.carbohydrates,
         ).join(Nutrition, Nutrition.id == Recipe.nutrition_id)
         return (await self._session.execute(self._by_user(query, user_id))).all()
+
+    async def recent_names(self, user_id: int | None, limit: int) -> tuple[str, ...]:
+        if user_id is None or limit == 0:
+            return ()
+        query = self._by_user(select(Recipe.name), user_id).limit(limit)
+        return tuple(await self._session.scalars(query))

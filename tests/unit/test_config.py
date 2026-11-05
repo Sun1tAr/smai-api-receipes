@@ -52,6 +52,7 @@ def test_each_required_setting_is_required(missing: str) -> None:
 
 def test_defaults() -> None:
     settings = make()
+    assert settings.likes_in_prompt_limit == 10
     assert settings.db_port == 5432
     assert settings.db_timeout_seconds == 5
     assert settings.log_level == "INFO"
@@ -326,3 +327,15 @@ def test_ms2_timeout_must_be_in_range(value: float) -> None:
 def test_ms2_url_must_not_contain_credentials() -> None:
     with pytest.raises(ValidationError):
         make(ms2_base_url="http://user:pass@ms2:8000")
+
+
+@pytest.mark.parametrize("value", ["0", "5", "10"])
+def test_likes_in_prompt_limit_is_read_from_env(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("LIKES_IN_PROMPT_LIMIT", value)
+    assert make().likes_in_prompt_limit == int(value)
+
+
+@pytest.mark.parametrize("value", [-1, 11, 1.5])
+def test_invalid_likes_in_prompt_limit_prevents_startup(value: int | float) -> None:
+    with pytest.raises(ValidationError, match="likes_in_prompt_limit"):
+        make(likes_in_prompt_limit=value)

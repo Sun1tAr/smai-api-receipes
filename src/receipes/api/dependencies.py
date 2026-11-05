@@ -9,8 +9,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from receipes.api.schemas import INT4_MAX
+from receipes.config import DEFAULT_LIKES_IN_PROMPT_LIMIT
 from receipes.db.models import GenerationParameters, GenerationTask, Recipe
-from receipes.db.repositories import PromptTemplateRepository, TaskRepository
+from receipes.db.repositories import (
+    PromptTemplateRepository,
+    RecipeLikeRepository,
+    TaskRepository,
+)
 from receipes.dictionaries import Dictionaries, DictionarySource
 from receipes.domain.errors import (
     REPLACEMENT_TIMED_OUT,
@@ -53,8 +58,13 @@ class TaskStore(Protocol):
 
 
 class SqlTaskStore:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        likes_in_prompt_limit: int = DEFAULT_LIKES_IN_PROMPT_LIMIT,
+    ) -> None:
         self._sessions = session_factory
+        self._likes_in_prompt_limit = likes_in_prompt_limit
 
     async def create(
         self,
@@ -63,7 +73,9 @@ class SqlTaskStore:
         user_id: int | None = None,
     ) -> UUID:
         async with self._sessions() as session, session.begin():
-            prompt, problem = await self._render_prompt(session, params, dictionaries)
+            prompt, problem = await self._render_prompt(
+                session, params, dictionaries, user_id
+            )
             task_id = await TaskRepository(session).create(params, prompt, user_id)
         if problem is not None:
             logger.warning(
@@ -76,11 +88,12 @@ class SqlTaskStore:
     # справочников нет или они не знают ID (API этого не допускает: ID проверены).
     # Второе значение — причина (для лога после коммита); текст промпта и параметры
     # в лог не попадают.
-    @staticmethod
     async def _render_prompt(
+        self,
         session: AsyncSession,
         params: GenerationParams,
         dictionaries: Dictionaries | None,
+        user_id: int | None,
     ) -> tuple[str | None, str | None]:
         template = await PromptTemplateRepository(session).get_active()
         if template is None:
@@ -93,6 +106,9 @@ class SqlTaskStore:
                 constraints = build_constraints(params, dictionaries)
             except UnknownDictionaryId:
                 return None, "unknown_id"
+        liked_names = await RecipeLikeRepository(session).recent_names(
+            user_id, self._likes_in_prompt_limit
+        )
         try:
             return (
                 render_prompt(
@@ -100,6 +116,7 @@ class SqlTaskStore:
                     params.people_count,
                     params.weekly_budget,
                     constraints,
+                    liked_recipe_names=liked_names,
                 ),
                 None,
             )
@@ -160,7 +177,10 @@ class SqlTaskStore:
 
 
 def get_task_store(request: Request) -> TaskStore:
-    return SqlTaskStore(request.app.state.session_factory)
+    return SqlTaskStore(
+        request.app.state.session_factory,
+        request.app.state.settings.likes_in_prompt_limit,
+    )
 
 
 def get_dictionaries(request: Request) -> DictionarySource:

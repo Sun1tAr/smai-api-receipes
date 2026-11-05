@@ -1,17 +1,25 @@
+import json
 import os
 import re
 from collections.abc import Callable
 from decimal import Decimal
 from uuid import UUID
 
+import httpx
 import pytest
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from menu_samples import ollama_reply, sample_menu
+from sqlalchemy import event, text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from test_generation_parameters import Ms2Stub
+from test_likes_api import OWNER, add_recipes
 
 from receipes.config import Settings
 from receipes.database import create_engine
-from receipes.db.repositories import PromptTemplateRepository
+from receipes.db.models import PromptTemplate
+from receipes.db.repositories import PromptTemplateRepository, TaskRepository
+from receipes.domain.params import GenerationParams
 from receipes.generation.prompt import render_prompt, validate_template
+from receipes.main import create_app
 
 pytestmark = [
     pytest.mark.integration,
@@ -164,3 +172,111 @@ async def test_replacement_migration_preserves_v3_rows_and_refuses_lossy_downgra
     finally:
         alembic("upgrade", "head")
         await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("user_id", "limit", "fallback", "expected"),
+    [
+        (42, 2, False, ["Блюдо 3", "Блюдо 2"]),
+        (42, 1, True, ["Блюдо 3"]),
+        (7, 10, False, ["Блюдо 4"]),
+        (5, 10, False, []),
+        (None, 10, False, []),
+        (None, 10, True, []),
+        (42, 0, False, []),
+        (42, 0, True, []),
+    ],
+)
+async def test_menu_likes_snapshot_and_worker_fallback(
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    user_id: int | None,
+    limit: int,
+    fallback: bool,
+    expected: list[str],
+) -> None:
+    recipe_ids = [UUID(int=index) for index in range(1, 5)]
+    await add_recipes(session_factory, *recipe_ids)
+    async with session_factory() as session, session.begin():
+        session.add(
+            PromptTemplate(template="{people_count} {weekly_budget}\n\nТолько JSON")
+        )
+    prompts: list[str] = []
+
+    def model(request: httpx.Request) -> httpx.Response:
+        prompts.append(json.loads(request.content)["prompt"])
+        return httpx.Response(200, json=ollama_reply(sample_menu()))
+
+    app = create_app(
+        settings.model_copy(update={"likes_in_prompt_limit": limit}),
+        ollama_transport=httpx.MockTransport(model),
+        ms2_transport=httpx.MockTransport(Ms2Stub()),
+    )
+    queries: list[str] = []
+
+    @event.listens_for(app.state.engine.sync_engine, "before_cursor_execute")
+    def record_likes_query(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT") and "recipe_like" in statement:
+            queries.append(statement)
+
+    async def snapshot(task_id: UUID) -> str | None:
+        async with session_factory() as session:
+            return await TaskRepository(session).get_prompt(task_id)
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client,
+    ):
+        for index, recipe_id in enumerate(recipe_ids):
+            like = await client.post(
+                f"/recipes/{recipe_id}/like",
+                headers=OWNER if index < 3 else {"X-User-Id": "7"},
+            )
+            assert like.status_code == 200
+        if fallback:
+            async with session_factory() as session, session.begin():
+                task_id = await TaskRepository(session).create(
+                    GenerationParams(2, Decimal("100"), habits=(1,)), user_id=user_id
+                )
+            assert await snapshot(task_id) is None
+        else:
+            response = await client.post(
+                "/generate-menu",
+                json={
+                    "peopleCount": 2,
+                    "weeklyBudget": 100,
+                    "habits": [1],
+                    "kitchenTools": [],
+                },
+                headers={"X-User-Id": str(user_id)} if user_id is not None else {},
+            )
+            assert response.status_code == 202
+            task_id = UUID(response.json()["task_id"])
+            saved = await snapshot(task_id)
+            assert saved is not None
+            if user_id == 42 and limit > 0:
+                removed = await client.delete(
+                    f"/recipes/{recipe_ids[2]}/like", headers=OWNER
+                )
+                assert removed.status_code == 200
+
+        assert await app.state.worker.process_one() is True
+    [prompt] = prompts
+    assert await snapshot(task_id) == prompt
+    if not fallback:
+        assert saved == prompt
+    assert "привычки питания: «n1»" in prompt
+    preference_lines = [line for line in prompt.splitlines() if line.startswith("[")]
+    if expected:
+        [data] = preference_lines
+        assert json.loads(data) == expected
+    else:
+        assert not preference_lines
+        assert "Предпочтения пользователя" not in prompt
+    if user_id is None or limit == 0:
+        assert not queries
+    else:
+        [query] = queries
+        assert "LIMIT" in query

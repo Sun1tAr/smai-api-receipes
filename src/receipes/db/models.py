@@ -7,6 +7,7 @@ from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from receipes.database import Base
+from receipes.domain.params import GenerationParams
 from receipes.domain.status import TaskKind
 
 # Схема строго по ERD MS-4 (SMAI-A-110): PK, FK и NOT NULL по ТЗ; CHECK и UNIQUE
@@ -45,6 +46,16 @@ class GenerationParameters(Base):
     kitchen_tools: Mapped[list["GenerationParameterKitchenTool"]] = relationship(
         lazy="raise"
     )
+
+    def to_params(self) -> GenerationParams:
+        return GenerationParams(
+            people_count=self.people_count,
+            weekly_budget=self.weekly_budget,
+            habits=tuple(item.habit_id for item in self.habits),
+            diet=self.diet_id,
+            allergies=tuple(item.allergen_id for item in self.allergies),
+            kitchen_tools=tuple(item.kitchen_tool_id for item in self.kitchen_tools),
+        )
 
 
 class GenerationParameterHabit(Base):
