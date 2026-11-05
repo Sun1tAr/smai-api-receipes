@@ -8,6 +8,7 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationEr
 
 from receipes.domain.errors import InvalidNeurocoreResponse
 from receipes.domain.names import name_key, normalize_name
+from receipes.domain.status import TaskKind
 
 MIN_RECIPES = 3
 MAX_NAME_LENGTH = 200
@@ -146,14 +147,20 @@ def _clean_recipe(recipe: RecipePayload) -> RecipePayload:
 
 # «Ворота» ответа модели: типы, количество, границы, чистота текста, дубли.
 # Нарушение — InvalidNeurocoreResponse с причиной для метрики.
-def parse_menu(data: object) -> MenuPayload:
+def parse_menu(
+    data: object,
+    *,
+    kind: TaskKind = TaskKind.MENU,
+    existing_names: tuple[str, ...] = (),
+) -> MenuPayload:
     try:
         payload = MenuPayload.model_validate(data, strict=False)
     except ValidationError:
         raise _reject("schema") from None
-    if len(payload.recipes) < MIN_RECIPES:
+    count = len(payload.recipes)
+    if not (count == 1 if kind == TaskKind.REPLACE else count >= MIN_RECIPES):
         raise _reject("count")
-    names: set[str] = set()
+    names = {name_key(name) for name in existing_names}
     for recipe in payload.recipes:
         _clean_recipe(recipe)
         key = name_key(recipe.name)

@@ -67,6 +67,7 @@ def test_defaults() -> None:
     assert settings.generation_worker_interval_seconds == 2
     assert settings.generation_metrics_refresh_seconds == 15
     assert settings.generation_bad_response_retries == 1
+    assert settings.replace_wait_seconds == 120
     assert settings.vkusvill_mcp_url is None
     assert settings.mcp_call_timeout_seconds == 5
     assert settings.mcp_call_retries == 1
@@ -155,6 +156,7 @@ def test_values_are_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> No
         "OLLAMA_TEMPERATURE": "0.7",
         "GENERATION_WORKER_ENABLED": "false",
         "GENERATION_BAD_RESPONSE_RETRIES": "0",
+        "REPLACE_WAIT_SECONDS": "175",
     }.items():
         monkeypatch.setenv(key, value)
     settings = Settings(_env_file=None)
@@ -162,6 +164,7 @@ def test_values_are_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> No
     assert settings.ollama_temperature == 0.7
     assert settings.generation_worker_enabled is False
     assert settings.generation_bad_response_retries == 0
+    assert settings.replace_wait_seconds == 175
 
 
 def test_log_level_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -193,6 +196,8 @@ def test_log_level_is_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
         {"generation_metrics_refresh_seconds": 300.01},
         {"generation_bad_response_retries": -1},
         {"generation_bad_response_retries": 11},
+        {"replace_wait_seconds": 0},
+        {"replace_wait_seconds": 175.01},
         {"vkusvill_mcp_url": "https://user:pass@catalog.test/mcp"},
         {"mcp_call_timeout_seconds": 6},
         {"mcp_call_retries": 2},

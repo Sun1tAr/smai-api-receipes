@@ -1,6 +1,7 @@
 # Тексты, которые пишет сам воркер.
 SERVICE_RESTARTED = "Service restarted"
 GENERATION_FAILED = "Menu generation failed"
+REPLACEMENT_TIMED_OUT = "Recipe replacement timed out"
 
 
 # Ошибка генерации: её текст сохраняется в generation_task.error и виден клиенту через

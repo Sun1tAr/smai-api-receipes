@@ -24,6 +24,7 @@ from receipes.db.repositories import (
     PromptTemplateRepository,
     TaskRepository,
 )
+from receipes.domain.errors import TaskStateConflict
 from receipes.domain.menu import (
     IngredientPayload,
     MenuPayload,
@@ -399,3 +400,280 @@ async def test_queue_index_exists(session_factory: Factory) -> None:
             )
         ).all()
     assert "ix_generation_task_status_created_at" in names
+
+
+async def source_menu(factory: Factory) -> tuple[UUID, UUID, dict[str, UUID]]:
+    async with factory() as session, session.begin():
+        tasks = TaskRepository(session)
+        source_id = await tasks.create(GenerationParams(3, Decimal("750")), user_id=1)
+        await tasks.claim_next()
+        menu_id = await MenuRepository(session).save(
+            menu_of(
+                recipe("Омлет", "Соль"), recipe("Суп", "Вода"), recipe("Каша", "Соль")
+            )
+        )
+        await tasks.mark_done(source_id, menu_id)
+        source = await tasks.get(source_id)
+        recipes = {
+            slot.recipe.name: slot.recipe_id for slot in source.menu.menu_recipes
+        }
+    return source_id, menu_id, recipes
+
+
+async def test_replacement_keeps_parameters_and_exact_result(
+    session_factory: Factory,
+) -> None:
+    source, menu, old = await source_menu(session_factory)
+    async with session_factory() as session, session.begin():
+        tasks = TaskRepository(session)
+        latest = await tasks.create(GenerationParams(2, Decimal("250")), user_id=1)
+        await tasks.claim_next()
+        await tasks.mark_done(latest, menu)
+        assert await tasks.create_replace(uuid4(), old["Омлет"]) is None
+        assert await tasks.create_replace(source, uuid4()) is None
+        task_id = await tasks.create_replace(source, old["Омлет"])
+        assert task_id is not None
+        assert await tasks.create_replace(task_id, old["Омлет"]) is None
+        claim = await tasks.claim_next()
+        assert claim is not None and (claim.task_id, claim.kind) == (task_id, "replace")
+        assert await tasks.mark_done(task_id, menu) is None
+        context = await tasks.get_replace_context(task_id, 120)
+        assert context is not None
+        assert context.replaced_name == "Омлет"
+        assert set(context.recipe_names) == set(old)
+        assert 0 < context.remaining_seconds <= 120
+        assert await tasks.finish_replace(task_id, recipe("Рагу", "Соль"), 120)
+
+    async with session_factory() as session, session.begin():
+        tasks = TaskRepository(session)
+        replaced = await tasks.get_replacement(task_id)
+        assert replaced is not None and replaced.result_recipe is not None
+        first_result_id = replaced.result_recipe.id
+        assert await tasks.expire_replace(task_id, 0, "deadline") is None
+        assert replaced.source_task_id == source
+        assert replaced.replaced_recipe_id == old["Омлет"]
+        assert replaced.menu_id == menu and replaced.status == TaskStatus.DONE
+        assert replaced.result_recipe.ingredients[0].ingredient.name == "Соль"
+        assert len(replaced.result_recipe.instructions) == 2
+        assert replaced.result_recipe.nutrition.proteins == Decimal("20.25")
+        assert await tasks.get_params(task_id) == GenerationParams(3, Decimal("750"))
+        saved = await tasks.find_last_done_parameters(1)
+        assert saved is not None and saved.people_count == 2
+        assert await tasks.create_replace(task_id, first_result_id) is None
+        assert await tasks.create_replace(source, old["Омлет"]) is None
+        next_task_id = await tasks.create_replace(source, first_result_id)
+        assert next_task_id is not None
+        await tasks.claim_next()
+        assert await tasks.finish_replace(next_task_id, recipe("Рис", "Вода"), 120)
+
+    async with session_factory() as session:
+        tasks = TaskRepository(session)
+        first = await tasks.get_replacement(task_id)
+        current = await tasks.get(source)
+        assert first is not None and first.result_recipe is not None
+        assert current is not None and current.menu is not None
+        assert (first.result_recipe.id, first.result_recipe.name) == (
+            first_result_id,
+            "Рагу",
+        )
+        slots = {slot.recipe.name: slot.recipe_id for slot in current.menu.menu_recipes}
+        assert slots == {"Каша": old["Каша"], "Суп": old["Суп"], "Рис": slots["Рис"]}
+        assert await session.get(Recipe, old["Омлет"]) is not None
+        assert await tasks.get_replacement(source) is None
+
+
+@pytest.mark.parametrize("duplicate", ["«ОМЛЕТ!»", "суп."])
+async def test_replacement_rejects_a_duplicate_name(
+    session_factory: Factory,
+    duplicate: str,
+) -> None:
+    source, _, old = await source_menu(session_factory)
+    async with session_factory() as session, session.begin():
+        tasks = TaskRepository(session)
+        task_id = await tasks.create_replace(source, old["Омлет"])
+        assert task_id is not None
+        await tasks.claim_next()
+        with pytest.raises(TaskStateConflict):
+            await tasks.finish_replace(task_id, recipe(duplicate, "Масло"), 120)
+        assert await session.scalar(select(func.count(Recipe.id))) == 3
+        assert await session.scalar(select(func.count(Ingredient.id))) == 2
+
+
+async def test_concurrent_replacements_only_swap_one_slot_once(
+    session_factory: Factory,
+) -> None:
+    source, menu, old = await source_menu(session_factory)
+    async with session_factory() as session, session.begin():
+        tasks = TaskRepository(session)
+        first = await tasks.create_replace(source, old["Омлет"])
+        second = await tasks.create_replace(source, old["Омлет"])
+        assert first is not None and second is not None
+        await tasks.claim_next()
+        await tasks.claim_next()
+
+    async def swap(task_id: UUID, name: str) -> bool:
+        try:
+            async with session_factory() as session, session.begin():
+                assert await TaskRepository(session).finish_replace(
+                    task_id, recipe(name, "Масло"), 120
+                )
+        except TaskStateConflict:
+            return False
+        return True
+
+    assert sum(await asyncio.gather(swap(first, "Рагу"), swap(second, "Пюре"))) == 1
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count(Recipe.id))) == 4
+        links = await session.scalars(
+            select(MenuRecipe.recipe_id).where(MenuRecipe.menu_id == menu)
+        )
+        ids = set(links)
+        assert len(ids) == 3
+        assert old["Омлет"] not in ids and {old["Суп"], old["Каша"]} <= ids
+
+
+@pytest.mark.parametrize("claimed", [False, True])
+async def test_replacement_expiration_wins_once_and_blocks_late_writes(
+    session_factory: Factory,
+    claimed: bool,
+) -> None:
+    source, menu, old = await source_menu(session_factory)
+    async with session_factory() as session, session.begin():
+        tasks = TaskRepository(session)
+        task_id = await tasks.create_replace(source, old["Омлет"])
+        assert task_id is not None
+        claim = await tasks.claim_next() if claimed else None
+        assert await tasks.expire_replace(task_id, 120, "deadline") is None
+        await session.execute(
+            text(
+                "UPDATE generation_task SET created_at = now() - interval '3 min'"
+                " WHERE task_id = :task_id"
+            ),
+            {"task_id": task_id},
+        )
+    async with session_factory() as session, session.begin():
+        tasks = TaskRepository(session)
+        expired = await tasks.expire_replace(task_id, 120, "deadline")
+        assert expired is not None and expired.kind == "replace"
+        assert expired.claimed_at == (claim.claimed_at if claim else None)
+        assert await tasks.expire_replace(task_id, 120, "deadline") is None
+        assert await tasks.mark_failed(task_id, "late") is None
+        await tasks.set_prompt(task_id, "late")
+        assert await tasks.finish_replace(task_id, recipe("Рагу", "Масло"), 120) is None
+        failed = await tasks.get_replacement(task_id)
+        assert failed is not None
+        assert (failed.status, failed.error, failed.prompt) == (
+            TaskStatus.FAILED,
+            "deadline",
+            None,
+        )
+        assert failed.menu_id == menu and failed.result_recipe_id is None
+        assert await session.scalar(select(func.count(Recipe.id))) == 3
+
+
+async def test_replacement_rechecks_deadline_after_waiting_for_menu_lock(
+    session_factory: Factory,
+) -> None:
+    source, menu, old = await source_menu(session_factory)
+    async with session_factory() as session, session.begin():
+        tasks = TaskRepository(session)
+        task_id = await tasks.create_replace(source, old["Омлет"])
+        assert task_id is not None
+        await tasks.claim_next()
+        await session.execute(
+            text(
+                "UPDATE generation_task"
+                " SET created_at = clock_timestamp() - interval '119 s'"
+                " WHERE task_id = :task_id"
+            ),
+            {"task_id": task_id},
+        )
+
+    waiting_pid: asyncio.Queue[int] = asyncio.Queue()
+
+    async def finish():
+        async with session_factory() as session, session.begin():
+            await waiting_pid.put(await session.scalar(select(func.pg_backend_pid())))
+            return await TaskRepository(session).finish_replace(
+                task_id, recipe("Рагу", "Масло"), 120
+            )
+
+    async with session_factory() as session, session.begin():
+        await session.execute(select(Menu.id).where(Menu.id == menu).with_for_update())
+        finisher = asyncio.create_task(finish())
+        async with asyncio.timeout(2):
+            pid = await waiting_pid.get()
+            while not await session.scalar(select(func.pg_blocking_pids(pid))):
+                await asyncio.sleep(0.01)
+        await session.execute(select(func.pg_sleep(1.05)))
+
+    assert await finisher is None
+    async with session_factory() as session, session.begin():
+        tasks = TaskRepository(session)
+        assert await tasks.expire_replace(task_id, 120, "deadline")
+        assert await session.scalar(select(func.count(Recipe.id))) == 3
+
+
+async def test_replacement_rolls_back_when_deadline_passes_during_save(
+    session_factory: Factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, _, old = await source_menu(session_factory)
+    original_save = MenuRepository.save_recipe
+    saved_recipe: UUID | None = None
+
+    async def slow_save(repository: MenuRepository, payload: RecipePayload) -> UUID:
+        nonlocal saved_recipe
+        saved_recipe = await original_save(repository, payload)
+        await asyncio.sleep(1.05)
+        return saved_recipe
+
+    monkeypatch.setattr(MenuRepository, "save_recipe", slow_save)
+    async with session_factory() as session, session.begin():
+        tasks = TaskRepository(session)
+        task_id = await tasks.create_replace(source, old["Омлет"])
+        assert task_id is not None
+        await tasks.claim_next()
+        await session.execute(
+            text(
+                "UPDATE generation_task"
+                " SET created_at = clock_timestamp() - interval '119 s'"
+                " WHERE task_id = :task_id"
+            ),
+            {"task_id": task_id},
+        )
+        assert await tasks.finish_replace(task_id, recipe("Рагу", "Масло"), 120) is None
+        assert saved_recipe is not None
+        assert await tasks.expire_replace(task_id, 120, "deadline")
+
+    async with session_factory() as session:
+        assert await session.get(Recipe, saved_recipe) is None
+        assert await session.scalar(select(func.count(Instruction.id))) == 6
+        assert await session.scalar(select(func.count(Ingredient.id))) == 2
+        current = await TaskRepository(session).get(source)
+        assert current is not None and current.menu is not None
+        assert {slot.recipe_id for slot in current.menu.menu_recipes} == set(
+            old.values()
+        )
+
+
+async def test_claim_cannot_skip_a_disabled_menu_at_the_head(
+    session_factory: Factory,
+) -> None:
+    source, _, old = await source_menu(session_factory)
+    pending_menu = await create_task(session_factory)
+    async with session_factory() as session, session.begin():
+        tasks = TaskRepository(session)
+        replacement = await tasks.create_replace(source, old["Омлет"])
+        assert replacement is not None
+        assert await tasks.claim_next(menu_enabled=False) is None
+        first = await tasks.claim_next()
+        assert first is not None and (first.task_id, first.kind) == (
+            pending_menu,
+            "menu",
+        )
+        second = await tasks.claim_next(menu_enabled=False)
+        assert second is not None and (second.task_id, second.kind) == (
+            replacement,
+            "replace",
+        )

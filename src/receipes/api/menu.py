@@ -20,9 +20,11 @@ from receipes.api.schemas import (
     MenuResponse,
     NutritionResponse,
     RecipeResponse,
+    ReplaceRecipeRequest,
+    ReplaceRecipeResponse,
     TaskResultResponse,
 )
-from receipes.db.models import GenerationTask
+from receipes.db.models import GenerationTask, Recipe
 from receipes.dictionaries import (
     UNKNOWN_ID,
     Dictionaries,
@@ -38,6 +40,7 @@ logger = structlog.get_logger()
 router = APIRouter(tags=["menu"])
 
 TASK_NOT_FOUND = "Generation task not found"
+REPLACEMENT_NOT_FOUND = "Generation task or recipe not found"
 Store = Annotated[TaskStore, Depends(get_task_store)]
 DictionariesDep = Annotated[DictionarySource, Depends(get_dictionaries)]
 
@@ -181,6 +184,14 @@ RESULT_EXAMPLES = {
         "summary": "Генерация завершилась ошибкой",
         "value": {"status": "failed", "menu": None, "error": "Neurocore timeout"},
     },
+}
+
+REPLACE_PATH = "/generate-menu/{task_id}/replace-recipe"
+REPLACEMENT_EXAMPLE = {
+    "recipe": {
+        **DONE_EXAMPLE["menu"]["recipes"][0],
+        "recipeId": "00000000-0000-4000-8000-000000000004",
+    }
 }
 
 
@@ -400,34 +411,32 @@ def _menu_response(task: GenerationTask) -> MenuResponse:
     if task.menu is None or not task.menu.menu_recipes:
         # Статус done без данных меню — нарушение инварианта, а не ответ клиенту.
         raise RuntimeError("done task has no menu")
-    recipes = []
-    for link in task.menu.menu_recipes:
-        recipe = link.recipe
-        recipes.append(
-            RecipeResponse(
-                recipe_id=recipe.id,
-                name=recipe.name,
-                ingredients=[
-                    IngredientResponse(
-                        name=item.ingredient.name,
-                        quantity=item.quantity,
-                        unit=item.unit,
-                    )
-                    for item in recipe.ingredients
-                ],
-                calories=recipe.calories,
-                nutrition=NutritionResponse(
-                    calories=recipe.nutrition.calories,
-                    proteins=recipe.nutrition.proteins,
-                    fats=recipe.nutrition.fats,
-                    carbohydrates=recipe.nutrition.carbohydrates,
-                ),
-                cookingTime=recipe.cooking_time,
-                instructions=[step.text for step in recipe.instructions],
-                photo=None,
+    return MenuResponse(
+        recipes=[_recipe_response(link.recipe) for link in task.menu.menu_recipes]
+    )
+
+
+def _recipe_response(recipe: Recipe) -> RecipeResponse:
+    return RecipeResponse(
+        recipe_id=recipe.id,
+        name=recipe.name,
+        ingredients=[
+            IngredientResponse(
+                name=item.ingredient.name, quantity=item.quantity, unit=item.unit
             )
-        )
-    return MenuResponse(recipes=recipes)
+            for item in recipe.ingredients
+        ],
+        calories=recipe.calories,
+        nutrition=NutritionResponse(
+            calories=recipe.nutrition.calories,
+            proteins=recipe.nutrition.proteins,
+            fats=recipe.nutrition.fats,
+            carbohydrates=recipe.nutrition.carbohydrates,
+        ),
+        cookingTime=recipe.cooking_time,
+        instructions=[step.text for step in recipe.instructions],
+        photo=None,
+    )
 
 
 @router.get(
@@ -490,9 +499,88 @@ async def get_generation_result(
     )
 
 
+@router.post(
+    REPLACE_PATH,
+    summary="Заменить рецепт в готовом меню (API-18)",
+    description=(
+        "Заменяет один рецепт в готовом меню, в том числе гостевом. Использует "
+        "сохранённые параметры меню. После успеха API-2 по исходному `task_id` "
+        "возвращает новый состав меню. Остальные рецепты сохраняются. "
+        "Общий лимит ожидания включает очередь. При ошибке генерации или "
+        "истечении срока сервис отвечает 500, а состав меню сохраняется."
+    ),
+    response_model=ReplaceRecipeResponse,
+    responses={
+        200: {
+            "description": "Рецепт заменён и сохранён в меню.",
+            "content": {"application/json": {"example": REPLACEMENT_EXAMPLE}},
+        },
+        400: _error_doc(
+            "Некорректное тело или отсутствует корректный UUID в `recipeId`.",
+            _error_example(
+                "VALIDATION_ERROR",
+                "Request validation failed",
+                {"fields": [{"loc": ["body", "recipeId"], "type": "uuid_parsing"}]},
+            ),
+        ),
+        404: _error_doc(
+            "Исходная задача отсутствует, не завершена или `task_id` не UUID. "
+            "Такой же ответ, если рецепт уже отсутствует в этом меню.",
+            _error_example("NOT_FOUND", REPLACEMENT_NOT_FOUND, {}),
+        ),
+        500: _error_doc(
+            "Внутренняя ошибка, ошибка генерации или истёк срок ожидания замены.",
+            _error_example("INTERNAL_ERROR", "Internal server error", {}),
+        ),
+    },
+)
+async def replace_recipe(
+    request: Request,
+    task_id: Annotated[
+        str,
+        Path(
+            description="UUID исходной задачи из API-1 с готовым меню.",
+            examples=["b1e2c3d4-5678-90ab-cdef-1234567890ab"],
+            json_schema_extra={"format": "uuid"},
+        ),
+    ],
+    body: Annotated[
+        ReplaceRecipeRequest,
+        Body(
+            openapi_examples={
+                "recipe": {
+                    "summary": "UUID рецепта из готового меню",
+                    "value": {"recipeId": "00000000-0000-4000-8000-000000000002"},
+                }
+            }
+        ),
+    ],
+    store: Store,
+) -> Any:
+    try:
+        source_task_id = UUID(task_id)
+    except ValueError:
+        return error_response(404, "NOT_FOUND", REPLACEMENT_NOT_FOUND)
+    replacement_id = await store.create_replace(source_task_id, body.recipe_id)
+    if replacement_id is None:
+        return error_response(404, "NOT_FOUND", REPLACEMENT_NOT_FOUND)
+    recipe = await store.wait_for_replace(
+        replacement_id,
+        request.app.state.settings.replace_wait_seconds,
+        request.app.state.generation_metrics,
+    )
+    if recipe is None:
+        return error_response(500, "INTERNAL_ERROR", "Internal server error")
+    return ReplaceRecipeResponse(recipe=_recipe_response(recipe))
+
+
 # FastAPI собирает OpenAPI с exclude_none и теряет null в примерах (`menu`, `error`,
 # `photo`), хотя именно они показывают клиенту контракт. Возвращаем их на место.
 def restore_example_nulls(schema: dict[str, Any]) -> None:
     operation = schema["paths"]["/generate-menu/{task_id}"]["get"]
     content = operation["responses"]["200"]["content"]["application/json"]
     content["examples"] = RESULT_EXAMPLES
+    replacement = schema["paths"][REPLACE_PATH]["post"]
+    replacement["responses"]["200"]["content"]["application/json"]["example"] = (
+        REPLACEMENT_EXAMPLE
+    )

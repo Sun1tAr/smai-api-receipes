@@ -18,6 +18,7 @@ from receipes.domain.errors import (
     NeurocoreUnavailable,
 )
 from receipes.domain.menu import MenuPayload, parse_menu
+from receipes.domain.status import TaskKind
 from receipes.generation.metrics import GenerationMetrics
 
 # Схема ответа дословно по API-3 (SMAI-A-131); одна и для v1, и для v2 промпта.
@@ -71,6 +72,16 @@ RESPONSE_FORMAT: dict[str, Any] = {
     },
     "required": ["recipes"],
 }
+REPLACE_RESPONSE_FORMAT: dict[str, Any] = {
+    **RESPONSE_FORMAT,
+    "properties": {
+        "recipes": {
+            **RESPONSE_FORMAT["properties"]["recipes"],
+            "minItems": 1,
+            "maxItems": 1,
+        }
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -115,13 +126,15 @@ class OllamaClient:
             base_url=str(settings.ollama_base_url), timeout=timeout, transport=transport
         )
 
-    def _request_body(self, prompt: str) -> dict[str, Any]:
+    def _request_body(self, prompt: str, kind: TaskKind) -> dict[str, Any]:
         settings = self._settings
         return {
             "model": settings.ollama_model,
             "prompt": prompt,
             "stream": False,
-            "format": RESPONSE_FORMAT,
+            "format": REPLACE_RESPONSE_FORMAT
+            if kind == TaskKind.REPLACE
+            else RESPONSE_FORMAT,
             "options": {
                 "num_ctx": settings.ollama_num_ctx,
                 "num_predict": settings.ollama_num_predict,
@@ -131,11 +144,11 @@ class OllamaClient:
         }
 
     # Запрос к Ollama; ошибки приводятся к безопасным текстам GenerationError.
-    async def _post(self, prompt: str) -> dict[str, Any]:
+    async def _post(self, prompt: str, kind: TaskKind) -> dict[str, Any]:
         try:
             async with asyncio.timeout(self._settings.ollama_timeout_seconds):
                 response = await self._http.post(
-                    "/api/generate", json=self._request_body(prompt)
+                    "/api/generate", json=self._request_body(prompt, kind)
                 )
         except (TimeoutError, httpx.ReadTimeout, httpx.WriteTimeout):
             raise NeurocoreTimeout from None
@@ -158,18 +171,24 @@ class OllamaClient:
         return body
 
     # Один вызов: сначала done_reason (обрезка без разбора), затем JSON и «ворота».
-    async def generate_menu(self, prompt: str) -> GeneratedMenu:
+    async def generate_menu(
+        self,
+        prompt: str,
+        *,
+        kind: TaskKind = TaskKind.MENU,
+        existing_names: tuple[str, ...] = (),
+    ) -> GeneratedMenu:
         started = perf_counter()
         # None — вызов отменён (остановка сервиса): это не исход запроса.
         outcome: str | None = "error"
         with self._tracer.start_as_current_span("ollama.generate"):
             try:
-                body = await self._post(prompt)
+                body = await self._post(prompt, kind)
                 try:
                     if body.get("done_reason") == "length":
                         outcome = "truncated"
                         raise NeurocoreTruncated
-                    menu = self._parse(body)
+                    menu = self._parse(body, kind, existing_names)
                 except GenerationError as error:
                     # Счётчики нужны и при отказе (при обрезке eval_count == лимит).
                     error.prompt_eval_count = _count(body, "prompt_eval_count")
@@ -199,7 +218,9 @@ class OllamaClient:
         )
 
     @staticmethod
-    def _parse(body: dict[str, Any]) -> MenuPayload:
+    def _parse(
+        body: dict[str, Any], kind: TaskKind, existing_names: tuple[str, ...]
+    ) -> MenuPayload:
         text = body.get("response")
         if not isinstance(text, str):
             raise InvalidNeurocoreResponse("schema")
@@ -207,7 +228,7 @@ class OllamaClient:
             data = json.loads(text)
         except ValueError:
             raise InvalidNeurocoreResponse("schema") from None
-        return parse_menu(data)
+        return parse_menu(data, kind=kind, existing_names=existing_names)
 
     # Лёгкая проба перед взятием задачи: GET /api/tags (список моделей, без генерации).
     # require_model: после ответа 404 ждём, пока настроенная модель появится в списке

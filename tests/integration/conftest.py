@@ -80,5 +80,10 @@ async def session_factory(
     tables = ", ".join(Base.metadata.tables)
     async with engine.begin() as connection:
         await connection.execute(text(f"TRUNCATE {tables} CASCADE"))
-    yield factory
-    await engine.dispose()
+    try:
+        yield factory
+    finally:
+        # Миграции в других тестах должны стартовать без данных замен.
+        async with engine.begin() as connection:
+            await connection.execute(text(f"TRUNCATE {tables} CASCADE"))
+        await engine.dispose()

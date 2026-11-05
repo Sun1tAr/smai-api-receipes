@@ -18,6 +18,7 @@ Ollama. Инфраструктура (**SMAI-58**): каркас приложе�
 | `GET /health` | Готовность: `SELECT 1` к PostgreSQL (Ollama не проверяется); не пишет спаны, лог запроса на уровне DEBUG | 200 `{"status":"ok"}`, 503 `INTERNAL_ERROR` | служебный |
 | `POST /generate-menu` | API-1: создать задачу генерации меню. Тело: `peopleCount` 1–20, `weeklyBudget` > 0 (≤ 1 000 000, до 2 знаков) и параметры v2: `habits` и `kitchenTools` (обязательны, можно `[]`), `diet` (число или `null`, можно не передавать), `allergies` (можно не передавать). ID — целые int4, повторы сохраняются один раз. Необязательный заголовок `X-User-Id` (одно целое 1–2147483647, ставит gateway по токену; повтор заголовка — 400) задаёт владельца задачи (`generation_parameters.user_id`); без него запрос гостевой, `user_id = NULL`; некорректное значение — 400 `VALIDATION_ERROR` (`loc` `["header","X-User-Id"]`, значение не возвращается). Не больше 3 разных привычек (иначе 400 `too_long`). Каждый ID должен существовать в справочниках MS-2, иначе 400 `unknown_id` с местом ошибки (`["body","habits","1"]`; повтор неизвестного ID отмечается на каждом вхождении). Запрос без единого ID MS-2 не вызывает. Если MS-2 недоступен, ответил ошибкой или не уложился в `MS2_TIMEOUT_SECONDS`, задача не создаётся и ответ 500. Параметры сохраняются с задачей, а названия выбранных ID (из того же ответа MS-2) попадают в промпт блоком ограничений. Запрос без `habits` или `kitchenTools` (формат v1) — 400 | 202 `{"task_id"}`, 400 `VALIDATION_ERROR`, 500 `INTERNAL_ERROR` | бизнес |
 | `GET /generate-menu/{task_id}` | API-2: статус задачи; всегда `status`, `menu`, `error` (`menu` только при `done`, `error` только при `failed`). Каждый рецепт содержит `recipeId` (UUID сохранённого рецепта, неизменный при повторном GET). Порядок рецептов и ингредиентов не гарантируется | 200, 404 `NOT_FOUND` (неизвестный или не-UUID `task_id`), 500 `INTERNAL_ERROR` | бизнес |
+| `POST /generate-menu/{task_id}/replace-recipe` | API-18: заменить один рецепт в готовом меню, включая гостевое. Тело `{"recipeId":"<UUID>"}`. API-2 по исходному `task_id` покажет новый состав | 200 `{"recipe":{…}}`, 400 `VALIDATION_ERROR`, 404 `NOT_FOUND` для отсутствующей задачи или рецепта в её меню, 500 `INTERNAL_ERROR` при сбое или таймауте | бизнес |
 | `POST /recipes/cart` | API-14: подобрать товары ВкусВилла для сохранённого рецепта. Тело `{"recipeId":"<UUID>"}`. Результат содержит `matches`, `total` в рублях, `allMatched` и `unmatchedCount` | 200, 400 `VALIDATION_ERROR`, 404 `NOT_FOUND` (гостевой, неизвестный или из незавершённой задачи), 503 `EXTERNAL_SERVICE_ERROR`, 500 `INTERNAL_ERROR` | бизнес |
 | `POST /recipes/cart/link` | API-16: создать одну ссылку ВкусВилла для 1–20 позиций из API-14. Тело `{"items":[{"id":606,"q":0.15}]}`. Авторизация не требуется | 200 `{"link":"https://vkusvill.ru/mobile?basket&share=2557567558"}`, 400 `VALIDATION_ERROR`, 503 `EXTERNAL_SERVICE_ERROR`, 500 `INTERNAL_ERROR` | бизнес |
 | `GET /profile/parameters` | API-13: сохранённые параметры пользователя (SMAI-102): `habits`, `diet`, `allergies`, `kitchenTools` самой свежей задачи пользователя в статусе `done` (по `created_at`, при равенстве по `task_id`); `pending`, `in_progress` и `failed` не учитываются; `peopleCount` и `weeklyBudget` не возвращаются. Нет готовых задач — 200 с пустыми списками и `diet: null`. Владелец задаётся заголовком `X-User-Id` (его ставит gateway по токену), без него или с некорректным значением (целое 1–2147483647) — 401 | 200, 401 `UNAUTHORIZED`, 500 `INTERNAL_ERROR` | бизнес |
@@ -35,7 +36,7 @@ Ollama. Инфраструктура (**SMAI-58**): каркас приложе�
 ```
 
 Коды: `VALIDATION_ERROR` (400, ошибка валидации запроса), `NOT_FOUND` (404; для
-API-2 — `Generation task not found`),
+API-2 — `Generation task not found`, для API-18 — `Generation task or recipe not found`),
 `UNAUTHORIZED` (401, API-13 без валидного `X-User-Id`), `METHOD_NOT_ALLOWED` (405), `INTERNAL_ERROR` (500 и 503 у `/health`),
 `EXTERNAL_SERVICE_ERROR` (503 у API-14 и API-16). Каждый ответ, включая
 500 на необработанное исключение, содержит заголовок `X-Request-ID`: входящее
@@ -116,6 +117,7 @@ Compose-сети. При старте контейнер выполняет `ale
 | `GENERATION_WORKER_INTERVAL_SECONDS` | Интервал опроса очереди, (0, 3600] | `2` |
 | `GENERATION_BAD_RESPONSE_RETRIES` | Повторы при невалидном ответе модели (таймаут, обрезка и недоступность не повторяются), [0, 10] | `1` |
 | `GENERATION_METRICS_REFRESH_SECONDS` | Как часто обновляются gauge очереди генерации в `/metrics`, (0, 300]; меньше ~1 с не рекомендуется | `15` |
+| `REPLACE_WAIT_SECONDS` | Бюджет замены рецепта с момента постановки в очередь, (0, 175] секунд | `120` |
 | `RECEIPES_HTTP_PORT` | Хостовой порт Compose (только Compose) | `8001` |
 
 Пустые и состоящие из пробелов `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`
@@ -184,11 +186,11 @@ JSON…») вставляется блок «Ограничения пользо
 keepalive (30 с простоя, затем проба каждые 10 с, 3 пробы): если клиент пропал,
 сервер освободит замок примерно через минуту; потеря соединения воркером
 обнаруживается проверкой на каждой итерации (`generation_lock_lost`), замок берётся
-заново. Очередь не ограничена и не имеет TTL.
+заново. Для генерации меню очередь не ограничена и не имеет TTL.
 
 **Защита очереди.** Перед взятием задачи проверяется активный шаблон промпта: если
 его нет или он повреждён (нет `{people_count}`/`{weekly_budget}`, лишние или
-непарные скобки), задачи остаются `pending`, а в лог пишется `prompt_template_unusable`
+непарные скобки), задачи генерации меню остаются `pending`, а в лог пишется `prompt_template_unusable`
 с причиной (один раз, пока причина не изменится). Ошибки стороны Ollama
 (`Neurocore unavailable`, `Neurocore timeout`, `Neurocore model not found`,
 `Neurocore error`) переводят воркер в режим ожидания: упавшая задача остаётся
@@ -204,7 +206,7 @@ Ollama, у которой настроенная `OLLAMA_MODEL` есть в сп
 успешно завершённая задача. Сбои самого цикла
 (например, БД) повторяются с паузой 1 → 30 с.
 
-**Время.** Худший случай одной задачи — `(1 + GENERATION_BAD_RESPONSE_RETRIES) ×
+**Время.** Худший случай генерации меню — `(1 + GENERATION_BAD_RESPONSE_RETRIES) ×
 OLLAMA_TIMEOUT_SECONDS` (по умолчанию 600 с), всё это время очередь стоит. В норме
 генерация идёт секунды (≈63 токена/с, когда модель целиком в видеопамяти). На
 процессоре ответ до лимита токенов не уложится в таймаут: это сигнал проверить
@@ -223,25 +225,42 @@ OLLAMA_NUM_PREDICT` (≈5,2 тыс. токенов в худшем случае)
 `ollama_context_tight`.
 
 **Логи и метрики.** События `generation_task_claimed|done|failed` несут
-`task_id`, длительность, число рецептов и `prompt_eval_count`/`eval_count`;
+`task_id`, `kind`, длительность, число рецептов и `prompt_eval_count`/`eval_count`;
 промпт, ответ модели и параметры в лог не попадают. `/metrics`:
-`menu_generation_tasks_total{status}`, `menu_generation_duration_seconds`,
+`menu_generation_tasks_total{kind,status}`, `menu_generation_duration_seconds{kind}`,
 `ollama_request_duration_seconds`, `ollama_requests_total{outcome}`,
-`menu_generation_rejected_total{reason}`.
+`menu_generation_rejected_total{kind,reason}`.
+
+### Замена рецепта
+
+API-18 ставит задачу `replace` в общую очередь и ждёт результат. Воркер берёт
+активный шаблон `replace` при обработке и подставляет `{people_count}`,
+`{weekly_budget}`, `{replaced_recipe}`, `{existing_recipes}` и ограничения v2
+исходного меню. Ошибка шаблона замены завершает только эту задачу.
+Воркер запрашивает один рецепт, проверяет его и заменяет выбранную связь в меню.
+Старый рецепт сохраняется в БД. Если слот уже заменён, параллельный запрос на него
+не сможет записать результат.
+
+`REPLACE_WAIT_SECONDS` включает очередь, генерацию, допустимые повторы и запись
+результата. После дедлайна сервис закрывает незавершённую задачу и возвращает 500.
+Поздний ответ модели не изменяет меню. На всех репликах MS-4 задай одно значение
+и меняй его после завершения активных замен. Таймаут gateway
+`UPSTREAM_REPLACE_TIMEOUT_SECONDS` должен быть больше этого значения (125 с по
+умолчанию).
 
 ### Метрики очереди генерации
 
 Gauge считаются из БД фоновой задачей раз в `GENERATION_METRICS_REFRESH_SECONDS`
-одним запросом с группировкой по статусу, а не на каждый scrape; гистограммы
-пишет воркер в момент завершения задачи (после commit, один раз на задачу).
-Единственная метка — `status`.
+одним запросом с группировкой по `kind` и `status`. Счётчик и гистограммы
+обновляет тот, кто сохранил терминальный переход, один раз после commit.
+`kind` принимает два значения, `menu` и `replace`.
 
 | Метрика | Тип | Метки | Значение |
 | --- | --- | --- | --- |
-| `recipes_generation_tasks` | Gauge | `status` ∈ `pending`, `in_progress`, `done`, `failed` | Число задач в статусе (нули тоже выгружаются) |
-| `recipes_generation_task_oldest_age_seconds` | Gauge | `status` ∈ `pending`, `in_progress` | Возраст самой старой задачи в статусе (`now() − min(status_changed_at)`); 0, если задач нет |
-| `recipes_generation_task_duration_seconds` | Histogram | `status` ∈ `done`, `failed` | Полное время задачи: от создания до терминального статуса, с ожиданием в очереди |
-| `recipes_generation_task_processing_seconds` | Histogram | `status` ∈ `done`, `failed` | Время в `in_progress` |
+| `recipes_generation_tasks` | Gauge | `kind`, `status` ∈ `pending`, `in_progress`, `done`, `failed` | Число задач в статусе (нули тоже выгружаются) |
+| `recipes_generation_task_oldest_age_seconds` | Gauge | `kind`, `status` ∈ `pending`, `in_progress` | Возраст самой старой задачи в статусе (`now() − min(status_changed_at)`). Если задач нет, 0 |
+| `recipes_generation_task_duration_seconds` | Histogram | `kind`, `status` ∈ `done`, `failed` | Полное время задачи, от создания до терминального статуса, с ожиданием в очереди |
+| `recipes_generation_task_processing_seconds` | Histogram | `kind`, `status` ∈ `done`, `failed` | Время в `in_progress` |
 | `recipes_generation_tasks_refresh_timestamp_seconds` | Gauge | — | Unix-время последнего успешного обновления gauge |
 
 Разница `duration − processing` — время ожидания в очереди. Бакеты гистограмм:
@@ -257,11 +276,12 @@ Gauge считаются из БД фоновой задачей раз в `GENE
   (только тип ошибки), при восстановлении — INFO
   `generation_metrics_refresh_recovered`.
 - Возраст в gauge «заморожен» между обновлениями (до одного интервала).
-- Задачи, которые при старте закрыла `recover()` (`Service restarted`), попадают
-  только в `duration{status="failed"}`: начало их обработки неизвестно. Поэтому
-  `_count` у `duration{failed}` может быть больше, чем у `processing{failed}`.
-- Несколько реплик: gauge агрегируются через `max` (`refresh_timestamp` — через
-  `min`, чтобы устаревшая реплика не пряталась), гистограммы — через `sum`.
+- Для закрытых при старте задач и замен, истёкших в `pending`, пишется полное
+  время. Поэтому `_count` у `duration{status="failed"}` может быть больше, чем
+  у `processing{status="failed"}`.
+- Между репликами агрегируй gauge через `max by (kind, status)`, время последнего
+  обновления через `min`. Для счётчиков и гистограмм суммируй скорости по нужным
+  меткам. Сохраняй `le` при агрегации бакетов и `kind` для сравнения видов задач.
 - Метрики — в базе: `generation_task.status_changed_at` (время последней смены
   статуса, миграция `0003_task_status_changed_at`), индекс
   `(status, status_changed_at)`.

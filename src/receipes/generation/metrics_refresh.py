@@ -6,6 +6,7 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from receipes.domain.status import TaskKind
 from receipes.generation.metrics import AGE_STATUSES, QUEUE_STATUSES, GenerationMetrics
 
 logger = structlog.get_logger()
@@ -15,9 +16,9 @@ MAX_REFRESH_TIMEOUT_SECONDS = 5.0
 
 # Один запрос на тик, возраст считает БД (часы приложения не участвуют).
 COUNTS_QUERY = text(
-    "SELECT status, count(*), "
+    "SELECT kind, status, count(*), "
     "EXTRACT(EPOCH FROM now() - min(status_changed_at)) "
-    "FROM generation_task GROUP BY status"
+    "FROM generation_task GROUP BY kind, status"
 )
 
 
@@ -38,10 +39,12 @@ class QueueMetricsRefresher:
         self._clock = clock
         self._failing = False
 
-    async def _fetch(self) -> dict[str, tuple[int, float]]:
+    async def _fetch(self) -> dict[tuple[str, str], tuple[int, float]]:
         async with self._sessions() as session:
             rows = (await session.execute(COUNTS_QUERY)).all()
-        return {status: (count, float(age)) for status, count, age in rows}
+        return {
+            (kind, status): (count, float(age)) for kind, status, count, age in rows
+        }
 
     async def refresh_once(self) -> None:
         try:
@@ -49,11 +52,12 @@ class QueueMetricsRefresher:
         except Exception as error:
             self._report_failure(error)
             return
-        for status in QUEUE_STATUSES:
-            count, age = counts.get(status, (0, 0.0))
-            self._metrics.queue_tasks.labels(status).set(count)
-            if status in AGE_STATUSES:
-                self._metrics.oldest_age.labels(status).set(max(age, 0.0))
+        for kind in TaskKind:
+            for status in QUEUE_STATUSES:
+                count, age = counts.get((kind, status), (0, 0.0))
+                self._metrics.queue_tasks.labels(kind, status).set(count)
+                if status in AGE_STATUSES:
+                    self._metrics.oldest_age.labels(kind, status).set(max(age, 0.0))
         self._metrics.refresh_timestamp.set(self._clock())
         if self._failing:
             self._failing = False
