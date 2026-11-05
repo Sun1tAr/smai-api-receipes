@@ -71,6 +71,7 @@ async def test_cart_uses_saved_recipe_origin_and_done_status(settings, session_f
     capture = Path(__file__).parents[1] / "fixtures" / "mcp" / "init.json"
     initialize_result = json.loads(capture.read_text())["result"]
     calls = []
+    link = "https://vkusvill.ru/cart?products=606%3A0.01"
 
     def catalog(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
@@ -84,7 +85,10 @@ async def test_cart_uses_saved_recipe_origin_and_done_status(settings, session_f
             assert method == "tools/call"
             tool = payload["params"]["name"]
             arguments = payload["params"]["arguments"]
-            if tool == "vkusvill_product_details":
+            if tool == "vkusvill_cart_link_create":
+                assert arguments == {"products": [{"id": 606, "q": 0.01}]}
+                data = {"link": link}
+            elif tool == "vkusvill_product_details":
                 assert arguments == {"id": 606}
                 data = {
                     "id": 606,
@@ -145,6 +149,13 @@ async def test_cart_uses_saved_recipe_origin_and_done_status(settings, session_f
                     "unit": "г",
                 }
 
+            items = [
+                {"id": row["product"]["id"], "q": row["q"]} for row in result["matches"]
+            ]
+            response = await client.post("/recipes/cart/link", json={"items": items})
+            assert response.status_code == 200
+            assert response.json() == {"link": link}
+
             for recipe_id in (
                 recipe_ids[None, TaskStatus.DONE],
                 recipe_ids[22, TaskStatus.FAILED],
@@ -158,6 +169,7 @@ async def test_cart_uses_saved_recipe_origin_and_done_status(settings, session_f
     assert calls == [
         "initialize",
         "notifications/initialized",
+        "tools/call",
         "tools/call",
         "tools/call",
         "tools/call",

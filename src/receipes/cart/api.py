@@ -1,11 +1,19 @@
 import asyncio
+import re
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from receipes.api.schemas import IngredientResponse
-from receipes.cart.schemas import CartRequest, CartResponse
+from receipes.cart.mcp import CART_LINK_TOOL, McpError
+from receipes.cart.schemas import (
+    CartLinkRequest,
+    CartLinkResponse,
+    CartRequest,
+    CartResponse,
+)
 from receipes.cart.service import CatalogUnavailable, build_cart
 from receipes.db.repositories import MenuRepository
 from receipes.errors import ErrorResponse, error_response
@@ -13,6 +21,14 @@ from receipes.errors import ErrorResponse, error_response
 router = APIRouter(tags=["recipes"])
 
 _CATALOG_MESSAGE = "VkusVill catalog unavailable"
+_CART_LINK_MESSAGE = "VkusVill cart link unavailable"
+_CART_LINK_EXAMPLE = {"link": "https://vkusvill.ru/mobile?basket&share=2557567558"}
+_INVALID_URL_CHARS = re.compile(
+    r'[\s\x00-\x1f\x7f-\x9f\ud800-\udfff\\<>"{}`|^]|%(?![0-9a-fA-F]{2})'
+)
+_VKUSVILL_AUTHORITY = re.compile(
+    r"(?:www\.)?vkusvill\.ru(?::[0-9]+)?", re.IGNORECASE | re.ASCII
+)
 _NOT_FOUND_MESSAGE = "Recipe not found"
 _CART_EXAMPLE = {
     "matches": [
@@ -132,6 +148,81 @@ async def get_recipe_cart(
         except CatalogUnavailable:
             pass
     return error_response(503, "EXTERNAL_SERVICE_ERROR", _CATALOG_MESSAGE)
+
+
+def _valid_cart_link(link: object) -> bool:
+    if not isinstance(link, str) or _INVALID_URL_CHARS.search(link):
+        return False
+    try:
+        url = urlsplit(link)
+        return (
+            url.scheme == "https"
+            and _VKUSVILL_AUTHORITY.fullmatch(url.netloc) is not None
+            and url.port != 0
+        )
+    except ValueError:
+        return False
+
+
+@router.post(
+    "/recipes/cart/link",
+    summary="Создать ссылку на корзину ВкусВилла (API-16)",
+    description=(
+        "Принимает от 1 до 20 позиций с `product.id` и `q` из API-14. "
+        "ВкусВилл создаёт одну ссылку для всего списка. Если хотя бы одна "
+        "позиция некорректна, запрос целиком завершается ошибкой. "
+        "Маршрут доступен без авторизации. Общий дедлайн MCP составляет "
+        "не более 9 секунд."
+    ),
+    response_model=CartLinkResponse,
+    responses={
+        200: {
+            "description": "Ссылка на корзину для всех переданных позиций.",
+            "content": {"application/json": {"example": _CART_LINK_EXAMPLE}},
+        },
+        400: _error_doc(
+            "Тело запроса некорректно или ВкусВилл отклонил позиции корзины.",
+            "VALIDATION_ERROR",
+            "Request validation failed",
+        ),
+        500: _error_doc(
+            "Внутренняя ошибка сервиса рецептов.",
+            "INTERNAL_ERROR",
+            "Internal server error",
+        ),
+        503: _error_doc(
+            "ВкусВилл недоступен, не настроен или вернул некорректный ответ.",
+            "EXTERNAL_SERVICE_ERROR",
+            _CART_LINK_MESSAGE,
+        ),
+    },
+)
+async def create_recipe_cart_link(
+    payload: CartLinkRequest, request: Request
+) -> CartLinkResponse | JSONResponse:
+    state = request.app.state
+    if state.vkusvill_mcp is not None:
+        try:
+            async with asyncio.timeout(min(state.settings.cart_deadline_seconds, 9)):
+                data = await state.vkusvill_mcp.call(
+                    CART_LINK_TOOL,
+                    {"products": [item.model_dump() for item in payload.items]},
+                )
+            link = data.get("link")
+            if _valid_cart_link(link):
+                return CartLinkResponse(link=link)
+        except McpError as exc:
+            if (
+                exc.code == "invalid_input"
+                and exc.http_status == 400
+                and not exc.unavailable
+            ):
+                return error_response(
+                    400, "VALIDATION_ERROR", "Request validation failed"
+                )
+        except TimeoutError:
+            pass
+    return error_response(503, "EXTERNAL_SERVICE_ERROR", _CART_LINK_MESSAGE)
 
 
 # FastAPI исключает null из примеров при построении OpenAPI.

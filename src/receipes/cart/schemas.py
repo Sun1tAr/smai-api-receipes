@@ -63,3 +63,32 @@ class CartResponse(BaseModel):
         serialization_alias="unmatchedCount",
         description="Число позиций с ошибкой.",
     )
+
+
+class CartLinkItem(BaseModel):
+    id: int = Field(
+        strict=True, ge=1, le=999_999_999, description="ID товара из API-14."
+    )
+    q: float = Field(
+        strict=True,
+        allow_inf_nan=False,
+        ge=0.01,
+        le=40,
+        description="Количество в единицах продажи из API-14.",
+    )
+
+
+class CartLinkRequest(BaseModel):
+    items: list[CartLinkItem] = Field(
+        min_length=1,
+        max_length=20,
+        description="Позиции для одной корзины ВкусВилла.",
+        examples=[[{"id": 606, "q": 0.15}]],
+    )
+
+
+class CartLinkResponse(BaseModel):
+    link: str = Field(
+        description="Абсолютная HTTPS-ссылка на корзину ВкусВилла.",
+        json_schema_extra={"format": "uri"},
+    )

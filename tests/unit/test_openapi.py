@@ -39,6 +39,7 @@ async def test_health_is_fully_documented_and_metrics_is_hidden(app) -> None:
         "/generate-menu/{task_id}",
         "/profile/parameters",
         "/recipes/cart",
+        "/recipes/cart/link",
     }
     operation = document["paths"]["/health"]["get"]
     assert operation["summary"]
@@ -67,6 +68,7 @@ EXPECTED_CODES = {
     ("/generate-menu/{task_id}", "get"): {"200", "404", "500"},
     ("/profile/parameters", "get"): {"200", "401", "500"},
     ("/recipes/cart", "post"): {"200", "400", "404", "500", "503"},
+    ("/recipes/cart/link", "post"): {"200", "400", "500", "503"},
 }
 
 
@@ -227,3 +229,30 @@ async def test_cart_request_and_partial_success_examples_match_schema(app) -> No
         success["example"], {**success["schema"], "components": document["components"]}
     )
     assert success["example"]["matches"][1]["product"] is None
+
+
+async def test_cart_link_request_and_response_examples_match_schema(app) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        document = (await client.get("/openapi.json")).json()
+    operation = document["paths"]["/recipes/cart/link"]["post"]
+    schemas = document["components"]["schemas"]
+    payload = schemas["CartLinkRequest"]
+    items = payload["properties"]["items"]
+    assert (items["minItems"], items["maxItems"]) == (1, 20)
+    item = schemas["CartLinkItem"]["properties"]
+    assert (item["id"]["type"], item["id"]["minimum"], item["id"]["maximum"]) == (
+        "integer",
+        1,
+        999_999_999,
+    )
+    assert (item["q"]["type"], item["q"]["minimum"], item["q"]["maximum"]) == (
+        "number",
+        0.01,
+        40,
+    )
+    components = {"components": document["components"]}
+    jsonschema.validate({"items": items["examples"][0]}, {**payload, **components})
+    success = operation["responses"]["200"]["content"]["application/json"]
+    jsonschema.validate(success["example"], {**success["schema"], **components})
