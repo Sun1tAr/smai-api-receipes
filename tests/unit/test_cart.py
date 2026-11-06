@@ -197,6 +197,58 @@ async def test_details_recheck_does_not_sell_invalid_product(setup_cart, update)
     assert result["total"] == 0 and result["unmatchedCount"] == 1
 
 
+@pytest.mark.parametrize(
+    "update", [{"available": False}, {"name": "Молоко овсяное"}, {"weight": None}]
+)
+async def test_uses_next_strict_candidate_after_unsuitable_card(setup_cart, update):
+    case = CATALOG["молоко"]
+    first, second = case["items"][:2]
+    first_card = case["details"][0]
+    catalog = Catalog(
+        {
+            "молоко": {
+                **case,
+                "items": [first, second],
+                "details": [{**first_card, **update}, {**first_card, **second}],
+            }
+        }
+    )
+    app, recipe_id = setup_cart([ingredient("молоко")], catalog)
+
+    response = await post_cart(app, recipe_id)
+
+    assert response.status_code == 200
+    row = response.json()["matches"][0]
+    assert row["error"] is None
+    assert row["product"]["id"] == 173
+    assert row["q"] == 1
+
+
+async def test_incompatible_error_survives_later_invalid_card(setup_cart):
+    case = CATALOG["молоко"]
+    first, second = case["items"][:2]
+    first_card = case["details"][0]
+    catalog = Catalog(
+        {
+            "молоко": {
+                **case,
+                "items": [first, second],
+                "details": [
+                    {**first_card, "weight": None},
+                    {**first_card, **second, "available": False},
+                ],
+            }
+        }
+    )
+    app, recipe_id = setup_cart([ingredient("молоко")], catalog)
+
+    response = await post_cart(app, recipe_id)
+
+    assert response.status_code == 200
+    assert response.json()["matches"][0]["error"] == "несовместимые единицы"
+    assert catalog.lookups[-1] == (DETAILS, {"id": 173})
+
+
 async def test_uses_card_price_instead_of_search_price(setup_cart):
     class ChangedPrice(Catalog):
         async def call(self, tool, arguments):

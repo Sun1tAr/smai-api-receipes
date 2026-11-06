@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from receipes.cart import mcp
-from receipes.cart.mcp import McpClient, McpError
+from receipes.cart.mcp import CART_LINK_TOOL, McpClient, McpError
 
 _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "mcp"
 
@@ -395,6 +395,89 @@ async def test_session_expiry_reinitializes_before_retry(make_client) -> None:
         ("notifications/initialized", "session-2"),
         ("tools/call", "session-2"),
     ]
+
+
+async def test_late_link_rejection_keeps_reinitialized_session(make_client) -> None:
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+    initialized = 0
+    calls = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initialized
+        body = json.loads(request.content)
+        session = request.headers.get("Mcp-Session-Id")
+        match body["method"]:
+            case "initialize":
+                initialized += 1
+                return _rpc(
+                    body,
+                    _capture("init")["result"],
+                    headers={"Mcp-Session-Id": f"session-{initialized}"},
+                )
+            case "notifications/initialized":
+                return httpx.Response(202)
+            case "tools/call":
+                product_id = body["params"]["arguments"]["products"][0]["id"]
+                calls.append((product_id, session))
+                if session == "session-1":
+                    if product_id == 1:
+                        waiting.set()
+                        await release.wait()
+                    return httpx.Response(404)
+                return _data(body, {"link": f"https://vkusvill.ru/cart/{product_id}"})
+        raise AssertionError(body)
+
+    client = make_client(handler)
+
+    async def create_link(product_id: int) -> dict:
+        return await client.call(
+            CART_LINK_TOOL, {"products": [{"id": product_id, "q": 1}]}
+        )
+
+    async def freshen_session() -> dict:
+        await waiting.wait()
+        try:
+            return await create_link(2)
+        finally:
+            release.set()
+
+    first, second = await asyncio.wait_for(
+        asyncio.gather(create_link(1), freshen_session(), return_exceptions=True), 1
+    )
+
+    assert first == {"link": "https://vkusvill.ru/cart/1"}
+    assert second == {"link": "https://vkusvill.ru/cart/2"}
+    assert initialized == 2
+    assert calls == [
+        (1, "session-1"),
+        (2, "session-1"),
+        (2, "session-2"),
+        (1, "session-2"),
+    ]
+
+
+async def test_link_does_not_retry_session_rejection_during_handshake(
+    make_client,
+) -> None:
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body["method"])
+        if body["method"] == "initialize":
+            return _rpc(
+                body,
+                _capture("init")["result"],
+                headers={"Mcp-Session-Id": "session-1"},
+            )
+        assert request.headers["Mcp-Session-Id"] == "session-1"
+        return httpx.Response(404)
+
+    client = make_client(handler)
+    with pytest.raises(McpError):
+        await client.call(CART_LINK_TOOL, {})
+    assert seen == ["initialize", "notifications/initialized"]
 
 
 async def test_outer_deadline_closes_sse_and_releases_slot(make_client) -> None:
