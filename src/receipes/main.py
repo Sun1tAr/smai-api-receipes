@@ -161,6 +161,14 @@ def create_app(
         settings.generation_metrics_refresh_seconds,
     )
 
+    async def run_worker() -> None:
+        try:
+            await worker.run()
+        except Exception:
+            logger.error("generation_worker_exited", exc_info=True)
+        else:
+            logger.error("generation_worker_exited")
+
     # Владение соединениями и экспортёром ограничено жизненным циклом приложения.
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -172,7 +180,7 @@ def create_app(
             if not await dependencies_ready(engine, settings):
                 raise RuntimeError("Service dependencies are unavailable")
             if settings.generation_worker_enabled:
-                worker_task = asyncio.create_task(worker.run(), name="generation")
+                worker_task = asyncio.create_task(run_worker(), name="generation")
             # Фоном и без ожидания первого тика: недоступная БД не мешает старту.
             refresh_task = asyncio.create_task(refresher.run(), name="queue-metrics")
             logger.info("service_started")
