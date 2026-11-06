@@ -15,6 +15,7 @@ from sqlalchemy import URL
 # (SMAI-54) плюс блок ограничений v2 (SMAI-89: худший случай по сиду MS-2
 # +334 токена по замеру, всего 1156) плюс запас на рост.
 CONTEXT_RESERVE_TOKENS = 1536
+DEFAULT_LIKES_IN_PROMPT_LIMIT = 10
 
 
 class Settings(BaseSettings):
@@ -70,6 +71,9 @@ class Settings(BaseSettings):
     # Повторы только при невалидном ответе модели (не при таймауте и обрезке).
     generation_bad_response_retries: int = Field(default=1, ge=0, le=10)
     replace_wait_seconds: float = Field(default=120, gt=0, le=175)
+    likes_in_prompt_limit: int = Field(
+        default=DEFAULT_LIKES_IN_PROMPT_LIMIT, ge=0, le=10
+    )
 
     # LOG_LEVEL=info допустим: регистр в окружении легко перепутать.
     @field_validator("log_level", mode="before")

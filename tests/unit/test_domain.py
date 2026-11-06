@@ -35,6 +35,7 @@ ERD_COLUMNS = {
     "menu": {"id"},
     "menu_recipes": {"id", "menu_id", "recipe_id"},
     "recipe": {"id", "name", "calories", "cooking_time", "photo", "nutrition_id"},
+    "recipe_like": {"user_id", "recipe_id", "created_at"},
     "ingredient": {"id", "name"},
     "recipe_ingredients": {"id", "recipe_id", "ingredient_id", "quantity", "unit"},
     "instruction": {"id", "recipe_id", "text", "position"},
@@ -52,6 +53,7 @@ ERD_FOREIGN_KEYS = {
     ("menu_recipes", "menu_id", "menu"),
     ("menu_recipes", "recipe_id", "recipe"),
     ("recipe", "nutrition_id", "nutrition"),
+    ("recipe_like", "recipe_id", "recipe"),
     ("recipe_ingredients", "recipe_id", "recipe"),
     ("recipe_ingredients", "ingredient_id", "ingredient"),
     ("instruction", "recipe_id", "recipe"),
@@ -89,15 +91,17 @@ def test_only_primary_keys_and_foreign_keys_beyond_not_null() -> None:
         assert all(not index.unique for index in table.indexes)
 
 
-def test_ids_are_uuid_and_dates_have_time_zone() -> None:
+def test_ids_are_uuid_or_user_id_and_dates_have_time_zone() -> None:
     tables = Base.metadata.tables
     for table in tables.values():
         for column in table.primary_key.columns:
-            assert column.type.__class__.__name__ == "Uuid"
+            expected = "Integer" if column.name == "user_id" else "Uuid"
+            assert column.type.__class__.__name__ == expected
     for table, column in (
         ("generation_task", "created_at"),
         ("generation_task", "status_changed_at"),
         ("prompt_template", "created_at"),
+        ("recipe_like", "created_at"),
     ):
         assert tables[table].c[column].type.timezone is True
 

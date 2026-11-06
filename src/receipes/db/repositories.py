@@ -1,8 +1,20 @@
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import NamedTuple
 from uuid import UUID, uuid4
 
-from sqlalchemy import Interval, Row, Select, bindparam, func, or_, select, update
+from sqlalchemy import (
+    Interval,
+    Row,
+    Select,
+    bindparam,
+    delete,
+    func,
+    or_,
+    select,
+    update,
+)
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -20,6 +32,7 @@ from receipes.db.models import (
     PromptTemplate,
     Recipe,
     RecipeIngredient,
+    RecipeLike,
     utcnow,
 )
 from receipes.domain.errors import TaskStateConflict
@@ -199,16 +212,7 @@ class TaskRepository:
     # Параметры задачи целиком; GenerationParams сам сортирует списки по ID.
     async def get_params(self, task_id: UUID) -> GenerationParams | None:
         row = await self.get_parameters(task_id)
-        if row is None:
-            return None
-        return GenerationParams(
-            people_count=row.people_count,
-            weekly_budget=row.weekly_budget,
-            habits=tuple(item.habit_id for item in row.habits),
-            diet=row.diet_id,
-            allergies=tuple(item.allergen_id for item in row.allergies),
-            kitchen_tools=tuple(item.kitchen_tool_id for item in row.kitchen_tools),
-        )
+        return None if row is None else row.to_params()
 
     async def get_prompt(self, task_id: UUID) -> str | None:
         query = select(GenerationTask.prompt).where(GenerationTask.task_id == task_id)
@@ -584,3 +588,62 @@ class PromptTemplateRepository:
             .limit(1)
         )
         return await self._session.scalar(query)
+
+
+class RecipeLikeRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def recipe_exists(self, recipe_id: UUID) -> bool:
+        query = select(Recipe.id).where(Recipe.id == recipe_id)
+        # Удерживаем рецепт от удаления до вставки связи.
+        return (
+            await self._session.scalar(query.with_for_update(read=True, key_share=True))
+            is not None
+        )
+
+    async def add(self, user_id: int, recipe_id: UUID) -> bool:
+        query = (
+            insert(RecipeLike)
+            .values(user_id=user_id, recipe_id=recipe_id)
+            .on_conflict_do_nothing(
+                index_elements=[RecipeLike.user_id, RecipeLike.recipe_id]
+            )
+            .returning(RecipeLike.recipe_id)
+        )
+        return await self._session.scalar(query) is not None
+
+    async def remove(self, user_id: int, recipe_id: UUID) -> bool:
+        query = (
+            delete(RecipeLike)
+            .where(RecipeLike.user_id == user_id, RecipeLike.recipe_id == recipe_id)
+            .returning(RecipeLike.recipe_id)
+        )
+        return await self._session.scalar(query) is not None
+
+    @staticmethod
+    def _by_user(query: Select, user_id: int) -> Select:
+        return (
+            query.join(RecipeLike, RecipeLike.recipe_id == Recipe.id)
+            .where(RecipeLike.user_id == user_id)
+            .order_by(RecipeLike.created_at.desc(), RecipeLike.recipe_id.desc())
+        )
+
+    async def list_recipes(self, user_id: int) -> Sequence[Row]:
+        query = select(
+            Recipe.id,
+            Recipe.name,
+            Recipe.calories,
+            Recipe.cooking_time,
+            Nutrition.calories.label("nutrition_calories"),
+            Nutrition.proteins,
+            Nutrition.fats,
+            Nutrition.carbohydrates,
+        ).join(Nutrition, Nutrition.id == Recipe.nutrition_id)
+        return (await self._session.execute(self._by_user(query, user_id))).all()
+
+    async def recent_names(self, user_id: int | None, limit: int) -> tuple[str, ...]:
+        if user_id is None or limit == 0:
+            return ()
+        query = self._by_user(select(Recipe.name), user_id).limit(limit)
+        return tuple(await self._session.scalars(query))

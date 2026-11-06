@@ -7,6 +7,7 @@ from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from receipes.database import Base
+from receipes.domain.params import GenerationParams
 from receipes.domain.status import TaskKind
 
 # Схема строго по ERD MS-4 (SMAI-A-110): PK, FK и NOT NULL по ТЗ; CHECK и UNIQUE
@@ -45,6 +46,16 @@ class GenerationParameters(Base):
     kitchen_tools: Mapped[list["GenerationParameterKitchenTool"]] = relationship(
         lazy="raise"
     )
+
+    def to_params(self) -> GenerationParams:
+        return GenerationParams(
+            people_count=self.people_count,
+            weekly_budget=self.weekly_budget,
+            habits=tuple(item.habit_id for item in self.habits),
+            diet=self.diet_id,
+            allergies=tuple(item.allergen_id for item in self.allergies),
+            kitchen_tools=tuple(item.kitchen_tool_id for item in self.kitchen_tools),
+        )
 
 
 class GenerationParameterHabit(Base):
@@ -122,6 +133,19 @@ class Recipe(Base):
     ingredients: Mapped[list["RecipeIngredient"]] = relationship(lazy="raise")
     instructions: Mapped[list["Instruction"]] = relationship(
         lazy="raise", order_by="Instruction.position"
+    )
+
+
+class RecipeLike(Base):
+    __tablename__ = "recipe_like"
+    __table_args__ = (
+        Index("ix_recipe_like_user_id_created_at", "user_id", "created_at"),
+    )
+
+    user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    recipe_id: Mapped[UUID] = mapped_column(ForeignKey("recipe.id"), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now()
     )
 
 

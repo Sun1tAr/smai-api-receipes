@@ -19,6 +19,7 @@ from receipes.db.repositories import (
     FinishedTask,
     MenuRepository,
     PromptTemplateRepository,
+    RecipeLikeRepository,
     ReplaceContext,
     TaskRepository,
 )
@@ -311,9 +312,8 @@ class GenerationWorker:
             self._record(claim, "done", started, generated)
         return True
 
-    # Транзакция 2: готовый промпт задачи или (для задач без него) параметры и активный
-    # шаблон. Названия справочников запрашиваются у MS-2 вне транзакций БД; собранный
-    # промпт сохраняется в задаче отдельной короткой транзакцией.
+    # Транзакция 2: готовый промпт или параметры задачи, активный шаблон и лайки.
+    # Запрос к MS-2 идёт вне транзакции БД. Собранный промпт сохраняется отдельно.
     async def _prepare_prompt(
         self, task_id: UUID, context: ReplaceContext | None = None
     ) -> str:
@@ -324,20 +324,25 @@ class GenerationWorker:
             saved = await tasks.get_prompt(task_id)
             if saved is not None:
                 return saved
-            params = await tasks.get_params(task_id)
+            parameters = await tasks.get_parameters(task_id)
             template = await PromptTemplateRepository(session).get_active(kind)
-        if params is None or template is None:
-            raise PromptTemplateError
-        # Битый шаблон отклоняется до обращения к MS-2.
-        validate_template(template.template, kind)
+            if parameters is None or template is None:
+                raise PromptTemplateError
+            params = parameters.to_params()
+            template_text = template.template
+            validate_template(template_text, kind)
+            liked_names = await RecipeLikeRepository(session).recent_names(
+                parameters.user_id, self._settings.likes_in_prompt_limit
+            )
         constraints = await self._constraints(task_id, params)
         prompt = render_prompt(
-            template.template,
+            template_text,
             params.people_count,
             params.weekly_budget,
             constraints,
             replaced_recipe=context.replaced_name if context else None,
             existing_recipes=context.recipe_names if context else (),
+            liked_recipe_names=liked_names,
         )
         async with self._sessions() as session, session.begin():
             await TaskRepository(session).set_prompt(task_id, prompt)

@@ -12,6 +12,7 @@ from menu_samples import ollama_reply, sample_menu, sample_recipe
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from test_generation_parameters import Ms2Stub
+from test_likes_api import OWNER, add_recipes
 
 from receipes.api.dependencies import SqlTaskStore
 from receipes.config import Settings
@@ -337,3 +338,39 @@ async def test_invalid_replace_template_leaves_normal_generation_available(
     assert await scenario.recipes(next_task)
     assert await scenario.recipes(task_id) == original
     assert len(scenario.model_requests) == 2
+
+
+async def test_replace_uses_source_owner_likes_not_the_callers(
+    scenario: Scenario,
+) -> None:
+    response = await scenario.client.post(
+        "/generate-menu", json=MENU_REQUEST, headers=OWNER
+    )
+    assert response.status_code == 202
+    task_id = response.json()["task_id"]
+    assert await scenario.app.state.worker.process_one() is True
+    original = await scenario.recipes(task_id)
+    await add_recipes(scenario.factory, UUID(int=11), UUID(int=12))
+    other = {"X-User-Id": "7"}
+    for index, headers in ((11, OWNER), (12, other)):
+        response = await scenario.client.post(
+            f"/recipes/{UUID(int=index)}/like", headers=headers
+        )
+        assert response.status_code == 200
+    async with asyncio.TaskGroup() as group:
+        posted = group.create_task(
+            scenario.client.post(
+                f"/generate-menu/{task_id}/replace-recipe",
+                json={"recipeId": next(iter(original))},
+                headers=other,
+            )
+        )
+        await scenario.wait_for_replacements()
+        assert await scenario.app.state.worker.process_one() is True
+    assert posted.result().status_code == 200
+    [_, replace_request] = scenario.model_requests
+    prompt = replace_request["prompt"]
+    [data] = [line for line in prompt.splitlines() if line.startswith("[")]
+    assert json.loads(data) == ["Блюдо 11"]
+    assert "Ограничения пользователя и запрет повторов важнее" in prompt
+    assert (await scenario.replacement_tasks())[0].prompt == prompt
