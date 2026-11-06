@@ -39,6 +39,7 @@ async def test_health_is_fully_documented_and_metrics_is_hidden(app) -> None:
         "/generate-menu/{task_id}",
         "/generate-menu/{task_id}/replace-recipe",
         "/profile/parameters",
+        "/profile/menus",
         "/recipes/{recipe_id}/like",
         "/recipes/liked",
         "/recipes/cart",
@@ -71,6 +72,7 @@ EXPECTED_CODES = {
     ("/generate-menu/{task_id}", "get"): {"200", "404", "500"},
     ("/generate-menu/{task_id}/replace-recipe", "post"): {"200", "400", "404", "500"},
     ("/profile/parameters", "get"): {"200", "401", "500"},
+    ("/profile/menus", "get"): {"200", "401", "500"},
     ("/recipes/{recipe_id}/like", "post"): {"200", "401", "404", "409", "500"},
     ("/recipes/{recipe_id}/like", "delete"): {"200", "401", "404", "500"},
     ("/recipes/liked", "get"): {"200", "401", "500"},
@@ -303,3 +305,24 @@ async def test_likes_document_uuid_owner_and_success_examples(app) -> None:
             }
         else:
             assert examples == [{"success": True}]
+
+
+async def test_menu_history_documents_owner_and_success_examples(app) -> None:
+    document = app.openapi()
+    operation = document["paths"]["/profile/menus"]["get"]
+    assert (
+        operation["parameters"]
+        == (document["paths"]["/recipes/liked"]["get"]["parameters"])
+    )
+    success = operation["responses"]["200"]["content"]["application/json"]
+    examples = [item["value"] for item in success["examples"].values()]
+    assert {"menus": []} in examples
+    [menu] = next(example["menus"] for example in examples if example["menus"])
+    assert set(menu) == {"menuId", "createdAt", "recipes"}
+    assert set(menu["recipes"][0]) == {"recipeId", "name", "calories", "cookingTime"}
+    for example in examples:
+        jsonschema.validate(
+            example,
+            {**success["schema"], "components": document["components"]},
+            format_checker=jsonschema.FormatChecker(),
+        )

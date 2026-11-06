@@ -1,10 +1,10 @@
 import asyncio
 import re
-from typing import Protocol
+from typing import Annotated, Protocol
 from uuid import UUID
 
 import structlog
-from fastapi import Request
+from fastapi import Depends, HTTPException, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -199,3 +199,31 @@ def parse_user_id(values: list[str]) -> int | None:
         return None
     value = int(values[0])
     return value if 1 <= value <= INT4_MAX else None
+
+
+# Заголовок проверяем вручную, чтобы при его отсутствии вернуть 401.
+OWNER_HEADER = {
+    "parameters": [
+        {
+            "name": USER_ID_HEADER,
+            "in": "header",
+            "required": True,
+            "description": (
+                "ID из проверенного токена. Gateway передаёт один заголовок "
+                "с целым числом от 1 до 2147483647."
+            ),
+            "schema": {"type": "string"},
+            "example": "42",
+        }
+    ]
+}
+
+
+def require_user(request: Request) -> int:
+    user_id = parse_user_id(request.headers.getlist(USER_ID_HEADER))
+    if user_id is None:
+        raise HTTPException(status_code=401)
+    return user_id
+
+
+UserId = Annotated[int, Depends(require_user)]

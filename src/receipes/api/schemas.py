@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Literal
 from uuid import UUID
@@ -282,4 +283,29 @@ class SavedParametersResponse(BaseModel):
     allergies: list[int] = Field(description="ID аллергенов по возрастанию.")
     kitchen_tools: list[int] = Field(
         alias="kitchenTools", description="ID кухонной техники по возрастанию."
+    )
+
+
+class MenuHistoryRecipeResponse(BaseModel):
+    recipe_id: UUID = Field(alias="recipeId", description="UUID рецепта.")
+    name: str = Field(description="Название блюда.")
+    calories: Number = Field(description="Калорийность одной порции, ккал.")
+    cooking_time: Number = Field(
+        alias="cookingTime", description="Время приготовления, минут."
+    )
+
+
+class MenuHistoryItemResponse(BaseModel):
+    menu_id: UUID = Field(alias="menuId", description="UUID сохранённого меню.")
+    created_at: datetime = Field(
+        alias="createdAt", description="Время создания задачи генерации в UTC."
+    )
+    recipes: list[MenuHistoryRecipeResponse] = Field(
+        description="Текущий состав меню. Порядок рецептов не гарантируется."
+    )
+
+
+class MenuHistoryResponse(BaseModel):
+    menus: list[MenuHistoryItemResponse] = Field(
+        description="Готовые меню пользователя, от новых к старым."
     )
