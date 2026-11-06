@@ -1,7 +1,8 @@
 import asyncio
 import json
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -11,8 +12,8 @@ import pytest
 from menu_samples import ollama_reply, sample_menu
 from opentelemetry.trace import NoOpTracer
 from prometheus_client import CollectorRegistry
-from sqlalchemy import func, select, text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy import func, select, text, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from receipes.api.dependencies import SqlTaskStore
 from receipes.config import Settings
@@ -26,7 +27,11 @@ from receipes.db.models import (
 )
 from receipes.db.repositories import FinishedTask, TaskRepository
 from receipes.dictionaries import Dictionaries
-from receipes.domain.errors import DictionaryError, PromptTemplateError
+from receipes.domain.errors import (
+    REPLACEMENT_TIMED_OUT,
+    DictionaryError,
+    PromptTemplateError,
+)
 from receipes.domain.params import GenerationParams
 from receipes.domain.status import TaskStatus
 from receipes.generation.metrics import GenerationMetrics
@@ -699,6 +704,170 @@ async def test_unexpected_exception_in_progress_fails_the_task_and_rolls_back_me
         assert await harness.count(model) == 0
 
 
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_locked_terminal_write_is_retried_until_release_or_cancellation(
+    ready: Factory, settings: Settings, cancel: bool
+) -> None:
+    first = await add_task(ready)
+    second = await add_task(ready)
+    delays: list[float] = []
+    retrying = asyncio.Event()
+    engine = create_async_engine(
+        settings.database_url,
+        connect_args={"server_settings": {"lock_timeout": "50ms"}},
+    )
+    try:
+        async with ready() as blocker:
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                if not delays:
+                    await blocker.execute(
+                        select(GenerationTask.task_id)
+                        .where(GenerationTask.task_id == first)
+                        .with_for_update()
+                    )
+                return good(request)
+
+            async def sleep(seconds: float) -> None:
+                delays.append(seconds)
+                if cancel:
+                    retrying.set()
+                    await asyncio.Future()
+                elif len(delays) == 7:
+                    await blocker.rollback()
+
+            worker_factory = async_sessionmaker(engine, expire_on_commit=False)
+            harness = rig(worker_factory, settings, handler, sleep)
+            if cancel:
+                async with asyncio.TaskGroup() as group:
+                    running = group.create_task(harness.worker.process_one())
+                    await asyncio.wait_for(retrying.wait(), timeout=3)
+                    running.cancel()
+                assert running.cancelled()
+                assert delays == [1]
+                assert (await harness.task(first)).status == TaskStatus.IN_PROGRESS
+                assert (await harness.task(second)).status == TaskStatus.PENDING
+                assert len(harness.requests) == 1
+            else:
+                assert await harness.worker.process_one() is True
+                failed = await harness.task(first)
+                assert (failed.status, failed.error, failed.menu_id) == (
+                    TaskStatus.FAILED,
+                    "Menu generation failed",
+                    None,
+                )
+                assert delays == [1, 2, 4, 8, 16, 30, 30]
+                assert await harness.worker.process_one() is True
+                assert (await harness.task(second)).status == TaskStatus.DONE
+                assert len(harness.requests) == 2
+                assert await harness.count(Menu) == 1
+    finally:
+        await engine.dispose()
+
+
+def interrupt_commit(
+    factory: Factory, transaction_number: int, *, committed: bool
+) -> Factory:
+    transactions = 0
+
+    class InterruptedCommitSession(AsyncSession):
+        @asynccontextmanager
+        async def begin(self) -> AsyncIterator[None]:
+            nonlocal transactions
+            transactions += 1
+            interrupted = transactions == transaction_number
+            async with super().begin():
+                yield
+                if interrupted and not committed:
+                    raise ConnectionError("commit outcome unknown")
+            if interrupted:
+                raise ConnectionError("commit acknowledgement lost")
+
+    return async_sessionmaker(
+        factory.kw["bind"], class_=InterruptedCommitSession, expire_on_commit=False
+    )
+
+
+@pytest.mark.parametrize(
+    ("interrupted_transaction", "committed", "expected"),
+    [
+        (1, False, TaskStatus.PENDING),
+        (1, True, TaskStatus.FAILED),
+        (3, True, TaskStatus.DONE),
+    ],
+    ids=["claim-rolled-back", "claim-committed", "done-committed"],
+)
+async def test_worker_handles_unknown_commit_outcome(
+    ready: Factory,
+    settings: Settings,
+    interrupted_transaction: int,
+    committed: bool,
+    expected: TaskStatus,
+) -> None:
+    task_id = await SqlTaskStore(ready).create(GenerationParams(4, Decimal("5000.50")))
+    worker_factory = interrupt_commit(
+        ready, interrupted_transaction, committed=committed
+    )
+    harness = rig(worker_factory, settings)
+    if expected == TaskStatus.DONE:
+        await harness.worker.process_one()
+    else:
+        # После сверки состояния сбой захвата должен запустить backoff итерации.
+        with pytest.raises(ConnectionError, match="commit"):
+            await harness.worker.process_one()
+    task = await harness.task(task_id)
+    assert task.status == expected
+    if expected == TaskStatus.FAILED:
+        assert task.error == "Menu generation failed"
+    if expected == TaskStatus.PENDING:
+        assert harness.requests == []
+        assert await harness.worker.process_one() is True
+        task = await harness.task(task_id)
+        assert task.status == TaskStatus.DONE
+    assert len(harness.requests) == (0 if expected == TaskStatus.FAILED else 1)
+    assert (task.menu_id is not None) == (task.status == TaskStatus.DONE)
+    assert await harness.count(Menu) == (0 if expected == TaskStatus.FAILED else 1)
+
+
+async def test_expired_replacement_after_claim_rollback_has_no_processing_time(
+    ready: Factory, settings: Settings
+) -> None:
+    source = await add_task(ready)
+    menu_worker = rig(ready, settings)
+    assert await menu_worker.worker.process_one() is True
+    menu_task = await menu_worker.task(source)
+    recipe_id = menu_task.menu.menu_recipes[0].recipe_id
+    async with ready() as session, session.begin():
+        task_id = await TaskRepository(session).create_replace(source, recipe_id)
+        assert task_id is not None
+        await session.execute(
+            update(GenerationTask)
+            .where(GenerationTask.task_id == task_id)
+            .values(created_at=text("clock_timestamp() - interval '1 minute'"))
+        )
+
+    worker_factory = interrupt_commit(ready, 1, committed=False)
+    harness = rig(worker_factory, settings, replace_wait_seconds=1)
+    with pytest.raises(ConnectionError, match="commit"):
+        await harness.worker.process_one()
+
+    task = await harness.task(task_id)
+    assert (task.status, task.error, task.result_recipe_id) == (
+        TaskStatus.FAILED,
+        REPLACEMENT_TIMED_OUT,
+        None,
+    )
+    assert harness.requests == []
+    labels = {"kind": "replace", "status": "failed"}
+    assert (
+        harness.sample("recipes_generation_task_duration_seconds_count", **labels) == 1
+    )
+    assert (
+        harness.sample("recipes_generation_task_processing_seconds_count", **labels)
+        == 0
+    )
+
+
 async def test_photo_from_the_model_is_never_stored(
     ready: Factory, settings: Settings
 ) -> None:
@@ -848,7 +1017,7 @@ async def test_metrics_endpoint_exposes_generation_series(
 
 
 async def test_started_application_runs_the_worker_and_stops_it_cleanly(
-    ready: Factory, settings: Settings
+    ready: Factory, settings: Settings, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from receipes.main import create_app
 
@@ -869,6 +1038,50 @@ async def test_started_application_runs_the_worker_and_stops_it_cleanly(
             await asyncio.sleep(0.05)
         else:
             raise AssertionError("worker did not finish the task")
+    assert "generation_worker_exited" not in capsys.readouterr().out
+    assert app.state.ollama._http.is_closed
+    assert app.state.dictionaries._http.is_closed
+
+
+@pytest.mark.parametrize("crash", [False, True])
+async def test_unexpected_worker_exit_is_logged_before_shutdown(
+    ready: Factory,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    crash: bool,
+) -> None:
+    from receipes.main import create_app
+
+    exited = asyncio.Event()
+
+    async def stop() -> None:
+        exited.set()
+        if crash:
+            raise RuntimeError("worker crashed")
+
+    config = settings.model_copy(update={"generation_worker_enabled": True})
+    app = create_app(config)
+    monkeypatch.setattr(app.state.worker, "run", stop)
+    async with app.router.lifespan_context(app):
+        await exited.wait()
+        await asyncio.sleep(0)
+        logs = [
+            json.loads(line)
+            for line in capsys.readouterr().out.splitlines()
+            if line.startswith("{")
+        ]
+        [exit_log] = [
+            log for log in logs if log["message"] == "generation_worker_exited"
+        ]
+        assert exit_log["level"] == "error"
+        assert (exit_log.get("exception", {}).get("type") == "RuntimeError") == crash
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            assert (await client.get("/health")).json() == {"status": "ok"}
+    assert app.state.ollama._http.is_closed
+    assert app.state.dictionaries._http.is_closed
 
 
 # SMAI-94: промпт сохраняется при создании задачи, а не только при захвате воркером.

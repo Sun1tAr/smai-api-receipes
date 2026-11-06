@@ -61,8 +61,8 @@ ADVISORY_LOCK_KEY = 7_460_520_004
 # Пауза между попытками взять занятый замок (режим standby), не интервал опроса.
 LOCK_RETRY_SECONDS = 10.0
 
-# Пауза после сбоя итерации (обычно БД): 1 -> 2 -> 4 -> ... -> 30 с, сброс при успехе.
-ITERATION_BACKOFF_MAX_SECONDS = 30.0
+# Пауза после сбоя итерации или записи failed: 1 -> 2 -> 4 -> ... -> 30 с.
+DB_BACKOFF_MAX_SECONDS = 30.0
 
 # Ошибки стороны Ollama: после них очередь не разбирается, пока Ollama не вернётся.
 OLLAMA_SIDE_ERRORS = (
@@ -214,8 +214,8 @@ class GenerationWorker:
             )
 
     def _iteration_delay(self) -> float:
-        delay = 2.0 ** (self._iteration_failures - 1)
-        return min(delay, ITERATION_BACKOFF_MAX_SECONDS)
+        exponent = min(self._iteration_failures - 1, 5)
+        return min(2.0**exponent, DB_BACKOFF_MAX_SECONDS)
 
     # Пока Ollama недоступна, ждём по нарастающей паузе, иначе обычный интервал.
     def _idle_delay(self) -> float:
@@ -272,8 +272,23 @@ class GenerationWorker:
                 self._ollama_failed()
                 return False
             self._ollama_probe_passed()
-        async with self._sessions() as session, session.begin():
-            claim = await TaskRepository(session).claim_next(menu_enabled=menu_enabled)
+        claim = None
+        try:
+            async with self._sessions() as session, session.begin():
+                claim = await TaskRepository(session).claim_next(
+                    menu_enabled=menu_enabled
+                )
+        except Exception:
+            if claim is None:
+                raise
+            # Захват мог сохраниться, даже если БД не подтвердила commit.
+            logger.error(
+                "generation_task_claim_not_confirmed",
+                task_id=str(claim.task_id),
+                exc_info=True,
+            )
+            await self._fail(claim, GENERATION_FAILED, perf_counter(), None)
+            raise
         if claim is None:
             return False
         task_id, claimed_at, kind = claim
@@ -472,32 +487,39 @@ class GenerationWorker:
         error: GenerationError | None = None,
     ) -> None:
         task_id, claimed_at, kind = claim
-        try:
-            async with self._sessions() as session, session.begin():
-                tasks = TaskRepository(session)
-                finished = None
-                if kind == TaskKind.REPLACE:
-                    finished = await tasks.expire_replace(
-                        task_id,
-                        self._settings.replace_wait_seconds,
-                        REPLACEMENT_TIMED_OUT,
-                    )
-                if finished is not None:
-                    message = REPLACEMENT_TIMED_OUT
-                else:
-                    finished = await tasks.mark_failed(task_id, message)
-        except Exception:
-            # Задачу подберёт восстановление при следующем старте.
-            logger.error(
-                "generation_task_fail_not_saved", task_id=str(task_id), exc_info=True
-            )
-            return
+        delay = 1.0
+        while True:
+            try:
+                async with self._sessions() as session, session.begin():
+                    tasks = TaskRepository(session)
+                    finished = None
+                    if kind == TaskKind.REPLACE:
+                        finished = await tasks.expire_replace(
+                            task_id,
+                            self._settings.replace_wait_seconds,
+                            REPLACEMENT_TIMED_OUT,
+                        )
+                    expired = finished is not None
+                    if not expired:
+                        finished = await tasks.mark_failed(task_id, message)
+            except Exception as write_error:
+                logger.error(
+                    "generation_task_fail_not_saved",
+                    task_id=str(task_id),
+                    retry_seconds=delay,
+                    error_type=type(write_error).__name__,
+                    exc_info=delay == 1.0,
+                )
+                await self._sleep(delay)
+                delay = min(delay * 2, DB_BACKOFF_MAX_SECONDS)
+            else:
+                break
         if finished is not None:
             self._metrics.observe_finished(
                 "failed",
                 finished.created_at,
                 finished.finished_at,
-                claimed_at,
+                finished.claimed_at if expired else claimed_at,
                 kind=kind,
             )
             self._record(
@@ -505,7 +527,7 @@ class GenerationWorker:
                 "failed",
                 started,
                 generated,
-                error=message,
+                error=REPLACEMENT_TIMED_OUT if expired else message,
                 counts=error,
             )
         else:

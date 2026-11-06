@@ -35,6 +35,10 @@ class McpError(Exception):
         self.code = code
 
 
+class _SessionExpired(McpError):
+    """The server rejected a tool call with an expired MCP session."""
+
+
 def _invalid_response() -> McpError:
     return McpError("Invalid MCP response", unavailable=True)
 
@@ -230,7 +234,10 @@ class McpClient:
     async def call(self, tool: str, arguments: dict) -> dict:
         params = {"name": tool, "arguments": arguments}
         if tool == CART_LINK_TOOL:
-            data, _ = await self._call_tool(params)
+            try:
+                data, _ = await self._call_tool(params)
+            except _SessionExpired:
+                data, _ = await self._call_tool(params)
             return data
 
         key = (
@@ -326,11 +333,16 @@ class McpClient:
                     expired = (
                         status == 404
                         and headers is not None
-                        and "Mcp-Session-Id" in headers
+                        and "Mcp-Session-Id" in response.request.headers
                     )
                     if expired and self._session_headers is headers:
                         self._session_headers = None
-                    raise McpError(
+                    error = (
+                        _SessionExpired
+                        if expired and method == "tools/call"
+                        else McpError
+                    )
+                    raise error(
                         "MCP HTTP request failed",
                         unavailable=True,
                         retryable=expired or status in _RETRYABLE_STATUS,

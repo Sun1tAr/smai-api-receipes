@@ -177,7 +177,7 @@ async def _match(
             data = await mcp.call(_DETAILS, {"id": product_id})
             product = _product(data, product_id, key)
             if product is None:
-                return CartMatch(ingredient=ingredient, error=_NOT_FOUND)
+                continue
             quantity = cart_quantity(
                 amount,
                 unit,
@@ -185,7 +185,8 @@ async def _match(
                 product.weight.value if product.weight else None,
             )
             if quantity is None:
-                return CartMatch(ingredient=ingredient, error=_INCOMPATIBLE)
+                incompatible = True
+                continue
             q, warning = quantity
             return CartMatch(
                 ingredient=ingredient, product=product, q=q, warning=warning

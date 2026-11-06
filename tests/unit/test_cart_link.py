@@ -36,23 +36,30 @@ async def make_client():
     apps = []
     clients = []
 
-    def make(reply=None, *, configured=True, **settings):
+    def make(reply=None, *, configured=True, session=True, **settings):
         seen = []
+        initialized = 0
+        session_id = None
 
         async def handle(request):
+            nonlocal initialized, session_id
             body = json.loads(request.content)
             seen.append(body)
             match body["method"]:
                 case "initialize":
+                    assert "Mcp-Session-Id" not in request.headers
+                    initialized += 1
+                    session_id = f"session-{initialized}" if session else None
                     return rpc_result(
                         body,
                         {"protocolVersion": "2025-03-26"},
-                        headers={"Mcp-Session-Id": "session-1"},
+                        headers={"Mcp-Session-Id": session_id} if session_id else {},
                     )
                 case "notifications/initialized":
+                    assert request.headers.get("Mcp-Session-Id") == session_id
                     return httpx.Response(202)
                 case "tools/call":
-                    assert request.headers["Mcp-Session-Id"] == "session-1"
+                    assert request.headers.get("Mcp-Session-Id") == session_id
                     return await reply(body)
             raise AssertionError(body)
 
@@ -190,7 +197,6 @@ async def test_rejects_invalid_provider_link(make_client, link):
         ("invalid_input", 422, 200, 503),
         ("invalid_input", "400", 200, 503),
         ("invalid_input", 400, 400, 503),
-        ("invalid_input", 400, 404, 503),
         ("invalid_input", 400, 503, 503),
     ],
 )
@@ -224,14 +230,82 @@ async def test_only_typed_business_refusal_is_400(
     assert len(seen) == 3
 
 
-async def test_indeterminate_network_failure_is_never_retried(make_client):
+@pytest.mark.parametrize("second_status", [200, 404])
+async def test_link_replays_once_after_session_expiry(make_client, second_status):
+    attempts = []
+
     async def reply(body):
-        raise httpx.ReadError("provider secret")
+        attempts.append(body)
+        if len(attempts) == 1 or second_status == 404:
+            return httpx.Response(404)
+        return tool_result(body, {"ok": True, "data": {"link": _LINK}})
+
+    client, seen, _ = make_client(reply, mcp_call_retries=0)
+    response = await client.post(_PATH, json={"items": _ITEMS})
+
+    assert response.status_code == (200 if second_status == 200 else 503)
+    if second_status == 200:
+        assert response.json() == {"link": _LINK}
+    assert [body["method"] for body in seen] == [
+        "initialize",
+        "notifications/initialized",
+        "tools/call",
+    ] * 2
+    assert attempts[0]["params"] == attempts[1]["params"]
+    assert attempts[0]["id"] != attempts[1]["id"]
+
+
+@pytest.mark.parametrize("failure", ["stateless", "business", "rpc"])
+async def test_link_does_not_replay_other_404_errors(make_client, failure):
+    async def reply(body):
+        error = {"http_status": 404, "retryable": True}
+        if failure == "stateless":
+            return httpx.Response(404)
+        if failure == "business":
+            return tool_result(body, {"ok": False, "error": error})
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "error": {"code": -32603, "message": "Tool failed", "data": error},
+            },
+        )
+
+    client, seen, _ = make_client(reply, session=failure != "stateless")
+    response = await client.post(_PATH, json={"items": _ITEMS})
+
+    assert response.status_code == 503
+    assert len(seen) == 3
+
+
+@pytest.mark.parametrize("error", [httpx.ReadError, httpx.ReadTimeout])
+async def test_indeterminate_transport_failure_is_never_retried(make_client, error):
+    async def reply(body):
+        raise error("provider secret")
 
     client, seen, _ = make_client(reply, mcp_call_retries=1)
     response = await client.post(_PATH, json={"items": _ITEMS})
     assert response.status_code == 503
     assert len(seen) == 3
+
+
+async def test_link_replay_shares_original_deadline(make_client):
+    attempts = 0
+
+    async def reply(body):
+        nonlocal attempts
+        attempts += 1
+        await asyncio.sleep(0.15)
+        if attempts == 1:
+            return httpx.Response(404)
+        return tool_result(body, {"ok": True, "data": {"link": _LINK}})
+
+    client, _, _ = make_client(reply, cart_deadline_seconds=0.25)
+    response = await asyncio.wait_for(client.post(_PATH, json={"items": _ITEMS}), 1)
+
+    assert attempts == 2
+    assert response.status_code == 503
 
 
 async def test_outer_deadline_includes_wait_for_shared_transport_slot(make_client):

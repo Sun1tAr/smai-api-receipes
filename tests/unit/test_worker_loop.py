@@ -90,8 +90,10 @@ async def test_a_processed_task_is_followed_by_the_next_without_pause() -> None:
     assert sleeps == [7] and next(answers, None) is None
 
 
+@pytest.mark.parametrize("failures", [7, 1100])
 async def test_iteration_failures_back_off_and_log_one_traceback_per_series(
     capsys: pytest.CaptureFixture[str],
+    failures: int,
 ) -> None:
     configure_logging("INFO")
     sleeps: list[float] = []
@@ -99,7 +101,7 @@ async def test_iteration_failures_back_off_and_log_one_traceback_per_series(
 
     async def sleep(seconds: float) -> None:
         sleeps.append(seconds)
-        if len(sleeps) == 9:
+        if len(sleeps) == failures + 2:
             raise StopLoop
 
     worker = make_worker(sleep)
@@ -107,7 +109,7 @@ async def test_iteration_failures_back_off_and_log_one_traceback_per_series(
     async def process() -> bool:
         nonlocal calls
         calls += 1
-        if calls <= 7:
+        if calls <= failures:
             raise ConnectionError("database is down")
         return False
 
@@ -115,15 +117,14 @@ async def test_iteration_failures_back_off_and_log_one_traceback_per_series(
     worker.process_one = process  # type: ignore[method-assign]
     with pytest.raises(StopLoop):
         await worker.run()
-    # 1, 2, 4, 8, 16, 30 (потолок), 30; затем успех: сброс и обычный интервал 7.
-    assert sleeps == [1, 2, 4, 8, 16, 30, 30, 7, 7]
+    assert sleeps == [1, 2, 4, 8, 16] + [30] * (failures - 5) + [7, 7]
     entries = log_lines(capsys.readouterr().out)
     errors = [item for item in entries if item["level"] == "error"]
-    assert len(errors) == 7
+    assert len(errors) == failures
     assert all(item["message"] == "generation_iteration_failed" for item in errors)
     assert "exception" in errors[0] or "exc_info" in errors[0]
     assert all("exception" not in item for item in errors[1:])
-    assert errors[-1]["consecutive_failures"] == 7
+    assert errors[-1]["consecutive_failures"] == failures
     assert errors[-1]["error_type"] == "ConnectionError"
 
 
