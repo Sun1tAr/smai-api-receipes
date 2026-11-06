@@ -63,8 +63,10 @@ class Scenario:
             return await self.replace()
         return httpx.Response(200, json=ollama_reply(sample_menu()))
 
-    async def menu(self) -> str:
-        response = await self.client.post("/generate-menu", json=MENU_REQUEST)
+    async def menu(self, *, headers: dict[str, str] | None = None) -> str:
+        response = await self.client.post(
+            "/generate-menu", json=MENU_REQUEST, headers=headers
+        )
         assert response.status_code == 202
         return response.json()["task_id"]
 
@@ -73,8 +75,10 @@ class Scenario:
         assert response.status_code == 200 and response.json()["status"] == "done"
         return {item["recipeId"]: item for item in response.json()["menu"]["recipes"]}
 
-    async def completed_menu(self) -> tuple[str, dict[str, Any]]:
-        task_id = await self.menu()
+    async def completed_menu(
+        self, *, headers: dict[str, str] | None = None
+    ) -> tuple[str, dict[str, Any]]:
+        task_id = await self.menu(headers=headers)
         assert await self.app.state.worker.process_one() is True
         return task_id, await self.recipes(task_id)
 
@@ -126,6 +130,42 @@ async def scenario(
     ):
         rig.client = client
         yield rig
+
+
+async def test_history_keeps_menu_identity_and_shows_current_recipes(
+    scenario: Scenario,
+) -> None:
+    task_id, original = await scenario.completed_menu(headers=OWNER)
+    before = await scenario.client.get("/profile/menus", headers=OWNER)
+    assert before.status_code == 200
+    [original_menu] = before.json()["menus"]
+    assert {recipe["recipeId"] for recipe in original_menu["recipes"]} == set(original)
+    old_id = next(iter(original))
+    async with asyncio.TaskGroup() as group:
+        posted = group.create_task(scenario.post_replace(task_id, old_id))
+        await scenario.wait_for_replacements()
+        assert await scenario.app.state.worker.process_one() is True
+    replacement = posted.result()
+    assert replacement.status_code == 200
+    new_recipe = replacement.json()["recipe"]
+    new_id = new_recipe["recipeId"]
+    assert new_id not in original
+
+    response = await scenario.client.get("/profile/menus", headers=OWNER)
+    assert response.status_code == 200
+    [menu] = response.json()["menus"]
+    assert menu["menuId"] == original_menu["menuId"]
+    assert menu["createdAt"] == original_menu["createdAt"]
+    expected_cards = {
+        card["recipeId"]: card
+        for card in original_menu["recipes"]
+        if card["recipeId"] != old_id
+    }
+    expected_cards[new_id] = {
+        field: new_recipe[field]
+        for field in ("recipeId", "name", "calories", "cookingTime")
+    }
+    assert {card["recipeId"]: card for card in menu["recipes"]} == expected_cards
 
 
 async def test_replacement_retries_invalid_model_output_then_updates_api2(

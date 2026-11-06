@@ -1,14 +1,24 @@
+from datetime import UTC
 from typing import Annotated, Any
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Request
 
 from receipes.api.dependencies import (
+    OWNER_HEADER,
     USER_ID_HEADER,
     TaskStore,
+    UserId,
     get_task_store,
     parse_user_id,
 )
-from receipes.api.schemas import SavedParametersResponse
+from receipes.api.schemas import (
+    MenuHistoryItemResponse,
+    MenuHistoryRecipeResponse,
+    MenuHistoryResponse,
+    SavedParametersResponse,
+)
+from receipes.db.repositories import MenuRepository
 from receipes.errors import ErrorResponse, error_response
 
 router = APIRouter(tags=["profile"])
@@ -101,6 +111,82 @@ async def get_saved_parameters(
         allergies=sorted(item.allergen_id for item in row.allergies),
         kitchenTools=sorted(item.kitchen_tool_id for item in row.kitchen_tools),
     )
+
+
+HISTORY_EXAMPLES = {
+    "history": {
+        "summary": "Есть готовые меню",
+        "value": {
+            "menus": [
+                {
+                    "menuId": "d94d77a7-90f6-46f5-ac10-e9b50545714c",
+                    "createdAt": "2026-11-01T12:00:00Z",
+                    "recipes": [
+                        {
+                            "recipeId": "b1e2c3d4-5678-90ab-cdef-1234567890ab",
+                            "name": "Омлет с томатами",
+                            "calories": 345.5,
+                            "cookingTime": 25,
+                        }
+                    ],
+                }
+            ]
+        },
+    },
+    "empty": {"summary": "Готовых меню нет", "value": {"menus": []}},
+}
+
+
+@router.get(
+    "/profile/menus",
+    summary="История меню пользователя (API-22)",
+    description=(
+        "Возвращает готовые меню пользователя из доверенного заголовка "
+        "`X-User-Id`. Меню отсортированы по убыванию времени создания задачи, "
+        "при равном времени — по убыванию UUID задачи. В составе меню "
+        "отображаются текущие рецепты с учётом замен. При отсутствии готовых "
+        "меню список пуст."
+    ),
+    response_model=MenuHistoryResponse,
+    openapi_extra=OWNER_HEADER,
+    responses={
+        200: {
+            "description": "Список готовых меню.",
+            "content": {"application/json": {"examples": HISTORY_EXAMPLES}},
+        },
+        401: {
+            "model": ErrorResponse,
+            "description": "`X-User-Id` отсутствует, некорректен или повторён.",
+            "content": {"application/json": {"example": UNAUTHORIZED_BODY}},
+        },
+        500: {
+            "model": ErrorResponse,
+            "description": "Внутренняя ошибка сервиса (например, недоступна база).",
+            "content": {"application/json": {"example": INTERNAL_BODY}},
+        },
+    },
+)
+async def list_menu_history(request: Request, user_id: UserId) -> MenuHistoryResponse:
+    async with request.app.state.session_factory() as session:
+        rows = await MenuRepository(session).list_history(user_id)
+    menus: dict[UUID, MenuHistoryItemResponse] = {}
+    for row in rows:
+        if row.task_id not in menus:
+            menus[row.task_id] = MenuHistoryItemResponse(
+                menuId=row.menu_id,
+                createdAt=row.created_at.astimezone(UTC),
+                recipes=[],
+            )
+        if row.recipe_id is not None:
+            menus[row.task_id].recipes.append(
+                MenuHistoryRecipeResponse(
+                    recipeId=row.recipe_id,
+                    name=row.name,
+                    calories=row.calories,
+                    cookingTime=row.cooking_time,
+                )
+            )
+    return MenuHistoryResponse(menus=list(menus.values()))
 
 
 # FastAPI вырезает null из примеров (exclude_none): примеры 200 подставляются целиком,

@@ -1,9 +1,9 @@
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Request
+from fastapi import APIRouter, Path, Request
 
-from receipes.api.dependencies import USER_ID_HEADER, parse_user_id
+from receipes.api.dependencies import OWNER_HEADER, UserId
 from receipes.api.schemas import (
     LikedRecipesResponse,
     LikeSuccessResponse,
@@ -57,32 +57,6 @@ CARD = {
 }
 
 
-# Заголовок проверяем вручную, чтобы при его отсутствии вернуть 401.
-OWNER_HEADER = {
-    "parameters": [
-        {
-            "name": USER_ID_HEADER,
-            "in": "header",
-            "required": True,
-            "description": (
-                "ID из проверенного токена. Gateway передаёт один заголовок "
-                "с целым числом от 1 до 2147483647."
-            ),
-            "schema": {"type": "string"},
-            "example": "42",
-        }
-    ]
-}
-
-
-def _require_user(request: Request) -> int:
-    user_id = parse_user_id(request.headers.getlist(USER_ID_HEADER))
-    if user_id is None:
-        raise HTTPException(status_code=401)
-    return user_id
-
-
-UserId = Annotated[int, Depends(_require_user)]
 RecipePath = Annotated[
     str,
     Path(

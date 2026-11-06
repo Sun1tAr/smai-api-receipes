@@ -485,6 +485,34 @@ class MenuRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    async def list_history(self, user_id: int) -> Sequence[Row]:
+        query = (
+            select(
+                GenerationTask.task_id,
+                Menu.id.label("menu_id"),
+                GenerationTask.created_at,
+                Recipe.id.label("recipe_id"),
+                Recipe.name,
+                Recipe.calories,
+                Recipe.cooking_time,
+            )
+            .select_from(GenerationTask)
+            .join(
+                GenerationParameters,
+                GenerationParameters.id == GenerationTask.parameters_id,
+            )
+            .join(Menu, Menu.id == GenerationTask.menu_id)
+            .outerjoin(MenuRecipe, MenuRecipe.menu_id == Menu.id)
+            .outerjoin(Recipe, Recipe.id == MenuRecipe.recipe_id)
+            .where(
+                GenerationParameters.user_id == user_id,
+                GenerationTask.kind == TaskKind.MENU,
+                GenerationTask.status == TaskStatus.DONE,
+            )
+            .order_by(GenerationTask.created_at.desc(), GenerationTask.task_id.desc())
+        )
+        return (await self._session.execute(query)).all()
+
     async def find_cart_recipe(self, recipe_id: UUID) -> Recipe | None:
         query = (
             select(Recipe)
