@@ -15,7 +15,8 @@ from receipes.cart.schemas import (
     CartResponse,
     CartWeight,
 )
-from receipes.domain.names import name_key
+from receipes.domain.names import normalize_name
+from receipes.generation.ollama import OllamaClient
 
 _SEARCH = "vkusvill_products_search"
 _DETAILS = "vkusvill_product_details"
@@ -23,55 +24,18 @@ _NOT_FOUND = "Товар не найден"
 _CATALOG_ERROR = "Каталог недоступен"
 _INCOMPATIBLE = "несовместимые единицы"
 _UNSUPPORTED_UNIT = "единица не конвертируется"
-
-# shortcut: узкие совпадения, расширять только по проверенным примерам каталога
-_FACET_ALIASES = {
-    "морковь": "овощи, фрукты, ягоды, зелень",
-    "молоко": "молоко, сливки",
-    "молоко безлактозное": "молоко, сливки",
-}
-_PACKAGE = re.compile(r"(?:\s*,\s*|\s+)\d+(?:[.,]\d+)?\s*(?:кг|гр?|мл|л|шт)\Z")
-_MILK_NAME = re.compile(
-    r"молоко(?: коровье)?(?P<lactose_free> безлактозное)?"
-    r"(?: цельное| пастеризованное| ультрапастеризованное)?"
-    r"(?: [0-9](?:[.,][0-9]+)?%)?(?: в бутылке)?"
-)
+_PERCENT = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:[-–—]\s*(\d+(?:[.,]\d+)?)\s*)?%")
 
 
 class CatalogUnavailable(Exception):
     pass
 
 
-def _category_id(data: dict[str, Any], ingredient: str) -> int | None:
-    facets = data.get("facets")
-    categories = facets.get("categories") if isinstance(facets, dict) else None
-    if not isinstance(categories, list):
-        return None
-    titles = {ingredient, _FACET_ALIASES.get(ingredient)}
-    matches = set()
-    for category in categories:
-        if not isinstance(category, dict):
-            continue
-        category_id = category.get("category_id")
-        if type(category_id) is not int or category_id <= 0:
-            continue
-        names = (category.get("category_name"), category.get("subcategory_name"))
-        if any(
-            isinstance(name, str) and name_key(unescape(name)) in titles
-            for name in names
-        ):
-            matches.add(category_id)
-    return matches.pop() if len(matches) == 1 else None
-
-
-def _name_matches(name: str, ingredient: str) -> bool:
-    title = _PACKAGE.sub("", name_key(unescape(name)))
-    if ingredient in ("молоко", "молоко безлактозное"):
-        milk = _MILK_NAME.fullmatch(title)
-        return milk is not None and bool(milk["lactose_free"]) == (
-            ingredient == "молоко безлактозное"
-        )
-    return title == ingredient or (ingredient == "морковь" and title == "морковь мытая")
+def _percentages(name: str) -> set[tuple[Decimal, Decimal]]:
+    return {
+        (Decimal(start.replace(",", ".")), Decimal((end or start).replace(",", ".")))
+        for start, end in _PERCENT.findall(normalize_name(unescape(name)))
+    }
 
 
 def _product_unit(value: Any) -> Unit | None:
@@ -90,7 +54,7 @@ def _number(value: Any) -> Decimal | None:
 
 
 def _product(
-    data: dict[str, Any], product_id: int, ingredient: str
+    data: dict[str, Any], product_id: int, candidate_title: str
 ) -> CartProduct | None:
     actual_id = data.get("id")
     title = data.get("name")
@@ -101,7 +65,8 @@ def _product(
         or actual_id != product_id
         or data.get("available", True) is not True
         or not isinstance(title, str)
-        or not _name_matches(title, ingredient)
+        or normalize_name(unescape(title)).casefold()
+        != normalize_name(unescape(candidate_title)).casefold()
         or unit is None
         or not isinstance(price, dict)
         or price.get("currency") != "RUB"
@@ -128,86 +93,106 @@ def _product(
     )
 
 
-async def _match(
+async def _search(
+    mcp: McpClient, ingredient: IngredientResponse
+) -> list[dict[str, Any]] | str | None:
+    try:
+        data = await mcp.call(
+            _SEARCH,
+            {
+                "q": ingredient.name,
+                "vvonly": 1,
+                "sort": "popularity",
+                "page": 1,
+                "mode": "custom",
+                "fields": ["id", "name", "price", "unit", "weight"],
+            },
+        )
+    except McpError as error:
+        return None if error.unavailable else _CATALOG_ERROR
+    items = data.get("items")
+    candidates = []
+    seen = set()
+    for item in items[:10] if isinstance(items, list) else ():
+        if not isinstance(item, dict):
+            continue
+        product_id, title = item.get("id"), item.get("name")
+        if (
+            type(product_id) is int
+            and 0 < product_id <= 999999999
+            and isinstance(title, str)
+            and title.strip()
+            and product_id not in seen
+        ):
+            title = unescape(title)
+            try:
+                title.encode("utf-8")
+            except UnicodeEncodeError:
+                continue
+            candidates.append({"id": product_id, "name": title})
+            seen.add(product_id)
+    return candidates
+
+
+async def _materialize(
     mcp: McpClient,
     ingredient: IngredientResponse,
-    amount: Decimal,
-    unit: Unit,
-) -> CartMatch | None:
-    key = name_key(ingredient.name)
-    query = {
-        "q": ingredient.name,
-        "vvonly": 1,
-        "sort": "popularity",
-        "page": 1,
-        "mode": "custom",
-        "fields": ["id", "name", "price", "unit", "weight"],
-    }
-    try:
-        first_search = await mcp.call(_SEARCH, query)
-    except McpError as error:
-        if error.unavailable:
-            # None означает сбой инфраструктуры до получения первого ответа.
-            return None
-        return CartMatch(ingredient=ingredient, error=_CATALOG_ERROR)
-
-    category_id = _category_id(first_search, key)
-    if category_id is None:
-        return CartMatch(ingredient=ingredient, error=_NOT_FOUND)
-    try:
-        second_search = await mcp.call(_SEARCH, {**query, "category_id": category_id})
-        items = second_search.get("items")
-        incompatible = False
-        for item in items[:10] if isinstance(items, list) else ():
-            if not isinstance(item, dict):
-                continue
-            title = item.get("name")
-            product_id = item.get("id")
-            if (
-                type(product_id) is not int
-                or product_id <= 0
-                or not isinstance(title, str)
-                or not _name_matches(title, key)
-            ):
-                continue
-            product_unit = _product_unit(item.get("unit"))
-            if product_unit is None or (unit == "шт" and product_unit != unit):
-                incompatible = True
-                continue
+    candidates: list[dict[str, Any]],
+    ids: tuple[int, ...],
+) -> CartMatch:
+    amount, unit = normalize_quantity(ingredient.quantity, ingredient.unit)
+    titles = {item["id"]: item["name"] for item in candidates}
+    incompatible = False
+    catalog_error = False
+    required_percentages = _percentages(ingredient.name)
+    for product_id in ids:
+        if (
+            required_percentages
+            and _percentages(titles[product_id]) != required_percentages
+        ):
+            continue
+        try:
             data = await mcp.call(_DETAILS, {"id": product_id})
-            product = _product(data, product_id, key)
-            if product is None:
-                continue
-            quantity = cart_quantity(
-                amount,
-                unit,
-                product.unit,
-                product.weight.value if product.weight else None,
-            )
-            if quantity is None:
-                incompatible = True
-                continue
-            q, warning = quantity
-            return CartMatch(
-                ingredient=ingredient, product=product, q=q, warning=warning
-            )
-        return CartMatch(
-            ingredient=ingredient, error=_INCOMPATIBLE if incompatible else _NOT_FOUND
+        except McpError:
+            catalog_error = True
+            continue
+        product = _product(data, product_id, titles[product_id])
+        if product is None:
+            continue
+        quantity = cart_quantity(
+            amount,
+            unit,
+            product.unit,
+            product.weight.value if product.weight else None,
         )
-    except McpError:
-        return CartMatch(ingredient=ingredient, error=_CATALOG_ERROR)
+        if quantity is None:
+            incompatible = True
+            continue
+        q, warning = quantity
+        return CartMatch(ingredient=ingredient, product=product, q=q, warning=warning)
+    return CartMatch(
+        ingredient=ingredient,
+        error=_INCOMPATIBLE
+        if incompatible
+        else (_CATALOG_ERROR if catalog_error else _NOT_FOUND),
+    )
 
 
 async def build_cart(
-    mcp: McpClient, ingredients: list[IngredientResponse], deadline: float
+    mcp: McpClient,
+    ollama: OllamaClient,
+    ingredients: list[IngredientResponse],
+    deadline: float,
 ) -> CartResponse:
     loop = asyncio.get_running_loop()
     matches: list[CartMatch] = []
-    jobs: dict[int, asyncio.Task[CartMatch | None]] = {}
+    searches = {}
+    search_deadline = min(
+        deadline, loop.time() + min(10, max(0, deadline - loop.time()) * 2 / 7)
+    )
     async with asyncio.TaskGroup() as group:
         for index, ingredient in enumerate(ingredients):
-            amount = normalize_quantity(ingredient.quantity, ingredient.unit)
-            if amount is None:
+            if normalize_quantity(ingredient.quantity, ingredient.unit) is None:
                 matches.append(
                     CartMatch(ingredient=ingredient, error=_UNSUPPORTED_UNIT)
                 )
@@ -215,26 +200,73 @@ async def build_cart(
             matches.append(
                 CartMatch(ingredient=ingredient, error="Время поиска истекло")
             )
-            if loop.time() < deadline:
-                jobs[index] = group.create_task(_match(mcp, ingredient, *amount))
-        if jobs:
+            if loop.time() < search_deadline:
+                searches[index] = group.create_task(_search(mcp, ingredient))
+        if searches:
             _, pending = await asyncio.wait(
-                jobs.values(), timeout=max(0, deadline - loop.time())
+                searches.values(), timeout=max(0, search_deadline - loop.time())
             )
             for job in pending:
                 job.cancel()
 
     unavailable = 0
-    for index, job in jobs.items():
+    positions = []
+    for index, job in searches.items():
         if job.cancelled():
-            continue
-        row = job.result()
-        if row is None:
             unavailable += 1
-            row = CartMatch(ingredient=ingredients[index], error=_CATALOG_ERROR)
-        matches[index] = row
-    if jobs and unavailable == len(jobs):
+            continue
+        candidates = job.result()
+        if candidates is None:
+            unavailable += 1
+            matches[index].error = _CATALOG_ERROR
+        elif isinstance(candidates, str):
+            matches[index].error = candidates
+        elif not candidates:
+            matches[index].error = _NOT_FOUND
+        else:
+            positions.append(
+                {
+                    "index": index,
+                    "ingredient": ingredients[index].name,
+                    "candidates": candidates,
+                }
+            )
+    if searches and unavailable == len(searches):
         raise CatalogUnavailable
+
+    if positions:
+        remaining = max(0, deadline - loop.time())
+        # Reserve up to 10s for a details call and its existing MCP retry.
+        model_deadline = loop.time() + min(
+            15, max(0, remaining - min(10, remaining * 0.4))
+        )
+        selections = await ollama.match_cart(positions, model_deadline)
+        jobs = {}
+        async with asyncio.TaskGroup() as group:
+            for position in positions:
+                index = position["index"]
+                selection = selections[index]
+                if selection.error:
+                    matches[index].error = selection.error
+                elif loop.time() < deadline:
+                    matches[index].error = "Время проверки товара истекло"
+                    jobs[index] = group.create_task(
+                        _materialize(
+                            mcp,
+                            ingredients[index],
+                            position["candidates"],
+                            selection.ids,
+                        )
+                    )
+            if jobs:
+                _, pending = await asyncio.wait(
+                    jobs.values(), timeout=max(0, deadline - loop.time())
+                )
+                for job in pending:
+                    job.cancel()
+        for index, job in jobs.items():
+            if not job.cancelled():
+                matches[index] = job.result()
 
     unmatched_count = sum(row.error is not None for row in matches)
     total = sum(

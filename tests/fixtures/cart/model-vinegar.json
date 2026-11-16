@@ -1,0 +1,12 @@
+{
+  "source": "qwen2.5:7b live holdout, 2026-11-16; raw response preserved",
+  "done": true,
+  "response": "{\n  \"matches\": [\n    {\n      \"index\": 0,\n      \"ids\": [92787]\n    },\n    {\n      \"index\": 1,\n      \"ids\": null\n    },\n    {\n      \"index\": 2,\n      \"ids\": [71556, 24574, 113674]\n    }\n  ]\n}",
+  "done_reason": "stop",
+  "total_duration": 1549519986,
+  "load_duration": 16264359,
+  "prompt_eval_count": 592,
+  "prompt_eval_duration": 40497052,
+  "eval_count": 86,
+  "eval_duration": 1491537260
+}

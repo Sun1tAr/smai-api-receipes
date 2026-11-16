@@ -99,22 +99,10 @@ async def test_cart_uses_saved_recipe_origin_and_done_status(settings, session_f
                 }
             else:
                 assert tool == "vkusvill_products_search"
-                if "category_id" in arguments:
-                    assert arguments["category_id"] == 287
-                    data = {"items": [{"id": 606, "name": "Морковь", "unit": "кг"}]}
-                else:
-                    data = {
-                        "items": [],
-                        "facets": {
-                            "categories": [
-                                {
-                                    "category_id": 287,
-                                    "category_name": "Овощи, фрукты, ягоды, зелень",
-                                    "subcategory_name": "",
-                                }
-                            ]
-                        },
-                    }
+                data = {
+                    "items": [{"id": 606, "name": "Морковь", "unit": "кг"}],
+                    "facets": {"categories": []},
+                }
             result = {
                 "isError": False,
                 "content": [
@@ -128,7 +116,27 @@ async def test_cart_uses_saved_recipe_origin_and_done_status(settings, session_f
     settings = settings.model_copy(
         update={"vkusvill_mcp_url": AnyHttpUrl("http://catalog.test/mcp")}
     )
-    app = create_app(settings, mcp_transport=httpx.MockTransport(catalog))
+
+    def model(request):
+        body = json.loads(request.content)
+        positions = json.loads(body["prompt"].split("\nDATA\n", 1)[1])["positions"]
+        assert positions == [
+            {
+                "index": 0,
+                "ingredient": "Морковь",
+                "candidates": [{"id": 606, "name": "Морковь"}],
+            }
+        ]
+        return httpx.Response(
+            200,
+            json={"done": True, "response": '{"matches":[{"index":0,"ids":[606]}]}'},
+        )
+
+    app = create_app(
+        settings,
+        mcp_transport=httpx.MockTransport(catalog),
+        ollama_transport=httpx.MockTransport(model),
+    )
     async with app.router.lifespan_context(app):
         assert calls == []
         async with httpx.AsyncClient(
@@ -169,7 +177,6 @@ async def test_cart_uses_saved_recipe_origin_and_done_status(settings, session_f
     assert calls == [
         "initialize",
         "notifications/initialized",
-        "tools/call",
         "tools/call",
         "tools/call",
         "tools/call",

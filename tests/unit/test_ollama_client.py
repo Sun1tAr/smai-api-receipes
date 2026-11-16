@@ -316,3 +316,208 @@ async def test_model_presence_is_checked_in_tags(payload: dict, expected: bool) 
 async def test_tags_that_are_not_json_do_not_pass_the_model_check() -> None:
     client, _ = make_client(lambda r: httpx.Response(200, text="<html>"))
     assert await client.is_available(require_model=True) is False
+
+
+CART_POSITIONS = [
+    {
+        "index": 0,
+        "ingredient": "кумин молотый",
+        "candidates": [{"id": 915, "name": "Зира молотая"}],
+    }
+]
+
+
+async def test_cart_uses_own_schema_and_configured_model_without_menu_parser():
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["model"] == "chosen:model"
+        assert body["keep_alive"] == "30m"
+        assert body["options"] == {
+            "num_ctx": 8192,
+            "num_predict": 1024,
+            "temperature": 0,
+        }
+        positions = json.loads(body["prompt"].split("\nDATA\n", 1)[1])["positions"]
+        assert positions == CART_POSITIONS
+        answer = {"matches": [{"index": 0, "ids": [915]}]}
+        validate(answer, body["format"])
+        return httpx.Response(200, json={"done": True, "response": json.dumps(answer)})
+
+    client, _ = make_client(handler, ollama_model="chosen:model")
+    result = await client.match_cart(
+        CART_POSITIONS, asyncio.get_running_loop().time() + 1
+    )
+    assert result[0].ids == (915,) and result[0].error is None
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        {"done": False, "response": '{"matches":[{"index":0,"ids":[915]}]}'},
+        {
+            "done": True,
+            "done_reason": "length",
+            "response": '{"matches":[{"index":0,"ids":[915]}]}',
+        },
+        {"done": True, "response": "not json"},
+        {"done": True, "response": "[]"},
+        [],
+    ],
+)
+async def test_cart_never_accepts_incomplete_or_malformed_model_response(wire):
+    client, _ = make_client(lambda r: httpx.Response(200, json=wire))
+    result = await client.match_cart(
+        CART_POSITIONS, asyncio.get_running_loop().time() + 1
+    )
+    assert result[0].ids == () and result[0].error
+
+
+async def test_cart_busy_during_generation_and_generation_survives():
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def handler(request):
+        entered.set()
+        await finish.wait()
+        return ok(request)
+
+    client, _ = make_client(handler)
+    generation = asyncio.create_task(client.generate_menu("x"))
+    await entered.wait()
+    result = await asyncio.wait_for(
+        client.match_cart(CART_POSITIONS, asyncio.get_running_loop().time() + 1), 0.1
+    )
+    assert result[0].ids == () and result[0].error == "Модель сопоставления занята"
+    finish.set()
+    assert len((await generation).menu.recipes) == 3
+
+
+async def test_cart_timeout_cancels_transport_and_releases_admission():
+    cancelled = asyncio.Event()
+
+    async def handler(request):
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    client, _ = make_client(handler)
+    result = await client.match_cart(
+        CART_POSITIONS, asyncio.get_running_loop().time() + 0.01
+    )
+    assert result[0].error == "Время сопоставления истекло"
+    assert cancelled.is_set()
+    assert not client._inference.locked()
+
+
+async def test_cart_and_generation_serialize_on_same_client():
+    entered, finish = asyncio.Event(), asyncio.Event()
+    generation_entered = asyncio.Event()
+
+    async def handler(request):
+        body = json.loads(request.content)
+        if body["prompt"] == "menu":
+            generation_entered.set()
+            return ok(request)
+        entered.set()
+        await finish.wait()
+        return httpx.Response(
+            200,
+            json={"done": True, "response": '{"matches":[{"index":0,"ids":[915]}]}'},
+        )
+
+    client, _ = make_client(handler)
+    cart = asyncio.create_task(
+        client.match_cart(CART_POSITIONS, asyncio.get_running_loop().time() + 1)
+    )
+    await entered.wait()
+    generation = asyncio.create_task(client.generate_menu("menu"))
+    await asyncio.sleep(0)
+    assert not generation_entered.is_set()
+    finish.set()
+    assert (await cart)[0].ids == (915,)
+    assert len((await generation).menu.recipes) == 3
+
+
+async def test_cart_prompt_bound_keeps_full_names_and_reports_each_overflow():
+    sent = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        sent.append(body)
+        positions = json.loads(body["prompt"].split("\nDATA\n", 1)[1])["positions"]
+        assert all(
+            row["candidates"][0]["name"] == "Молоко безлактозное, 900 мл"
+            for row in positions
+        )
+        return httpx.Response(
+            200,
+            json={
+                "done": True,
+                "response": json.dumps(
+                    {
+                        "matches": [
+                            {"index": row["index"], "ids": [103297]}
+                            for row in positions
+                        ]
+                    }
+                ),
+            },
+        )
+
+    positions = [
+        {
+            "index": i,
+            "ingredient": "молоко безлактозное",
+            "candidates": [{"id": 103297, "name": "Молоко безлактозное, 900 мл"}],
+        }
+        for i in range(50)
+    ]
+    positions.insert(
+        0,
+        {
+            "index": 50,
+            "ingredient": "а" * 10000,
+            "candidates": [{"id": 1, "name": "Молоко"}],
+        },
+    )
+    client, _ = make_client(handler)
+    result = await client.match_cart(positions, asyncio.get_running_loop().time() + 1)
+    assert len(result) == 51
+    assert result[50].error == "Превышен лимит сопоставления"
+    assert 1 <= sum(row.error is None for row in result.values()) <= 12
+    assert result[49].error == "Превышен лимит сопоставления"
+    assert len(sent) == 1
+    assert (
+        len(sent[0]["prompt"].encode()) + len(json.dumps(sent[0]["format"]).encode())
+        <= 6000
+    )
+
+
+async def test_expired_cart_budget_does_not_start_inference():
+    def forbidden(request):
+        pytest.fail("expired cart must not send an inference request")
+
+    client, _ = make_client(forbidden)
+    result = await client.match_cart(
+        CART_POSITIONS, asyncio.get_running_loop().time() - 1
+    )
+    assert result[0].error == "Время сопоставления истекло"
+
+
+async def test_cancelling_cart_releases_lock_without_sending_another_request():
+    entered = asyncio.Event()
+
+    async def handler(request):
+        entered.set()
+        await asyncio.Future()
+
+    client, _ = make_client(handler)
+    task = asyncio.create_task(
+        client.match_cart(CART_POSITIONS, asyncio.get_running_loop().time() + 1)
+    )
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not client._inference.locked()
+    assert client._generation_pending == 0
