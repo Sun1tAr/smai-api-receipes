@@ -16,6 +16,7 @@ from receipes.api.schemas import (
     MenuHistoryItemResponse,
     MenuHistoryRecipeResponse,
     MenuHistoryResponse,
+    NutritionResponse,
     SavedParametersResponse,
 )
 from receipes.db.repositories import MenuRepository
@@ -126,6 +127,12 @@ HISTORY_EXAMPLES = {
                             "recipeId": "b1e2c3d4-5678-90ab-cdef-1234567890ab",
                             "name": "Омлет с томатами",
                             "calories": 345.5,
+                            "nutrition": {
+                                "calories": 340,
+                                "proteins": 20.5,
+                                "fats": 24,
+                                "carbohydrates": 10.5,
+                            },
                             "cookingTime": 25,
                         }
                     ],
@@ -145,7 +152,8 @@ HISTORY_EXAMPLES = {
         "`X-User-Id`. Меню отсортированы по убыванию времени создания задачи, "
         "при равном времени — по убыванию UUID задачи. В составе меню "
         "отображаются текущие рецепты с учётом замен. При отсутствии готовых "
-        "меню список пуст."
+        "меню список пуст. Рецепты содержат сохранённые КБЖУ одной порции "
+        "в `nutrition`; основная калорийность — `nutrition.calories`."
     ),
     response_model=MenuHistoryResponse,
     openapi_extra=OWNER_HEADER,
@@ -183,6 +191,12 @@ async def list_menu_history(request: Request, user_id: UserId) -> MenuHistoryRes
                     recipeId=row.recipe_id,
                     name=row.name,
                     calories=row.calories,
+                    nutrition=NutritionResponse(
+                        calories=row.nutrition_calories,
+                        proteins=row.proteins,
+                        fats=row.fats,
+                        carbohydrates=row.carbohydrates,
+                    ),
                     cookingTime=row.cooking_time,
                 )
             )

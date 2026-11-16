@@ -495,6 +495,10 @@ class MenuRepository:
                 Recipe.name,
                 Recipe.calories,
                 Recipe.cooking_time,
+                Nutrition.calories.label("nutrition_calories"),
+                Nutrition.proteins,
+                Nutrition.fats,
+                Nutrition.carbohydrates,
             )
             .select_from(GenerationTask)
             .join(
@@ -504,6 +508,7 @@ class MenuRepository:
             .join(Menu, Menu.id == GenerationTask.menu_id)
             .outerjoin(MenuRecipe, MenuRecipe.menu_id == Menu.id)
             .outerjoin(Recipe, Recipe.id == MenuRecipe.recipe_id)
+            .outerjoin(Nutrition, Nutrition.id == Recipe.nutrition_id)
             .where(
                 GenerationParameters.user_id == user_id,
                 GenerationTask.kind == TaskKind.MENU,
