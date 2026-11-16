@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 from opentelemetry.trace import Tracer
 
+from receipes.cart import matching
 from receipes.config import Settings
 from receipes.domain.errors import (
     GenerationError,
@@ -109,6 +110,8 @@ class OllamaClient:
         self._http = http
         self._metrics = metrics
         self._tracer = tracer
+        self._inference = asyncio.Lock()
+        self._generation_pending = 0
 
     # httpx считает read-таймаут на каждое чтение, а не на вызов, поэтому общий
     # потолок задаётся отдельно (asyncio.timeout).
@@ -145,8 +148,12 @@ class OllamaClient:
 
     # Запрос к Ollama; ошибки приводятся к безопасным текстам GenerationError.
     async def _post(self, prompt: str, kind: TaskKind) -> dict[str, Any]:
+        self._generation_pending += 1
         try:
-            async with asyncio.timeout(self._settings.ollama_timeout_seconds):
+            async with (
+                asyncio.timeout(self._settings.ollama_timeout_seconds),
+                self._inference,
+            ):
                 response = await self._http.post(
                     "/api/generate", json=self._request_body(prompt, kind)
                 )
@@ -155,6 +162,8 @@ class OllamaClient:
         except httpx.TransportError:
             # Нет соединения, обрыв, таймаут подключения: нейроядро недоступно.
             raise NeurocoreUnavailable from None
+        finally:
+            self._generation_pending -= 1
         status = response.status_code
         if status == 503:
             raise NeurocoreUnavailable
@@ -216,6 +225,64 @@ class OllamaClient:
             prompt_eval_count=_count(body, "prompt_eval_count"),
             eval_count=_count(body, "eval_count"),
         )
+
+    async def match_cart(
+        self, positions: list[dict[str, Any]], deadline: float
+    ) -> dict[int, matching.Selection]:
+        prompt, included, result = matching.prepare_batch(
+            positions, self._settings.ollama_num_ctx
+        )
+        if not included:
+            return result
+        error = None
+        if asyncio.get_running_loop().time() >= deadline:
+            error = "Время сопоставления истекло"
+        elif self._inference.locked() or self._generation_pending:
+            error = "Модель сопоставления занята"
+        else:
+            settings = self._settings
+            try:
+                async with asyncio.timeout_at(deadline), self._inference:
+                    response = await self._http.post(
+                        "/api/generate",
+                        json={
+                            "model": settings.ollama_model,
+                            "prompt": prompt,
+                            "stream": False,
+                            "format": matching.RESPONSE_FORMAT,
+                            "options": {
+                                "num_ctx": settings.ollama_num_ctx,
+                                "num_predict": matching.OUTPUT_TOKENS,
+                                "temperature": 0,
+                            },
+                            "keep_alive": settings.ollama_keep_alive,
+                        },
+                    )
+                if response.status_code != 200:
+                    error = "Модель сопоставления недоступна"
+                else:
+                    body = response.json()
+                    if (
+                        not isinstance(body, dict)
+                        or body.get("done") is not True
+                        or body.get("done_reason") == "length"
+                    ):
+                        error = matching.MODEL_ERROR
+                    else:
+                        result.update(
+                            matching.parse_selections(body.get("response"), included)
+                        )
+            except (TimeoutError, httpx.TimeoutException):
+                error = "Время сопоставления истекло"
+            except httpx.HTTPError:
+                error = "Модель сопоставления недоступна"
+            except ValueError:
+                error = matching.MODEL_ERROR
+        if error is not None:
+            result.update(
+                {row["index"]: matching.Selection(error=error) for row in included}
+            )
+        return result
 
     @staticmethod
     def _parse(
