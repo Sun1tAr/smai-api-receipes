@@ -82,6 +82,12 @@ async def test_history_contains_only_owned_completed_menus_in_creation_order(
 ) -> None:
     async with session_factory() as session, session.begin():
         nutrition = Nutrition(calories=100, proteins=10, fats=5, carbohydrates=20)
+        fractional_nutrition = Nutrition(
+            calories=Decimal("123.75"),
+            proteins=Decimal("10.25"),
+            fats=Decimal("5.5"),
+            carbohydrates=Decimal("20.75"),
+        )
         recipes = [
             Recipe(
                 id=UUID(int=100),
@@ -95,7 +101,7 @@ async def test_history_contains_only_owned_completed_menus_in_creation_order(
                 name="Суп",
                 calories=Decimal("321.25"),
                 cooking_time=Decimal("25.5"),
-                nutrition=nutrition,
+                nutrition=fractional_nutrition,
             ),
         ]
         session.add_all(recipes)
@@ -149,12 +155,24 @@ async def test_history_contains_only_owned_completed_menus_in_creation_order(
             "recipeId": str(UUID(int=100)),
             "name": "Салат",
             "calories": 200,
+            "nutrition": {
+                "calories": 100,
+                "proteins": 10,
+                "fats": 5,
+                "carbohydrates": 20,
+            },
             "cookingTime": 10,
         },
         {
             "recipeId": str(UUID(int=101)),
             "name": "Суп",
             "calories": 321.25,
+            "nutrition": {
+                "calories": 123.75,
+                "proteins": 10.25,
+                "fats": 5.5,
+                "carbohydrates": 20.75,
+            },
             "cookingTime": 25.5,
         },
     ]
@@ -172,6 +190,9 @@ async def test_history_contains_only_owned_completed_menus_in_creation_order(
             for field in ("calories", "cookingTime"):
                 assert type(integer[field]) is int
                 assert type(fractional[field]) is float
+            for field in ("calories", "proteins", "fats", "carbohydrates"):
+                assert type(integer["nutrition"][field]) is int
+                assert type(fractional["nutrition"][field]) is float
 
     response = await client.get(PATH, headers=OTHER)
     assert response.status_code == 200

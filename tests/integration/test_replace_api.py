@@ -135,6 +135,19 @@ async def scenario(
 async def test_history_keeps_menu_identity_and_shows_current_recipes(
     scenario: Scenario,
 ) -> None:
+    replacement_nutrition = {
+        "calories": 420.5,
+        "proteins": 31.25,
+        "fats": 12.5,
+        "carbohydrates": 46.75,
+    }
+
+    async def model() -> httpx.Response:
+        recipe = sample_recipe("Омлет с томатами", "Яйцо", "Томаты")
+        recipe["nutrition"] = replacement_nutrition
+        return httpx.Response(200, json=ollama_reply({"recipes": [recipe]}))
+
+    scenario.replace = model
     task_id, original = await scenario.completed_menu(headers=OWNER)
     before = await scenario.client.get("/profile/menus", headers=OWNER)
     assert before.status_code == 200
@@ -148,6 +161,7 @@ async def test_history_keeps_menu_identity_and_shows_current_recipes(
     replacement = posted.result()
     assert replacement.status_code == 200
     new_recipe = replacement.json()["recipe"]
+    assert new_recipe["nutrition"] == replacement_nutrition
     new_id = new_recipe["recipeId"]
     assert new_id not in original
 
@@ -163,7 +177,7 @@ async def test_history_keeps_menu_identity_and_shows_current_recipes(
     }
     expected_cards[new_id] = {
         field: new_recipe[field]
-        for field in ("recipeId", "name", "calories", "cookingTime")
+        for field in ("recipeId", "name", "calories", "nutrition", "cookingTime")
     }
     assert {card["recipeId"]: card for card in menu["recipes"]} == expected_cards
 

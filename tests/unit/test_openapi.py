@@ -319,7 +319,22 @@ async def test_menu_history_documents_owner_and_success_examples(app) -> None:
     assert {"menus": []} in examples
     [menu] = next(example["menus"] for example in examples if example["menus"])
     assert set(menu) == {"menuId", "createdAt", "recipes"}
-    assert set(menu["recipes"][0]) == {"recipeId", "name", "calories", "cookingTime"}
+    recipe_schema = document["components"]["schemas"]["MenuHistoryRecipeResponse"]
+    assert "nutrition" in recipe_schema["required"]
+    nutrition_schema = document["components"]["schemas"]["NutritionResponse"]
+    assert set(nutrition_schema["required"]) == {
+        "calories",
+        "proteins",
+        "fats",
+        "carbohydrates",
+    }
+    assert set(menu["recipes"][0]) == {
+        "recipeId",
+        "name",
+        "calories",
+        "nutrition",
+        "cookingTime",
+    }
     for example in examples:
         jsonschema.validate(
             example,

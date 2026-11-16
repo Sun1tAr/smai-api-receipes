@@ -289,7 +289,14 @@ class SavedParametersResponse(BaseModel):
 class MenuHistoryRecipeResponse(BaseModel):
     recipe_id: UUID = Field(alias="recipeId", description="UUID рецепта.")
     name: str = Field(description="Название блюда.")
-    calories: Number = Field(description="Калорийность одной порции, ккал.")
+    calories: Number = Field(
+        description=(
+            "Калорийность одной порции, ккал, как её вернула модель. Может "
+            "расходиться с `nutrition.calories`; основным считайте "
+            "`nutrition.calories`."
+        )
+    )
+    nutrition: NutritionResponse = Field(description="КБЖУ одной порции.")
     cooking_time: Number = Field(
         alias="cookingTime", description="Время приготовления, минут."
     )
