@@ -1,0 +1,343 @@
+import httpx
+import jsonschema
+import pytest
+from fakes import unavailable_db_settings
+
+
+@pytest.fixture
+async def app():
+    from receipes.main import create_app
+
+    app = create_app(unavailable_db_settings())
+    yield app
+    await app.state.engine.dispose()
+    app.state.tracer_provider.shutdown()
+
+
+async def test_docs_and_schema_are_served(app) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        docs = await client.get("/docs")
+        schema = await client.get("/openapi.json")
+    assert docs.status_code == 200
+    assert schema.status_code == 200
+    document = schema.json()
+    assert document["info"]["title"] == "SmartMeal recipes service"
+    assert document["info"]["version"] == "0.1.0"
+    assert document["info"]["description"]
+
+
+async def test_health_is_fully_documented_and_metrics_is_hidden(app) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        document = (await client.get("/openapi.json")).json()
+    assert set(document["paths"]) == {
+        "/health",
+        "/generate-menu",
+        "/generate-menu/{task_id}",
+        "/generate-menu/{task_id}/replace-recipe",
+        "/profile/parameters",
+        "/profile/menus",
+        "/recipes/{recipe_id}/like",
+        "/recipes/liked",
+        "/recipes/cart",
+        "/recipes/cart/link",
+    }
+    operation = document["paths"]["/health"]["get"]
+    assert operation["summary"]
+    assert operation["description"]
+    assert set(operation["responses"]) == {"200", "503"}
+    ok = operation["responses"]["200"]["content"]["application/json"]
+    error = operation["responses"]["503"]["content"]["application/json"]
+    assert error["example"]["error"]["code"] == "INTERNAL_ERROR"
+    schemas = document["components"]["schemas"]
+    health_schema = schemas["HealthResponse"]
+    assert health_schema["example"] == {"status": "ok"}
+    assert ok["schema"]["$ref"].endswith("/HealthResponse")
+    assert error["schema"]["$ref"].endswith("/ErrorResponse")
+    # Примеры должны соответствовать собственным схемам.
+    jsonschema.validate(health_schema["example"], health_schema)
+    error_schema = schemas["ErrorResponse"]
+    jsonschema.validate(
+        error["example"], {**error_schema, "components": {"schemas": schemas}}
+    )
+
+
+# Для каждого эндпоинта: summary, description, коды ответов и примеры по схемам.
+EXPECTED_CODES = {
+    ("/health", "get"): {"200", "503"},
+    ("/generate-menu", "post"): {"202", "400", "500"},
+    ("/generate-menu/{task_id}", "get"): {"200", "404", "500"},
+    ("/generate-menu/{task_id}/replace-recipe", "post"): {"200", "400", "404", "500"},
+    ("/profile/parameters", "get"): {"200", "401", "500"},
+    ("/profile/menus", "get"): {"200", "401", "500"},
+    ("/recipes/{recipe_id}/like", "post"): {"200", "401", "404", "409", "500"},
+    ("/recipes/{recipe_id}/like", "delete"): {"200", "401", "404", "500"},
+    ("/recipes/liked", "get"): {"200", "401", "500"},
+    ("/recipes/cart", "post"): {"200", "400", "404", "500", "503"},
+    ("/recipes/cart/link", "post"): {"200", "400", "500", "503"},
+}
+
+
+async def test_every_operation_is_documented_with_exact_error_codes(app) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        document = (await client.get("/openapi.json")).json()
+    schemas = document["components"]["schemas"]
+    assert "HTTPValidationError" not in schemas
+    operations = {
+        (path, method): operation
+        for path, item in document["paths"].items()
+        for method, operation in item.items()
+    }
+    assert set(operations) == set(EXPECTED_CODES)
+    for key, operation in operations.items():
+        assert operation["summary"] and operation["description"], key
+        assert set(operation["responses"]) == EXPECTED_CODES[key], key
+        for code, response in operation["responses"].items():
+            assert response["description"], (key, code)
+            if code.startswith(("4", "5")):
+                content = response["content"]["application/json"]
+                assert content["schema"]["$ref"].endswith("/ErrorResponse")
+                examples = (
+                    [content["example"]]
+                    if "example" in content
+                    else [item["value"] for item in content["examples"].values()]
+                )
+                for example in examples:
+                    jsonschema.validate(
+                        example,
+                        {
+                            **schemas["ErrorResponse"],
+                            "components": {"schemas": schemas},
+                        },
+                    )
+
+
+async def test_request_example_and_fields_are_documented(app) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        document = (await client.get("/openapi.json")).json()
+    schema = document["components"]["schemas"]["GenerateMenuRequest"]
+    jsonschema.validate(schema["example"], schema)
+    assert set(schema["properties"]) == {
+        "peopleCount",
+        "weeklyBudget",
+        "habits",
+        "diet",
+        "allergies",
+        "kitchenTools",
+    }
+    assert set(schema["required"]) == {
+        "peopleCount",
+        "weeklyBudget",
+        "habits",
+        "kitchenTools",
+    }
+    assert all(item["description"] for item in schema["properties"].values())
+    operation = document["paths"]["/generate-menu"]["post"]
+    body_examples = operation["requestBody"]["content"]["application/json"]["examples"]
+    assert {"full", "empty"} <= set(body_examples)
+    for item in body_examples.values():
+        jsonschema.validate(item["value"], schema)
+    assert body_examples["empty"]["value"]["habits"] == []
+    assert body_examples["empty"]["value"]["kitchenTools"] == []
+    assert "habits" in operation["description"]
+    assert "игнорируются" not in operation["description"]
+    examples = operation["responses"]["400"]["content"]["application/json"]["examples"]
+    assert {"habits_missing", "habits_item", "diet_type", "out_of_range"} <= set(
+        examples
+    )
+    result = document["paths"]["/generate-menu/{task_id}"]["get"]["description"]
+    assert "10 минут" in result and "порядок" in result
+    error = document["components"]["schemas"]["TaskResultResponse"]["properties"][
+        "error"
+    ]["description"]
+    for text in (
+        "Neurocore unavailable",
+        "Neurocore timeout",
+        "Neurocore model not found",
+        "Neurocore error",
+        "Invalid neurocore response",
+        "Neurocore response truncated",
+        "Service restarted",
+        "Menu generation failed",
+    ):
+        assert text in error
+
+
+async def test_generate_menu_description_says_names_go_into_the_prompt(app) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        schema = (await client.get("/openapi.json")).json()
+    description = schema["paths"]["/generate-menu"]["post"]["description"]
+    assert "попадают в промпт" in description
+    assert "пока не" not in description
+
+
+async def test_profile_parameters_and_user_header_are_documented(app) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        document = (await client.get("/openapi.json")).json()
+    schemas = document["components"]["schemas"]
+    operation = document["paths"]["/profile/parameters"]["get"]
+    examples = operation["responses"]["200"]["content"]["application/json"]["examples"]
+    assert set(examples) == {"saved", "empty"}
+    assert examples["empty"]["value"]["diet"] is None
+    for item in examples.values():
+        jsonschema.validate(
+            item["value"],
+            {**schemas["SavedParametersResponse"], "components": {"schemas": schemas}},
+        )
+    for item in (
+        operation,
+        document["paths"]["/generate-menu"]["post"],
+    ):
+        header = next(p for p in item["parameters"] if p["in"] == "header")
+        assert header["name"] == "X-User-Id"
+        assert header["required"] is False
+        assert header["description"]
+    post = document["paths"]["/generate-menu"]["post"]
+    assert (
+        "user_id" in post["responses"]["400"]["content"]["application/json"]["examples"]
+    )
+
+
+async def test_recipe_id_is_required_uuid_in_api2(app) -> None:
+    schema = app.openapi()["components"]["schemas"]["RecipeResponse"]
+    assert "recipeId" in schema["required"]
+    assert schema["properties"]["recipeId"]["type"] == "string"
+    assert schema["properties"]["recipeId"]["format"] == "uuid"
+    assert schema["properties"]["recipeId"]["description"]
+
+
+async def test_cart_request_and_partial_success_examples_match_schema(app) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        document = (await client.get("/openapi.json")).json()
+    operation = document["paths"]["/recipes/cart"]["post"]
+    schemas = document["components"]["schemas"]
+    payload = schemas["CartRequest"]
+    assert payload["required"] == ["recipeId"]
+    recipe_id = payload["properties"]["recipeId"]
+    assert recipe_id["format"] == "uuid"
+    jsonschema.validate(
+        {"recipeId": recipe_id["examples"][0]},
+        payload,
+        format_checker=jsonschema.FormatChecker(),
+    )
+    success = operation["responses"]["200"]["content"]["application/json"]
+    jsonschema.validate(
+        success["example"], {**success["schema"], "components": document["components"]}
+    )
+    assert success["example"]["matches"][1]["product"] is None
+
+
+async def test_cart_link_request_and_response_examples_match_schema(app) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        document = (await client.get("/openapi.json")).json()
+    operation = document["paths"]["/recipes/cart/link"]["post"]
+    schemas = document["components"]["schemas"]
+    payload = schemas["CartLinkRequest"]
+    items = payload["properties"]["items"]
+    assert (items["minItems"], items["maxItems"]) == (1, 20)
+    item = schemas["CartLinkItem"]["properties"]
+    assert (item["id"]["type"], item["id"]["minimum"], item["id"]["maximum"]) == (
+        "integer",
+        1,
+        999_999_999,
+    )
+    assert (item["q"]["type"], item["q"]["minimum"], item["q"]["maximum"]) == (
+        "number",
+        0.01,
+        40,
+    )
+    components = {"components": document["components"]}
+    jsonschema.validate({"items": items["examples"][0]}, {**payload, **components})
+    success = operation["responses"]["200"]["content"]["application/json"]
+    jsonschema.validate(success["example"], {**success["schema"], **components})
+
+
+async def test_likes_document_uuid_owner_and_success_examples(app) -> None:
+    document = app.openapi()
+    paths = document["paths"]
+    for method in ("post", "delete", "get"):
+        path = "/recipes/liked" if method == "get" else "/recipes/{recipe_id}/like"
+        operation = paths[path][method]
+        parameters = {p["name"]: p for p in operation["parameters"]}
+        assert parameters["X-User-Id"]["in"] == "header"
+        assert parameters["X-User-Id"]["required"] is True
+        assert parameters["X-User-Id"]["description"]
+        if method != "get":
+            recipe_id = parameters["recipe_id"]
+            assert recipe_id["in"] == "path" and recipe_id["required"] is True
+            assert recipe_id["schema"]["format"] == "uuid"
+        success = operation["responses"]["200"]["content"]["application/json"]
+        examples = (
+            [success["example"]]
+            if "example" in success
+            else [item["value"] for item in success["examples"].values()]
+        )
+        for example in examples:
+            jsonschema.validate(
+                example, {**success["schema"], "components": document["components"]}
+            )
+        if method == "get":
+            assert {"recipes": []} in examples
+            [card] = next(
+                example["recipes"] for example in examples if example["recipes"]
+            )
+            assert set(card) == {
+                "recipeId",
+                "name",
+                "calories",
+                "nutrition",
+                "cookingTime",
+            }
+        else:
+            assert examples == [{"success": True}]
+
+
+async def test_menu_history_documents_owner_and_success_examples(app) -> None:
+    document = app.openapi()
+    operation = document["paths"]["/profile/menus"]["get"]
+    assert (
+        operation["parameters"]
+        == (document["paths"]["/recipes/liked"]["get"]["parameters"])
+    )
+    success = operation["responses"]["200"]["content"]["application/json"]
+    examples = [item["value"] for item in success["examples"].values()]
+    assert {"menus": []} in examples
+    [menu] = next(example["menus"] for example in examples if example["menus"])
+    assert set(menu) == {"menuId", "createdAt", "recipes"}
+    recipe_schema = document["components"]["schemas"]["MenuHistoryRecipeResponse"]
+    assert "nutrition" in recipe_schema["required"]
+    nutrition_schema = document["components"]["schemas"]["NutritionResponse"]
+    assert set(nutrition_schema["required"]) == {
+        "calories",
+        "proteins",
+        "fats",
+        "carbohydrates",
+    }
+    assert set(menu["recipes"][0]) == {
+        "recipeId",
+        "name",
+        "calories",
+        "nutrition",
+        "cookingTime",
+    }
+    for example in examples:
+        jsonschema.validate(
+            example,
+            {**success["schema"], "components": document["components"]},
+            format_checker=jsonschema.FormatChecker(),
+        )

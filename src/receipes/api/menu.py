@@ -1,0 +1,586 @@
+from decimal import Decimal
+from typing import Annotated, Any
+from uuid import UUID
+
+import structlog
+from fastapi import APIRouter, Body, Depends, Header, Path, Request
+from fastapi.exceptions import RequestValidationError
+
+from receipes.api.dependencies import (
+    USER_ID_HEADER,
+    TaskStore,
+    get_dictionaries,
+    get_task_store,
+    parse_user_id,
+)
+from receipes.api.schemas import (
+    GenerateMenuRequest,
+    GenerateMenuResponse,
+    IngredientResponse,
+    MenuResponse,
+    NutritionResponse,
+    RecipeResponse,
+    ReplaceRecipeRequest,
+    ReplaceRecipeResponse,
+    TaskResultResponse,
+)
+from receipes.db.models import GenerationTask, Recipe
+from receipes.dictionaries import (
+    UNKNOWN_ID,
+    Dictionaries,
+    DictionarySource,
+    find_unknown_ids,
+)
+from receipes.domain.errors import DictionaryError
+from receipes.domain.params import GenerationParams
+from receipes.domain.status import TaskStatus
+from receipes.errors import ErrorResponse, error_response
+
+logger = structlog.get_logger()
+router = APIRouter(tags=["menu"])
+
+TASK_NOT_FOUND = "Generation task not found"
+REPLACEMENT_NOT_FOUND = "Generation task or recipe not found"
+Store = Annotated[TaskStore, Depends(get_task_store)]
+DictionariesDep = Annotated[DictionarySource, Depends(get_dictionaries)]
+
+
+def _error_example(code: str, message: str, details: dict[str, Any]) -> dict[str, Any]:
+    return {"error": {"code": code, "message": message, "details": details}}
+
+
+def _error_doc(
+    description: str,
+    example: dict[str, Any] | None = None,
+    examples: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    # OpenAPI: либо один `example`, либо именованные `examples`, но не оба сразу.
+    assert (example is None) != (examples is None)
+    content = {"examples": examples} if examples else {"example": example}
+    return {
+        "model": ErrorResponse,
+        "description": description,
+        "content": {"application/json": content},
+    }
+
+
+REQUEST_EXAMPLES = {
+    "full": {
+        "summary": "Все параметры выбраны",
+        "value": {
+            "peopleCount": 4,
+            "weeklyBudget": 5000,
+            "habits": [3, 5],
+            "diet": 4,
+            "allergies": [1, 2],
+            "kitchenTools": [1, 2, 6],
+        },
+    },
+    "empty": {
+        "summary": "Ничего не выбрано (минимальный запрос v2)",
+        "value": {
+            "peopleCount": 4,
+            "weeklyBudget": 5000,
+            "habits": [],
+            "kitchenTools": [],
+        },
+    },
+}
+
+INTERNAL_ERROR_DOC = _error_doc(
+    "Внутренняя ошибка сервиса (например, недоступна база данных). Подробности "
+    "только в логе сервиса.",
+    _error_example("INTERNAL_ERROR", "Internal server error", {}),
+)
+
+DONE_EXAMPLE = {
+    "status": "done",
+    "menu": {
+        "recipes": [
+            {
+                "recipeId": "00000000-0000-4000-8000-000000000001",
+                "name": "Овсяная каша с яблоком",
+                "ingredients": [
+                    {"name": "Овсяные хлопья", "quantity": 320, "unit": "г"},
+                    {"name": "Молоко", "quantity": 800, "unit": "мл"},
+                    {"name": "Яблоко", "quantity": 4, "unit": "шт."},
+                ],
+                "calories": 310,
+                "nutrition": {
+                    "calories": 310,
+                    "proteins": 11.5,
+                    "fats": 8,
+                    "carbohydrates": 45,
+                },
+                "cookingTime": 15,
+                "instructions": [
+                    "Вскипятите молоко в кастрюле.",
+                    "Всыпьте хлопья и варите 7 минут, помешивая.",
+                    "Добавьте нарезанное яблоко и прогрейте 2 минуты.",
+                ],
+                "photo": None,
+            },
+            {
+                "recipeId": "00000000-0000-4000-8000-000000000002",
+                "name": "Куриный суп с лапшой",
+                "ingredients": [
+                    {"name": "Куриное филе", "quantity": 600, "unit": "г"},
+                    {"name": "Лапша", "quantity": 200, "unit": "г"},
+                    {"name": "Морковь", "quantity": 2, "unit": "шт."},
+                ],
+                "calories": 280,
+                "nutrition": {
+                    "calories": 280,
+                    "proteins": 24,
+                    "fats": 7.5,
+                    "carbohydrates": 30,
+                },
+                "cookingTime": 40,
+                "instructions": [
+                    "Сварите бульон из филе 25 минут.",
+                    "Добавьте нарезанную морковь и лапшу, варите 8 минут.",
+                ],
+                "photo": None,
+            },
+            {
+                "recipeId": "00000000-0000-4000-8000-000000000003",
+                "name": "Запечённый лосось с рисом",
+                "ingredients": [
+                    {"name": "Лосось", "quantity": 600, "unit": "г"},
+                    {"name": "Рис", "quantity": 280, "unit": "г"},
+                    {"name": "Лимон", "quantity": 1, "unit": "шт."},
+                ],
+                "calories": 520,
+                "nutrition": {
+                    "calories": 520,
+                    "proteins": 35,
+                    "fats": 22,
+                    "carbohydrates": 48,
+                },
+                "cookingTime": 35,
+                "instructions": [
+                    "Разогрейте духовку до 200 градусов.",
+                    "Запекайте лосось с дольками лимона 20 минут.",
+                    "Отварите рис 15 минут и подайте с рыбой.",
+                ],
+                "photo": None,
+            },
+        ]
+    },
+    "error": None,
+}
+
+RESULT_EXAMPLES = {
+    "pending": {
+        "summary": "Задача ждёт очереди",
+        "value": {"status": "pending", "menu": None, "error": None},
+    },
+    "in_progress": {
+        "summary": "Идёт генерация",
+        "value": {"status": "in_progress", "menu": None, "error": None},
+    },
+    "done": {"summary": "Меню готово", "value": DONE_EXAMPLE},
+    "failed": {
+        "summary": "Генерация завершилась ошибкой",
+        "value": {"status": "failed", "menu": None, "error": "Neurocore timeout"},
+    },
+}
+
+REPLACE_PATH = "/generate-menu/{task_id}/replace-recipe"
+REPLACEMENT_EXAMPLE = {
+    "recipe": {
+        **DONE_EXAMPLE["menu"]["recipes"][0],
+        "recipeId": "00000000-0000-4000-8000-000000000004",
+    }
+}
+
+
+@router.post(
+    "/generate-menu",
+    status_code=202,
+    summary="Запустить генерацию меню (API-1)",
+    description=(
+        "Создаёт задачу генерации меню и сразу возвращает её идентификатор; меню "
+        "готовится в фоне. Результат запрашивается по `task_id` через "
+        "`GET /generate-menu/{task_id}`.\n\n"
+        "В теле запроса: `peopleCount`, `weeklyBudget` и параметры версии 2: `habits`, "
+        "`kitchenTools` (обязательны в JSON, могут быть `[]`), `diet` (число или "
+        "`null`, можно не передавать) и `allergies` (можно не передавать). "
+        "Параметры сохраняются вместе с задачей. Необязательный заголовок "
+        "`X-User-Id` (его выставляет gateway по токену) задаёт владельца задачи: "
+        "по ним потом отдаются сохранённые параметры (API-13). Без заголовка запрос "
+        "гостевой, владелец не сохраняется; значение вне целых 1..2147483647 или "
+        "повтор заголовка даёт 400. Запрос без `habits` или "
+        "`kitchenTools` (формат версии 1) получает 400.\n\n"
+        "Проверки: типы и диапазоны; не больше 3 разных привычек; каждый ID "
+        "должен существовать в справочниках MS-2. Неизвестный ID даёт 400 "
+        '`unknown_id` с указанием элемента (`["body", "habits", "1"]`), '
+        "повторяющийся неизвестный ID отмечается на каждом вхождении. Пустые "
+        "списки и `diet: null` принимаются и MS-2 не вызывают. Если справочники "
+        "MS-2 недоступны, ответили ошибкой или не уложились в таймаут, задача не "
+        "создаётся и сервис отвечает 500.\n\n"
+        "Названия выбранных привычек, диеты, аллергенов и техники из справочников "
+        "MS-2 попадают в промпт отдельным блоком ограничений; пустые списки и "
+        "`diet: null` ограничений не добавляют. Формат ответа модели от параметров "
+        "не зависит."
+    ),
+    response_model=GenerateMenuResponse,
+    responses={
+        202: {"description": "Задача создана и ждёт обработки."},
+        400: _error_doc(
+            "Некорректные параметры: поля не заданы, неверный тип или значение вне "
+            "границ, больше 3 разных привычек (`too_long`), неизвестный ID "
+            "(`unknown_id`), битый JSON, пустое тело, тело не JSON-объект.",
+            examples={
+                "peopleCount": {
+                    "summary": "Неверный тип peopleCount",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {
+                            "fields": [
+                                {"loc": ["body", "peopleCount"], "type": "int_type"}
+                            ]
+                        },
+                    ),
+                },
+                "habits_missing": {
+                    "summary": "Нет обязательного habits",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {"fields": [{"loc": ["body", "habits"], "type": "missing"}]},
+                    ),
+                },
+                "habits_item": {
+                    "summary": "Элемент habits не целое число",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {
+                            "fields": [
+                                {"loc": ["body", "habits", "0"], "type": "int_type"}
+                            ]
+                        },
+                    ),
+                },
+                "diet_type": {
+                    "summary": "diet не число и не null",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {"fields": [{"loc": ["body", "diet"], "type": "int_type"}]},
+                    ),
+                },
+                "habits_too_many": {
+                    "summary": "Больше трёх разных привычек",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {"fields": [{"loc": ["body", "habits"], "type": "too_long"}]},
+                    ),
+                },
+                "unknown_id": {
+                    "summary": "ID нет в справочнике MS-2 (второй элемент habits)",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {
+                            "fields": [
+                                {"loc": ["body", "habits", "1"], "type": "unknown_id"}
+                            ]
+                        },
+                    ),
+                },
+                "user_id": {
+                    "summary": "Некорректный X-User-Id",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {
+                            "fields": [
+                                {"loc": ["header", USER_ID_HEADER], "type": "user_id"}
+                            ]
+                        },
+                    ),
+                },
+                "out_of_range": {
+                    "summary": "ID вне диапазона int4",
+                    "value": _error_example(
+                        "VALIDATION_ERROR",
+                        "Request validation failed",
+                        {
+                            "fields": [
+                                {
+                                    "loc": ["body", "kitchenTools", "0"],
+                                    "type": "less_than_equal",
+                                }
+                            ]
+                        },
+                    ),
+                },
+            },
+        ),
+        500: _error_doc(
+            "Внутренняя ошибка сервиса: недоступна база данных или справочники "
+            "MS-2 (недоступны, ответили ошибкой или не уложились в таймаут), "
+            "поэтому ID проверить нельзя. Задача не создаётся. Подробности только "
+            "в логе сервиса.",
+            _error_example("INTERNAL_ERROR", "Internal server error", {}),
+        ),
+    },
+)
+async def generate_menu(
+    request: Request,
+    body: Annotated[GenerateMenuRequest, Body(openapi_examples=REQUEST_EXAMPLES)],
+    store: Store,
+    dictionaries: DictionariesDep,
+    # Только для OpenAPI: значение читается из `request` (см. ниже).
+    _x_user_id: Annotated[
+        str | None,
+        Header(
+            alias=USER_ID_HEADER,
+            description=(
+                "Владелец запроса: целое от 1 до 2147483647, заголовок один. Нет "
+                "заголовка: гость, `user_id` не сохраняется."
+            ),
+            examples=["42"],
+        ),
+    ] = None,
+) -> Any:
+    # Порядок: схема (уже прошла) -> заголовок -> проверка ID в MS-2 -> создание
+    # задачи. Проверка идёт до транзакции БД и не держит её.
+    # Читается из запроса целиком: повтор заголовка считается ошибкой.
+    owner_values = request.headers.getlist(USER_ID_HEADER)
+    user_id = parse_user_id(owner_values)
+    if owner_values and user_id is None:
+        raise RequestValidationError(
+            [
+                {
+                    "loc": ("header", USER_ID_HEADER),
+                    "type": "user_id",
+                    "msg": "Invalid user id",
+                }
+            ]
+        )
+    try:
+        known = await _check_dictionary_ids(body, dictionaries)
+    except DictionaryError as error:
+        logger.warning("dictionaries_failed", reason=error.message)
+        return error_response(500, "INTERNAL_ERROR", "Internal server error")
+    params = GenerationParams(
+        people_count=body.people_count,
+        weekly_budget=Decimal(str(body.weekly_budget)),
+        habits=tuple(body.habits),
+        diet=body.diet,
+        allergies=tuple(body.allergies),
+        kitchen_tools=tuple(body.kitchen_tools),
+    )
+    task_id = await store.create(params, known, user_id)
+    return GenerateMenuResponse(task_id=str(task_id))
+
+
+# Запрос без единого ID (все списки пусты, diet = null) MS-2 не вызывает. Тот же
+# ответ MS-2 идёт в промпт задачи: названия и проверка ID из одного снимка.
+async def _check_dictionary_ids(
+    body: GenerateMenuRequest, dictionaries: DictionarySource
+) -> Dictionaries | None:
+    if not (
+        body.habits or body.allergies or body.kitchen_tools or body.diet is not None
+    ):
+        return None
+    known = await dictionaries.fetch()
+    unknown = find_unknown_ids(
+        known,
+        habits=body.habits,
+        diet=body.diet,
+        allergies=body.allergies,
+        kitchen_tools=body.kitchen_tools,
+    )
+    if unknown:
+        raise RequestValidationError(
+            [
+                {"loc": loc, "type": UNKNOWN_ID, "msg": "Unknown dictionary id"}
+                for loc in unknown
+            ]
+        )
+    return known
+
+
+def _menu_response(task: GenerationTask) -> MenuResponse:
+    if task.menu is None or not task.menu.menu_recipes:
+        # Статус done без данных меню — нарушение инварианта, а не ответ клиенту.
+        raise RuntimeError("done task has no menu")
+    return MenuResponse(
+        recipes=[_recipe_response(link.recipe) for link in task.menu.menu_recipes]
+    )
+
+
+def _recipe_response(recipe: Recipe) -> RecipeResponse:
+    return RecipeResponse(
+        recipe_id=recipe.id,
+        name=recipe.name,
+        ingredients=[
+            IngredientResponse(
+                name=item.ingredient.name, quantity=item.quantity, unit=item.unit
+            )
+            for item in recipe.ingredients
+        ],
+        calories=recipe.calories,
+        nutrition=NutritionResponse(
+            calories=recipe.nutrition.calories,
+            proteins=recipe.nutrition.proteins,
+            fats=recipe.nutrition.fats,
+            carbohydrates=recipe.nutrition.carbohydrates,
+        ),
+        cookingTime=recipe.cooking_time,
+        instructions=[step.text for step in recipe.instructions],
+        photo=None,
+    )
+
+
+@router.get(
+    "/generate-menu/{task_id}",
+    summary="Получить результат генерации (API-2)",
+    description=(
+        "Возвращает статус задачи; поля `status`, `menu` и `error` есть всегда. "
+        "`menu` заполнено только при `status = done`, `error` — только при "
+        "`status = failed`.\n\n"
+        "Генерация обычно занимает от секунд до пары минут (один запрос к модели) "
+        "плюс ожидание в очереди; в худшем случае сама задача идёт до 10 минут, "
+        "поэтому клиент не должен рвать опрос по короткому таймауту. Очередь по "
+        "длине не ограничена.\n\n"
+        "Число рецептов не фиксировано: промпт просит не менее 3, на практике модель "
+        "отдаёт 3, контракт гарантирует минимум 3. Рецепты идут списком без "
+        "разбивки по дням, порядок рецептов и ингредиентов не гарантируется. "
+        "`calories` и `nutrition.calories` — калорийность одной порции от модели, "
+        "значения могут расходиться; для КБЖУ основное `nutrition.calories`."
+    ),
+    response_model=TaskResultResponse,
+    responses={
+        # Примеры с null FastAPI вырезает при сборке схемы (exclude_none):
+        # полные примеры возвращает restore_example_nulls().
+        200: {
+            "description": "Состояние задачи.",
+            "content": {"application/json": {"examples": RESULT_EXAMPLES}},
+        },
+        404: _error_doc(
+            "Задача не найдена, в том числе если `task_id` не является UUID.",
+            _error_example("NOT_FOUND", TASK_NOT_FOUND, {}),
+        ),
+        500: INTERNAL_ERROR_DOC,
+    },
+)
+async def get_generation_result(
+    task_id: Annotated[
+        str,
+        Path(
+            description=(
+                "Идентификатор задачи из ответа API-1 (UUID). Неизвестный или "
+                "не UUID даёт 404."
+            ),
+            examples=["b1e2c3d4-5678-90ab-cdef-1234567890ab"],
+        ),
+    ],
+    store: Store,
+) -> Any:
+    try:
+        identifier = UUID(task_id)
+    except ValueError:
+        return error_response(404, "NOT_FOUND", TASK_NOT_FOUND)
+    task = await store.get(identifier)
+    if task is None:
+        return error_response(404, "NOT_FOUND", TASK_NOT_FOUND)
+    status = TaskStatus(task.status)
+    return TaskResultResponse(
+        status=status.value,
+        menu=_menu_response(task) if status == TaskStatus.DONE else None,
+        error=task.error if status == TaskStatus.FAILED else None,
+    )
+
+
+@router.post(
+    REPLACE_PATH,
+    summary="Заменить рецепт в готовом меню (API-18)",
+    description=(
+        "Заменяет один рецепт в готовом меню, в том числе гостевом. Использует "
+        "сохранённые параметры меню. После успеха API-2 по исходному `task_id` "
+        "возвращает новый состав меню. Остальные рецепты сохраняются. "
+        "Общий лимит ожидания включает очередь. При ошибке генерации или "
+        "истечении срока сервис отвечает 500, а состав меню сохраняется."
+    ),
+    response_model=ReplaceRecipeResponse,
+    responses={
+        200: {
+            "description": "Рецепт заменён и сохранён в меню.",
+            "content": {"application/json": {"example": REPLACEMENT_EXAMPLE}},
+        },
+        400: _error_doc(
+            "Некорректное тело или отсутствует корректный UUID в `recipeId`.",
+            _error_example(
+                "VALIDATION_ERROR",
+                "Request validation failed",
+                {"fields": [{"loc": ["body", "recipeId"], "type": "uuid_parsing"}]},
+            ),
+        ),
+        404: _error_doc(
+            "Исходная задача отсутствует, не завершена или `task_id` не UUID. "
+            "Такой же ответ, если рецепт уже отсутствует в этом меню.",
+            _error_example("NOT_FOUND", REPLACEMENT_NOT_FOUND, {}),
+        ),
+        500: _error_doc(
+            "Внутренняя ошибка, ошибка генерации или истёк срок ожидания замены.",
+            _error_example("INTERNAL_ERROR", "Internal server error", {}),
+        ),
+    },
+)
+async def replace_recipe(
+    request: Request,
+    task_id: Annotated[
+        str,
+        Path(
+            description="UUID исходной задачи из API-1 с готовым меню.",
+            examples=["b1e2c3d4-5678-90ab-cdef-1234567890ab"],
+            json_schema_extra={"format": "uuid"},
+        ),
+    ],
+    body: Annotated[
+        ReplaceRecipeRequest,
+        Body(
+            openapi_examples={
+                "recipe": {
+                    "summary": "UUID рецепта из готового меню",
+                    "value": {"recipeId": "00000000-0000-4000-8000-000000000002"},
+                }
+            }
+        ),
+    ],
+    store: Store,
+) -> Any:
+    try:
+        source_task_id = UUID(task_id)
+    except ValueError:
+        return error_response(404, "NOT_FOUND", REPLACEMENT_NOT_FOUND)
+    replacement_id = await store.create_replace(source_task_id, body.recipe_id)
+    if replacement_id is None:
+        return error_response(404, "NOT_FOUND", REPLACEMENT_NOT_FOUND)
+    recipe = await store.wait_for_replace(
+        replacement_id,
+        request.app.state.settings.replace_wait_seconds,
+        request.app.state.generation_metrics,
+    )
+    if recipe is None:
+        return error_response(500, "INTERNAL_ERROR", "Internal server error")
+    return ReplaceRecipeResponse(recipe=_recipe_response(recipe))
+
+
+# FastAPI собирает OpenAPI с exclude_none и теряет null в примерах (`menu`, `error`,
+# `photo`), хотя именно они показывают клиенту контракт. Возвращаем их на место.
+def restore_example_nulls(schema: dict[str, Any]) -> None:
+    operation = schema["paths"]["/generate-menu/{task_id}"]["get"]
+    content = operation["responses"]["200"]["content"]["application/json"]
+    content["examples"] = RESULT_EXAMPLES
+    replacement = schema["paths"][REPLACE_PATH]["post"]
+    replacement["responses"]["200"]["content"]["application/json"]["example"] = (
+        REPLACEMENT_EXAMPLE
+    )
